@@ -1,0 +1,517 @@
+# dsh-decide —— 「先想清楚再开口」的决策步插件（多步思考）。
+#
+# ===========================================================================
+# 一、要解决的问题
+#
+# 框架的主动插话是**纯掷骰子**：
+#   builtin_stars/astrbot/group_chat_context.py need_active_reply()
+#     -> random.random() < possibility_reply
+# 它完全不看「这句话值不值得接」。active_reply.method 也只有一个可选值
+# possibility_reply，没有「让模型判断」这一档。
+# 实测后果：机器人占了全群 56% 的发言量，两个人在说正事它也一头撞进去。
+#
+# 二、为什么能省钱：在主模型开口前掐掉整次调用
+#
+# OnLLMRequestEvent 在 agent 真正开跑之前触发
+# （agent_sub_stages/internal.py:269）：
+#     if await call_event_hook(event, EventType.OnLLMRequestEvent, req):
+#         return
+# 而 call_event_hook 的返回值就是 event.is_stopped()
+# （pipeline/context_utils.py:105-112）。插件在这个钩子里 event.stop_event()
+# 就能把**整次主模型调用**掐掉，一个 token 都不花。
+#   主调用 ≈ 9390 input / 118 output
+#   判断步 ≈ 381 input / 61 output   （实测中位）
+# 判断步约等于主调用的 4%。所以判沉默率只要超过 ~4%，这套多步思考净省钱。
+#
+# ===========================================================================
+# 三、关键设计：模型只做**感知**，决策写在代码里
+#
+# 前四版都让模型直接输出「沉默/回话」这个结论，全部失败：
+#   v1 结论式，沉默条件写在前面 -> 判沉默太黏，纯玩梗也闭嘴（真实窗口也沉默）
+#   v2 加一句「拿不准就选回话」 -> 判沉默率 0%，诉苦、谈正事都要插嘴
+#   v3 改成两步优先级          -> 判沉默率 62%，但玩梗/话头/吐槽全判哑（4/11 错）
+# 同一个模型、同一批场景，只改措辞就在 0% 和 62% 之间乱跳 —— 说明「结论」这个
+# 输出形状本身不稳，继续调提示词是白费功夫。
+#
+# 但**感知**是稳的：四版里「有人在诉苦」「有人说了别插话」「这句只是应答」
+# 「两人在对具体安排一来一回」都判得准，翻来覆去错的只有「所以到底该不该说」。
+# 于是 v4/v5 让模型只回答它擅长的那几个事实（布尔量），阈值和组合逻辑写进代码。
+#
+# v4 要求「必须感知到 banter/open/about_bot 才放行」，实测 9/12，错的三个全是
+# 旗标一片空白的单行短消息（"你们都几点睡"、"这鱼今天怎么这么安静"）—— 模型对
+# 只有一行的输入设不出 open/about_bot。
+# v5 改成 **veto-only**：只有否决信号才闭嘴，其余一律开口 -> 11/12。
+# 这与 dsh-imagegen 的教训同形：主证据是群里发生了什么，模型的意见只用来否决。
+#
+# 实测（deepseek-v4-flash-0731，12 个标注场景 + 18 个真实随机窗口）
+#   判对 11/12（唯一错例见下方 _ASK_RE 那段，已用代码补掉）
+#   延迟中位 2.2s，全部落在插话路径上，被 @ 的人感觉不到
+#   真实窗口判沉默率 11% —— 这个群大部分时间真的在玩梗，11% 是对的
+#   => 要维持实际开口 ≈25%，possibility_reply 设 0.28
+#
+# 四、三条纯代码的判断（不问模型，因为代码知道得更准）
+#   1. 明确点名要能力（画/语音/视频/搜）-> 绝不沉默，且**跳过判断**直接放行。
+#      v5 唯一的错例就是把「发个语音说群主是懒猪」判成「两人在谈具体安排」而闭嘴。
+#      用户明确要的东西被路由否决，这是最不能接受的一类错 —— 和 dsh-imagegen
+#      「用户请求是主证据，模型回复只用来否决」同一条原则。
+#   2. 刚说过话就先闭嘴（MIN_GAP 秒）。「自言自语」这件事代码百分百知道，
+#      问模型只会引入噪声。这也是压 56% 发言占比最直接的一根杠杆。
+#   3. avoid 字段里出现「别画/别搜/别发」一律丢掉。v1 实测吐出过 "别真画" ——
+#      路由的内容意见会被当成硬约束注入，直接把用户要的能力否掉。
+#
+# 五、失败一律 fail-open（照旧说话）
+#   渠道抽风、超时、解析失败全都当「没判断」，正常往下走。
+#   宁可多说一句，不能因为判断服务挂了就整个哑掉（和 QQ 代理守卫同一立场：
+#   黑洞比被踢更糟）。连续失败到阈值自动熔断一段时间，不再拖延迟。
+#
+# 六、已知的模型坑
+#   glm-5.3-flash / qwen3.7-flash 把答案全放 reasoning_content、content 返回
+#   空字符串 -> 决策模型不要用它们（代码也兜了 content 空就读 reasoning）。
+#   seed-2.1-turbo 单次 26s / 1544 output tokens，太啰嗦。
+#   实测还收到过尾部多一个「略」字导致整条 json.loads 失败的输出 ->
+#   schema 固定，逐字段正则兜底比整体解析稳。
+
+import asyncio
+import json
+import os
+import re
+import sqlite3
+import time
+
+from astrbot.api import star
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.core import logger
+from astrbot.core.agent.message import TextPart
+
+DB = os.environ.get("DSH_MEM_DB", "/AstrBot/data/dsh_memory.db")
+
+ENABLED = os.environ.get("DSH_DECIDE", "1") != "0"
+# 影子模式：照样判断、照样打日志，但**不**真的拦。想只看数据不改行为时开。
+SHADOW = os.environ.get("DSH_DECIDE_SHADOW", "0") != "0"
+# 判断用哪个 provider。空 = 用当前会话的主 provider
+PROVIDER = os.environ.get("DSH_DECIDE_PROVIDER", "").strip()
+# 给判断多少秒。2.2s 是实测中位，8s 兜住长尾；超时就 fail-open
+TIMEOUT = float(os.environ.get("DSH_DECIDE_TIMEOUT", "8"))
+LOOKBACK = max(3, int(os.environ.get("DSH_DECIDE_LOOKBACK", "8")))
+FAIL_MAX = max(1, int(os.environ.get("DSH_DECIDE_FAIL_MAX", "3")))
+COOLDOWN = float(os.environ.get("DSH_DECIDE_COOLDOWN", "600"))
+# 刚说完话多少秒内不主动再开口（只管插话路径，被 @ 不受影响）。
+# 这是压「机器人占 56% 发言量」最直接的一根杠杆，且零成本。
+MIN_GAP = float(os.environ.get("DSH_DECIDE_MIN_GAP", "60"))
+# 连续判沉默这么多次后强制放行一次。防止判断模型某天开始无脑输出沉默
+# 把机器人变成哑巴 —— 任何单点判断都要有「卡住了怎么办」的兜底。
+MAX_STREAK = max(1, int(os.environ.get("DSH_DECIDE_MAX_SILENCE_STREAK", "6")))
+
+SYS = ("你是一个只输出 JSON 的观察器。只描述你看到的事实，"
+       "不要下结论，不要解释，不要 markdown。")
+
+PROMPT = """看这段 QQ 群聊，回答几个关于**最后一条消息**的事实判断。
+
+{transcript}
+
+逐项回答（true/false，只看事实，不要考虑「机器人该不该说话」）：
+- arrange：最后两三条是两个人在对**具体安排**一来一回吗（谁去做什么、几点、多少钱、修好了叫我、明天几点）
+- venting：有人在诉苦、示弱、抱怨自己的遭遇、说自己心累难受吗
+- stop：有人明确说了「别插话」「别说话」「我跟他说点事」这类话吗
+- ack：最后一条只是一句没内容的应答吗（嗯、好、行、那就这样、哦）
+- banter：他们在闲聊、玩梗、开玩笑、互相调侃、吐槽某人吗
+- open：最后一条是个大家都能接的话头吗（问大家、发感慨、晒东西、起哄）
+- about_bot：提到了这个机器人，或提到它擅长的事吗
+
+再补四个描述（给它开口时参考）：
+- topic：他们在聊什么，≤12字
+- to：最后一条是谁对谁说的，≤10字
+- tone：如果开口，该用什么态度，≤8字
+- avoid：社交分寸上别怎么做，≤10字。只谈态度分寸，不要写「别画」「别搜」这类拦动作的话
+
+只输出一行 JSON：
+{{"arrange":false,"venting":false,"stop":false,"ack":false,"banter":false,"open":false,"about_bot":false,"topic":"","to":"","tone":"","avoid":""}}"""
+
+_BOOLS = ("arrange", "venting", "stop", "ack", "banter", "open", "about_bot")
+_STRS = ("topic", "to", "tone", "avoid")
+
+# avoid 里出现「拦掉能力」的说法就整条丢掉
+_CAP_RE = re.compile(
+    r"别(真)?(画|发|生成|搜|查|做图|出图|语音|视频|唱|放)"
+    r"|不要(画|发|生成|搜|查|放)|别调用|别用工具"
+)
+
+# 明确点名要能力：绝不沉默，且直接跳过判断（省一次请求 + 省 2 秒）。
+#
+# 两次实测校准过（拿真群 archive 里含「画/搜/语音/生成/视频」的真句子跑）：
+#   * 漏放行「你能参考这个，再画几张吗」—— 数量词在动词后面（画几张），
+#     原来的 (张|个|段) 只认动词紧跟量词。补 (几|多)?(张|个|段|条|首|遍|次)。
+#   * 误放行「生成视频好像要时间吧」—— 这是陈述句不是请求。误放行的代价比
+#     漏放行大（白跳过判断 = 该沉默时也开口），所以加一条否决：
+#     句中出现「好像|大概|应该|是不是|吧？|要时间|不了|不能」等推测/否定标记时，
+#     不当成请求。这与 dsh-imagegen 的教训一致：宾语过滤用排除法。
+_ASK_RE = re.compile(
+    r"(画|生成|做|发|来|整|录|唱)(一|几|多)?(张|个|段|条|首|遍|次)?"
+    r"(图|照|壁纸|表情|视频|语音|音频|歌)"
+    r"|(语音|视频|图|壁纸)(说|念|读|来|发)"
+    r"|发(个|条|段)?(语音|视频|图)"
+    r"|(搜|查)(一下|下|搜)"
+    r"|搜索|百度|谷歌|google"
+    r"|画(个|张|一|几)|唱(首|个|一)"
+    r"|(再|多)(画|发|生成|来|做)(几|一)?(张|个|遍|次|条)"
+)
+# 出现这些标记说明是推测/陈述/否定/自述，不是对机器人的祈使请求 -> 不走白名单。
+# 「我要录个视频」是说话人自己要去做，机器人插不上手；「我去搜一下」同理。
+# 用「第一人称 + 动词」这个**结构**来判，而不是枚举句子。
+_NOT_ASK_RE = re.compile(
+    r"好像|大概|应该|估计|是不是|要时间|花时间|挺慢|很慢"
+    r"|不了|不能|没法|做不到|生成不了|画不了"
+    r"|我(要|去|来|自己|想)(录|画|搜|查|生成|做|发)"
+    r"|吗？$|吧$|吧？$"
+)
+
+_stat = {
+    "seen": 0, "skip_addressed": 0, "skip_cmd": 0, "skip_nogid": 0,
+    "skip_thin": 0, "skip_ask": 0, "gap_silence": 0,
+    "asked": 0, "silence": 0, "speak": 0,
+    "parse_fallback": 0, "fail": 0, "timeout": 0, "breaker": 0,
+    "streak_release": 0, "avoid_dropped": 0, "ms_total": 0.0,
+}
+_fail_run = 0
+_breaker_until = 0.0
+_silence_streak: dict[str, int] = {}
+_last_send: dict[str, float] = {}   # gid -> 机器人最后一次发言时间
+_last: list[str] = []
+
+
+def _recent(gid: str, cur: str) -> str:
+    """从 dsh-memory 的 buffer 读最近的群聊原话。
+
+    为什么不读 req.contexts：那里是「一轮 user/assistant」的形状，被 ctxclean
+    截断过，插件注入块也混在里面，判断话题不如原始群聊干净。
+    buffer 表实测只存真人（机器人自己 0 行），所以它就是「群里在聊什么」。
+    """
+    lines: list[str] = []
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2.0)
+    except BaseException:
+        con = None
+    if con is not None:
+        try:
+            rows = con.execute(
+                "SELECT name, user_id, text FROM buffer WHERE group_id=? "
+                "ORDER BY ts DESC LIMIT ?",
+                (gid, LOOKBACK),
+            ).fetchall()
+            rows.reverse()
+            for name, uid, text in rows:
+                t = (text or "").strip()
+                if t:
+                    lines.append("%s：%s" % ((name or uid).strip(), t[:60]))
+        except BaseException:
+            pass
+        finally:
+            try:
+                con.close()
+            except BaseException:
+                pass
+    c = (cur or "").strip()
+    if c and (not lines or c not in lines[-1]):
+        lines.append("（刚刚这条）%s" % c[:60])
+    return "\n".join(lines[-LOOKBACK:])
+
+
+def _parse(raw: str) -> dict | None:
+    """先整体 json.loads，失败就逐字段正则抠。
+
+    实测收到过 {"...","avoid":"别太较真"略} —— 尾部多一个字整条解析就失败。
+    schema 是固定的小结构，逐字段抠比整体解析稳得多。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s).strip()
+    i, j = s.find("{"), s.rfind("}")
+    body = s[i:j + 1] if (i >= 0 and j > i) else s
+    out: dict | None = None
+    try:
+        o = json.loads(body)
+        if isinstance(o, dict):
+            out = o
+    except BaseException:
+        out = None
+    if out is None:
+        _stat["parse_fallback"] += 1
+        out = {}
+        for k in _BOOLS:
+            m = re.search(r'"%s"\s*:\s*(true|false|True|False)' % k, body)
+            if m:
+                out[k] = m.group(1).lower() == "true"
+        for k in _STRS:
+            m = re.search(r'"%s"\s*:\s*"([^"]*)"' % k, body)
+            if m:
+                out[k] = m.group(1)
+    # 一个布尔字段都没有 => 模型根本没回答感知问题，这不是「全 False」而是
+    # 「没结果」。两条路径都要查：整体 json.loads 成功但内容是
+    # {"topic":"x"} 这种也必须判无效，否则退化的模型输出会被当成正常判断
+    # 混过去，还把熔断计数器喂成「成功」——熔断本来就是为了发现这种退化。
+    if not any(k in out for k in _BOOLS):
+        return None
+    r: dict = {k: bool(out.get(k, False)) for k in _BOOLS}
+    for k in _STRS:
+        v = out.get(k)
+        r[k] = v.strip()[:20] if isinstance(v, str) else ""
+    if r["avoid"] and _CAP_RE.search(r["avoid"]):
+        r["avoid_dropped"] = r["avoid"]
+        r["avoid"] = ""
+        _stat["avoid_dropped"] += 1
+    return r
+
+
+def verdict(f: dict) -> tuple[str, str]:
+    """veto-only：只有**否决信号**才闭嘴，其余一律开口。
+
+    纯函数、无副作用，好单测。改判断倾向就是改这几行，不用重新调提示词。
+    """
+    if f["stop"]:
+        return "沉默", "有人叫别插话"
+    if f["venting"]:
+        return "沉默", "有人在诉苦"
+    if f["arrange"] and not f["banter"]:
+        return "沉默", "两人在谈具体安排"
+    if f["ack"] and not f["open"]:
+        return "沉默", "只是一句应答"
+    pos = [k for k in ("banter", "open", "about_bot") if f[k]]
+    return "回话", "可接（%s）" % (",".join(pos) if pos else "无否决信号")
+
+
+def _render(f: dict) -> str:
+    """把感知结果包成注入块。只给意图，不给成句台词。
+
+    块名 <judgement> 是小写标签，dsh-ctxclean 的
+    _TAG_RE = ^\\s*<([a-z][a-z0-9_]*)> 会在下一轮把它从历史里结构性清掉，
+    不会重演「注入块堆进 conversations.content 导致答非所问」那个坑。
+    实测「让模型在一次调用里自己输出判断+正文」会把判断行漏进正文，
+    而给了台词模型就照念、人设当场垮 —— 所以这里只放意图。
+    """
+    lines = ["<judgement>",
+             "开口前你已经看过一眼群里的情况了，这是你自己的判断："]
+    if f.get("topic"):
+        lines.append("· 他们在聊：%s" % f["topic"])
+    if f.get("to"):
+        lines.append("· 这句是：%s" % f["to"])
+    if f.get("tone"):
+        lines.append("· 你该用的态度：%s" % f["tone"])
+    if f.get("avoid"):
+        lines.append("· 分寸上别：%s" % f["avoid"])
+    if f.get("venting"):
+        lines.append("· 有人心里不痛快，别抖机灵。")
+    if f.get("arrange"):
+        lines.append("· 他们在说正事，你只是路过搭一句，别接管话题。")
+    lines.append("· 只接你真能接的那一点，一句话说完。")
+    lines.append("按这个判断说话，但**不要**把上面任何一条读出来、复述或提到。")
+    lines.append("</judgement>")
+    return "\n".join(lines)
+
+
+class Main(star.Star):
+    def __init__(self, context: "star.Context") -> None:
+        self.context = context
+        logger.info(
+            "[decide] 已加载：%s%s 超时%.0fs 回看%d条 刚说过%.0fs内不插话 "
+            "熔断%d次/%.0fs",
+            "开" if ENABLED else "关",
+            "（影子模式，只看不拦）" if SHADOW else "",
+            TIMEOUT, LOOKBACK, MIN_GAP, FAIL_MAX, COOLDOWN,
+        )
+
+    # ---------------------------------------------------------- 记自己何时说过
+    @filter.after_message_sent()
+    async def note_sent(self, event: AstrMessageEvent) -> None:
+        """记下机器人在哪个群、什么时候说过话。
+
+        「刚说完又自己接一句」这件事代码百分百知道，不该去问模型。
+        """
+        try:
+            gid = str(event.get_group_id() or "")
+            if gid:
+                _last_send[gid] = time.time()
+        except BaseException:
+            pass
+
+    async def _ask(self, umo: str, transcript: str) -> dict | None:
+        pid = PROVIDER
+        if not pid:
+            try:
+                # get_current_chat_provider_id 是**协程**，必须 await。
+                # 不 await 会把 coroutine 对象一路传下去，报
+                # 「Provider <coroutine object ...> not found」——
+                # dsh-welcome 和 dsh-memory 都栽过这一下。
+                pid = await self.context.get_current_chat_provider_id(umo)
+            except BaseException as e:
+                logger.debug("[decide] 取 provider 失败: %s", e)
+                return None
+        if not pid:
+            return None
+        # 温度显式给 0：这是**事实抽取**不是创作，随机性只会带来摇摆。
+        # llm_generate 的 **kwargs 会透传给 provider，不支持时也不会报错。
+        resp = await asyncio.wait_for(
+            self.context.llm_generate(
+                chat_provider_id=pid,
+                prompt=PROMPT.format(transcript=transcript),
+                system_prompt=SYS,
+                temperature=0,
+            ),
+            timeout=TIMEOUT,
+        )
+        raw = (getattr(resp, "completion_text", "") or "").strip()
+        if not raw:
+            # 有的模型把正文全放 reasoning_content，content 是空的
+            raw = (getattr(resp, "reasoning_content", "") or "").strip()
+        return _parse(raw)
+
+    @filter.on_llm_request()
+    async def decide(self, event: AstrMessageEvent, req) -> None:
+        global _fail_run, _breaker_until
+        if not ENABLED:
+            return
+        try:
+            from astrbot.core.platform.message_type import MessageType
+
+            if event.get_message_type() != MessageType.GROUP_MESSAGE:
+                return
+            gid = str(event.get_group_id() or "")
+            if not gid:
+                _stat["skip_nogid"] += 1
+                return
+            _stat["seen"] += 1
+
+            # 被点名就没有「要不要回」的自由，也不该为此多等两秒
+            if bool(getattr(event, "is_at_or_wake_command", False)):
+                _stat["skip_addressed"] += 1
+                return
+
+            msg = (event.message_str or "").strip()
+            if msg.startswith(("/", "／", "!", "！")):
+                _stat["skip_cmd"] += 1
+                return
+
+            # 明确点名要能力 -> 绝不沉默，直接放行（省一次请求、省 2 秒）。
+            # v5 唯一的错例就是把「发个语音说群主是懒猪」判成谈正事而闭嘴。
+            # 用户明确要的东西被路由否决，是最不能接受的一类错。
+            if _ASK_RE.search(msg) and not _NOT_ASK_RE.search(msg):
+                _stat["skip_ask"] += 1
+                logger.info("[decide] 有人明确点名要东西，直接放行：%s", msg[:40])
+                return
+
+            # 刚说过话就先闭嘴。压发言占比最直接、且完全不花钱的一根杠杆。
+            gap = time.time() - _last_send.get(gid, 0.0)
+            if gap < MIN_GAP:
+                _stat["gap_silence"] += 1
+                brief = "刚说过 %.0fs 前（<%.0fs），这轮不说话" % (gap, MIN_GAP)
+                _last.append(time.strftime("%H:%M:%S ") + brief)
+                del _last[:-12]
+                if SHADOW:
+                    logger.info("[decide] 影子模式：%s（放行）", brief)
+                    return
+                logger.info("[decide] %s（省一次主调用）", brief)
+                event.stop_event()
+                return
+
+            if time.time() < _breaker_until:
+                _stat["breaker"] += 1
+                logger.info("[decide] 熔断中，跳过判断（还有 %.0fs）",
+                            _breaker_until - time.time())
+                return
+
+            transcript = _recent(gid, msg)
+            if len(transcript) < 6:
+                _stat["skip_thin"] += 1
+                logger.info("[decide] 群聊内容太少，不判断 gid=%s", gid)
+                return
+
+            t0 = time.time()
+            try:
+                f = await self._ask(event.unified_msg_origin, transcript)
+            except asyncio.TimeoutError:
+                _stat["timeout"] += 1
+                _fail_run += 1
+                logger.warning("[decide] 判断超时 %.0fs，照旧说话（fail-open）",
+                               TIMEOUT)
+                f = None
+            except BaseException as e:
+                _stat["fail"] += 1
+                _fail_run += 1
+                logger.warning("[decide] 判断失败，照旧说话（fail-open）: %s", e)
+                f = None
+            ms = (time.time() - t0) * 1000
+            _stat["ms_total"] += ms
+
+            if f is None:
+                if _fail_run >= FAIL_MAX:
+                    _breaker_until = time.time() + COOLDOWN
+                    _fail_run = 0
+                    logger.warning(
+                        "[decide] 连续失败 %d 次，熔断 %.0fs（这期间照旧说话）",
+                        FAIL_MAX, COOLDOWN,
+                    )
+                return
+            _fail_run = 0
+            _stat["asked"] += 1
+
+            act, why = verdict(f)
+            flags = "".join(k[0].upper() if f[k] else "." for k in _BOOLS)
+            brief = "%s [%s] %s topic=%s tone=%s avoid=%s %.0fms" % (
+                act, flags, why, f.get("topic") or "-", f.get("tone") or "-",
+                f.get("avoid") or "-", ms,
+            )
+            _last.append(time.strftime("%H:%M:%S ") + brief)
+            del _last[:-12]
+
+            if act == "沉默":
+                n = _silence_streak.get(gid, 0) + 1
+                if n > MAX_STREAK:
+                    _silence_streak[gid] = 0
+                    _stat["streak_release"] += 1
+                    logger.info("[decide] 连续沉默 %d 次，强制放行一次｜%s",
+                                n, brief)
+                    return
+                _silence_streak[gid] = n
+                _stat["silence"] += 1
+                if SHADOW:
+                    logger.info("[decide] 影子模式：本该沉默但放行｜%s", brief)
+                    return
+                logger.info("[decide] 这轮不说话（省一次主调用）｜%s", brief)
+                event.stop_event()
+                return
+
+            _silence_streak[gid] = 0
+            _stat["speak"] += 1
+            req.extra_user_content_parts.append(TextPart(text=_render(f)))
+            logger.info("[decide] 开口｜%s", brief)
+        except BaseException as e:
+            # 决策步自己出问题，绝不能连累正常对话
+            logger.warning("[decide] 整体失败，照旧说话: %s", e)
+
+    @filter.command("插话判断")
+    async def cmd_status(self, event: AstrMessageEvent):
+        s = _stat
+        judged = s["silence"] + s["speak"]
+        rate = (s["silence"] / judged * 100) if judged else 0.0
+        saved = s["silence"] + s["gap_silence"]
+        avg = s["ms_total"] / max(1, s["asked"])
+        lines = [
+            "插话判断：%s%s" % ("开" if ENABLED else "关",
+                              "（影子模式，只看不拦）" if SHADOW else ""),
+            "看到群消息 %d 次" % s["seen"],
+            "  不判断：被喊 %d｜指令 %d｜明确要东西 %d｜内容太少 %d｜熔断 %d"
+            % (s["skip_addressed"], s["skip_cmd"], s["skip_ask"],
+               s["skip_thin"], s["breaker"]),
+            "  刚说过%.0fs内直接闭嘴 %d 次" % (MIN_GAP, s["gap_silence"]),
+            "真问模型 %d 次，平均 %.0fms（正则兜底解析 %d 次）"
+            % (s["asked"], avg, s["parse_fallback"]),
+            "  结果：沉默 %d｜开口 %d  →  判沉默率 %.0f%%"
+            % (s["silence"], s["speak"], rate),
+            "省下的主调用：约 %d 次（每次约 9400 输入 token）" % saved,
+            "失败 %d｜超时 %d｜连续沉默强制放行 %d｜拦下越权 avoid %d"
+            % (s["fail"], s["timeout"], s["streak_release"], s["avoid_dropped"]),
+        ]
+        if _last:
+            lines.append("最近几次判断：")
+            lines += ["  " + x for x in _last[-6:]]
+        yield event.plain_result("\n".join(lines))

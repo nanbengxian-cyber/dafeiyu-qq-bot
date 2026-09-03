@@ -1,0 +1,21 @@
+# 忽略构建产物与本地状态
+node_modules/
+__pycache__/
+*.pyc
+build/
+out/
+state/
+
+# 密钥与本机配置：绝不入库
+*.jks
+*.keystore
+.env
+config.json
+*.credentials.yaml
+*.idsig
+
+# 编辑器与系统
+.DS_Store
+*.swp
+*.bak
+*.bak.*

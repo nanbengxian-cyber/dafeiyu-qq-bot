@@ -1,0 +1,4 @@
+name: dsh-decide
+desc: 主动插话前先用小模型判断「在聊什么、该不该开口、要做什么」，判沉默就在 on_llm_request 里 stop_event 掐掉整次主模型调用（省 ~9400 token），判开口则把意图作为 <judgement> 块注入。失败一律 fail-open。
+author: 大肥鱼
+version: 1.0.0

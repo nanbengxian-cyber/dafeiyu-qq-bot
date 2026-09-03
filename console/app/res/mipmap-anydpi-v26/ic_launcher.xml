@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标（Android 8.0+）：系统按厂商形状裁剪，圆形、方形、水滴都由它决定。
+     不提供这个的话，新系统会把我们的方形图标塞进一个白色圆底里，很难看。
+     前景图是 full_bleed 渲染的（不自带圆角），所以必须靠 inset 留出安全边距 ——
+     系统只保证中间 72dp/108dp 可见，图形贴边会被裁掉。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground>
+        <inset android:drawable="@mipmap/ic_launcher_foreground"
+               android:inset="16%" />
+    </foreground>
+</adaptive-icon>

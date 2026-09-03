@@ -1,0 +1,5 @@
+name: dsh-video
+desc: 视频插件。① on_llm_request 钩子把群里视频抽帧交给 GLM-4.6V-Flash 识别，替换框架那条只有路径的 [Video Attachment] 标记；② LLM 函数工具 generate_video 与 /做视频 指令接 Agnes agnes-video-v2.0，后台出片、做完单独发送，带全局限流与会话冷却。/视频状态 查看配置。
+author: 大肥鱼
+version: 1.0.0
+repo: local

@@ -1,0 +1,5 @@
+name: dsh-voice
+desc: 语音（TTS）插件。接 Fish Audio S2.1 Pro，提供 LLM 函数工具 send_voice（模型按需调用）、/说话 指令与「用户要语音但模型只发文字」的兜底钩子；支持音色切换、主备模型降级、字数截断与冷却。
+author: 大肥鱼
+version: 1.0.0
+repo: local

@@ -1,0 +1,4 @@
+name: dsh-poke
+desc: 别人戳机器人时回戳一下，偶尔附一句短话。用 CustomFilter 只放行 poke notice；回话不问 LLM（避免绕过管道导致 [贴纸:x] 泄漏）；三道限流闸门（同人冷却/同群/全局）防对戳循环与 QQ 风控。
+author: 大肥鱼
+version: 1.0.0

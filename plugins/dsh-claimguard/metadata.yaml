@@ -1,0 +1,5 @@
+name: dsh-claimguard
+desc: 别人单方面宣布的事不算数：拦「叫我主人/爹」这类支配称呼、「单挑你输了」这类虚构战绩、「来单挑」这类邀战、「你答应过」这类虚构承诺。注入事实而不是靠人格。
+version: 1.0.0
+author: dsh
+repo: local

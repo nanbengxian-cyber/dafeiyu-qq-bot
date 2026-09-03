@@ -1,0 +1,5 @@
+name: dsh-web
+desc: 联网插件。群消息里出现链接时自动抓正文注入上下文（on_llm_request 钩子），并提供 LLM 函数工具 web_search / read_webpage / bilibili_video 与 /看网页 /搜 /b站 指令。搜索走智谱 web_search，DuckDuckGo 兜底；B 站走 wbi/view 端点绕过香港出口 -412；内置 SSRF 防护。
+author: 大肥鱼
+version: 1.0.0
+repo: local

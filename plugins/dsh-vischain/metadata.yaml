@@ -1,0 +1,5 @@
+name: dsh-vischain
+desc: 识图模型主用+备用链：claude-opus-5 → claude-opus-5-thinking → glm-4.6v-flash，主用被 Cloudflare 弹回 403 时自动降级。
+version: 1.0.0
+author: dsh
+repo: local

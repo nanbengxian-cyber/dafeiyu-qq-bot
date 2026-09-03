@@ -1,0 +1,4 @@
+name: dsh-style
+desc: 从 dsh-memory 的 buffer 表抽本群真人短句，作为 <style_samples> 块注入 LLM 请求，让机器人的句长/语感贴近真人（实测把平均 16.5 字压到 9.5 字）。
+author: 大肥鱼
+version: 1.0.0

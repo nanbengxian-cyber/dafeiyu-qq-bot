@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dafeiyu.console"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <!-- minSdk 21 = Android 5.0。这个 App 只用了 Activity/Toast/SeekBar 这些
+         从 API 1 就有的东西，压低下限纯粹是为了别在旧手机上装不上。
+         targetSdk 34 是必须的：Android 12+ 要求显式 exported，低 target 会被拒装。 -->
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <!-- 只要联网。刻意不要任何别的权限：不读通讯录、不读存储、不要位置。
+         这个 App 做的事就是往 8088 发几个 HTTP 请求。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:allowBackup="false"
+        android:supportsRtl="false"
+        android:usesCleartextTraffic="true">
+
+        <!-- usesCleartextTraffic 必须为 true：8088 是明文 HTTP，
+             Android 9(API 28) 起默认禁止明文流量，不开这个所有请求直接失败。
+             这不是疏忽，是服务端只有 HTTP 的现实约束，文档里已如实写明。 -->
+
+        <activity
+            android:name=".LoginActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+    </application>
+</manifest>

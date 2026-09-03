@@ -1,0 +1,5 @@
+name: dsh-welcome
+desc: 新成员入群欢迎。监听 OneBot group_increase 通知，用 LLM 按群人格现场生成一句简短欢迎语（失败回落预置短句），@ 新人发出。带同人去重、同群冷却、随机延迟，避免刷屏与机械感。提供 /欢迎测试 与 /欢迎状态。
+version: 1.0.0
+author: 大肥鱼
+repo: local

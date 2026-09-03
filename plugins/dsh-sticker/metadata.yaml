@@ -1,0 +1,4 @@
+name: dsh-sticker
+desc: QQ 群聊「小鲸鱼」表情包贴纸插件。回复中出现 [贴纸:名] 或 【贴纸:名】 标记时，把 data/stickers/<名>/ 下对应的 GIF 贴纸附加到该回复一并发送。
+author: 大肥鱼
+version: 1.0.0
