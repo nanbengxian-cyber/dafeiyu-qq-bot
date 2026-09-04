@@ -71,12 +71,16 @@
 #   实测还收到过尾部多一个「略」字导致整条 json.loads 失败的输出 ->
 #   schema 固定，逐字段正则兜底比整体解析稳。
 
+# [patch:ownvoice-v1 机器人自己的话进判断窗口]
+# [patch:followup-v1 被人接话时允许继续回]
+# [patch:initiate-compat-v1 认识 dsh-initiate 的合成事件]
 import asyncio
 import json
 import os
 import re
 import sqlite3
 import time
+from collections import deque
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
@@ -90,14 +94,36 @@ ENABLED = os.environ.get("DSH_DECIDE", "1") != "0"
 SHADOW = os.environ.get("DSH_DECIDE_SHADOW", "0") != "0"
 # 判断用哪个 provider。空 = 用当前会话的主 provider
 PROVIDER = os.environ.get("DSH_DECIDE_PROVIDER", "").strip()
-# 给判断多少秒。2.2s 是实测中位，8s 兜住长尾；超时就 fail-open
-TIMEOUT = float(os.environ.get("DSH_DECIDE_TIMEOUT", "8"))
+# 给判断多少秒。
+# ★ 8s 太短，实测被打爆过 ★
+# 深夜测的时候延迟中位 2.2s，8s 看着很宽裕。但白天渠道负载高，同一段代码
+# 实测中位涨到 17.8s —— 于是每次插话判断都超时 fail-open，
+# 多步思考完全失效（还照样把 token 花掉了，因为请求已经发出去）。
+# 判断只发生在**插话**路径上（被 @ 直接跳过），没人在等这句话，
+# 所以等久一点零代价；超时反而让功能静默失效。
+# 25s 覆盖实测长尾；真卡死也有熔断（连续失败 3 次停 10 分钟）兜着。
+TIMEOUT = float(os.environ.get("DSH_DECIDE_TIMEOUT", "25"))
 LOOKBACK = max(3, int(os.environ.get("DSH_DECIDE_LOOKBACK", "8")))
+# 窗口的**时间**上限。LOOKBACK 只管条数，不管这 8 条横跨多久 ——
+# 实测 571 个窗口里跨度中位 3 分钟，但 9% 超过 30 分钟、最长 603 分钟。
+# 那 9% 里「最近的话」其实是上一个话题，判断模型会拿上个话题的 tone
+# 来判当前这句（真实事故：有人认真问转学籍，窗口里 5/8 是半小时前的
+# 身份梗，于是 tone=轻松随和 → 机器人回「跟妈商量？长不大」）。
+# 宁可窗口只剩两行：模型缺上下文会偏保守（沉默），拿错上下文会自信答错。
+#
+# 20 分钟是量出来的：759 个真实窗口回溯，SPAN=20 时 87.5% 的窗口仍是
+# 完整 8 行、只有 3.6% 被削到 ≤2 行；同时它仍能砍掉事故窗口里那 4 条
+# 27~29 分钟前的旧话（SPAN=30 就砍不掉了，事故会重演）。
+SPAN = float(os.environ.get("DSH_DECIDE_SPAN", "1200"))
 FAIL_MAX = max(1, int(os.environ.get("DSH_DECIDE_FAIL_MAX", "3")))
 COOLDOWN = float(os.environ.get("DSH_DECIDE_COOLDOWN", "600"))
 # 刚说完话多少秒内不主动再开口（只管插话路径，被 @ 不受影响）。
 # 这是压「机器人占 56% 发言量」最直接的一根杠杆，且零成本。
 MIN_GAP = float(os.environ.get("DSH_DECIDE_MIN_GAP", "60"))
+# MIN_GAP 的硬地板。这么短的间隔一定是机器人自己在连着说，不值得花一次判断去问。
+# 8s 是照 segmented_reply 的实际节奏定的：分段间隔 1.2~2.8s，一条回复最多几段，
+# 所以 8s 内到达的消息基本不可能是「人看完了才回」。
+GAP_HARD = float(os.environ.get("DSH_DECIDE_GAP_HARD", "8"))
 # 连续判沉默这么多次后强制放行一次。防止判断模型某天开始无脑输出沉默
 # 把机器人变成哑巴 —— 任何单点判断都要有「卡住了怎么办」的兜底。
 MAX_STREAK = max(1, int(os.environ.get("DSH_DECIDE_MAX_SILENCE_STREAK", "6")))
@@ -106,6 +132,7 @@ SYS = ("你是一个只输出 JSON 的观察器。只描述你看到的事实，
        "不要下结论，不要解释，不要 markdown。")
 
 PROMPT = """看这段 QQ 群聊，回答几个关于**最后一条消息**的事实判断。
+（标着「你自己」的那几行是你之前说的话。）
 
 {transcript}
 
@@ -117,6 +144,7 @@ PROMPT = """看这段 QQ 群聊，回答几个关于**最后一条消息**的事
 - banter：他们在闲聊、玩梗、开玩笑、互相调侃、吐槽某人吗
 - open：最后一条是个大家都能接的话头吗（问大家、发感慨、晒东西、起哄）
 - about_bot：提到了这个机器人，或提到它擅长的事吗
+- replying_to_bot：最后一条是在回应「你自己」刚说的那句吗（顺着它答、反驳它、追问它）
 
 再补四个描述（给它开口时参考）：
 - topic：他们在聊什么，≤12字
@@ -125,9 +153,10 @@ PROMPT = """看这段 QQ 群聊，回答几个关于**最后一条消息**的事
 - avoid：社交分寸上别怎么做，≤10字。只谈态度分寸，不要写「别画」「别搜」这类拦动作的话
 
 只输出一行 JSON：
-{{"arrange":false,"venting":false,"stop":false,"ack":false,"banter":false,"open":false,"about_bot":false,"topic":"","to":"","tone":"","avoid":""}}"""
+{{"arrange":false,"venting":false,"stop":false,"ack":false,"banter":false,"open":false,"about_bot":false,"replying_to_bot":false,"topic":"","to":"","tone":"","avoid":""}}"""
 
-_BOOLS = ("arrange", "venting", "stop", "ack", "banter", "open", "about_bot")
+_BOOLS = ("arrange", "venting", "stop", "ack", "banter", "open", "about_bot",
+          "replying_to_bot")
 _STRS = ("topic", "to", "tone", "avoid")
 
 # avoid 里出现「拦掉能力」的说法就整条丢掉
@@ -171,12 +200,30 @@ _stat = {
     "asked": 0, "silence": 0, "speak": 0,
     "parse_fallback": 0, "fail": 0, "timeout": 0, "breaker": 0,
     "streak_release": 0, "avoid_dropped": 0, "ms_total": 0.0,
+    "span_dropped": 0,
 }
 _fail_run = 0
 _breaker_until = 0.0
 _silence_streak: dict[str, int] = {}
 _last_send: dict[str, float] = {}   # gid -> 机器人最后一次发言时间
+# gid -> 机器人自己最近说过的话 [(text, ts)]。
+# 为什么要自己存：dsh-memory 的 buffer 表**故意**不收机器人的话（那张表同时是
+# 群员画像的抽取源，收了会把机器人的话抽成群员事实）。但判断模型必须看见
+# 机器人说过什么，否则「这句是不是在回我」无从判断。所以在本插件进程内单独留
+# 一份，只服务于判断窗口，不落盘、重启即空（重启后最多前几轮判不出 follow_up，
+# 可接受——比污染长期记忆强）。
+_own: dict[str, "deque[tuple[str, float]]"] = {}
+OWN_MAX = max(1, int(os.environ.get("DSH_DECIDE_OWN_MAX", "4")))
 _last: list[str] = []
+
+
+def _ago(sec: float) -> str:
+    """把「距今多少秒」说成人话。判断模型靠这个看出对话是否连贯。"""
+    if sec < 45:
+        return "刚刚"
+    if sec < 3600:
+        return "%d分钟前" % max(1, int(round(sec / 60.0)))
+    return "%d小时前" % max(1, int(round(sec / 3600.0)))
 
 
 def _recent(gid: str, cur: str) -> str:
@@ -185,8 +232,18 @@ def _recent(gid: str, cur: str) -> str:
     为什么不读 req.contexts：那里是「一轮 user/assistant」的形状，被 ctxclean
     截断过，插件注入块也混在里面，判断话题不如原始群聊干净。
     buffer 表实测只存真人（机器人自己 0 行），所以它就是「群里在聊什么」。
+
+    两道闸门，条数和时间都要过：
+      · LOOKBACK 条 —— 控 token
+      · SPAN 秒   —— 控话题。超过 SPAN 的消息属于上一个话题，留着有害
+        （实测 9% 的窗口跨度 >30 分钟，最长 603 分钟）
     """
     lines: list[str] = []
+    # (显示名, ts, 文本)。为了能和机器人自己的话按时间归并，光有渲染好的
+    # 字符串不够，得留着排序键。
+    _rows: list[tuple[str, float, str]] = []
+    dropped = 0
+    span_s = 0.0
     try:
         con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2.0)
     except BaseException:
@@ -194,15 +251,28 @@ def _recent(gid: str, cur: str) -> str:
     if con is not None:
         try:
             rows = con.execute(
-                "SELECT name, user_id, text FROM buffer WHERE group_id=? "
+                "SELECT name, user_id, text, ts FROM buffer WHERE group_id=? "
                 "ORDER BY ts DESC LIMIT ?",
                 (gid, LOOKBACK),
             ).fetchall()
             rows.reverse()
-            for name, uid, text in rows:
+            # 基准时间取窗口里最新那条，不取 time.time()：
+            # 判断是被这条新消息触发的，它自己就是「现在」。用挂钟时间
+            # 会把「机器人想了 5 秒」也算进跨度里。
+            newest = max((r[3] or 0) for r in rows) if rows else 0
+            for name, uid, text, ts in rows:
                 t = (text or "").strip()
-                if t:
-                    lines.append("%s：%s" % ((name or uid).strip(), t[:60]))
+                if not t:
+                    continue
+                age = float(newest - (ts or 0))
+                if age > SPAN:
+                    dropped += 1
+                    continue
+                span_s = max(span_s, age)
+                lines.append(
+                    "[%s] %s：%s" % (_ago(age), (name or uid).strip(), t[:60])
+                )
+                _rows.append(((name or uid).strip(), float(ts or 0), t))
         except BaseException:
             pass
         finally:
@@ -210,10 +280,39 @@ def _recent(gid: str, cur: str) -> str:
                 con.close()
             except BaseException:
                 pass
+    if dropped:
+        # 必须打日志：不打的话下次再出「答非所问」还是只能靠猜是哪一环。
+        _stat["span_dropped"] += dropped
+        logger.info(
+            "[decide] 窗口砍掉 %d 条超过 %.0f 分钟的旧话（剩 %d 条／跨度 %.0f 分钟）",
+            dropped, SPAN / 60.0, len(lines), span_s / 60.0,
+        )
+    # 把机器人自己说过的话按时间戳归并进去。
+    # 必须是**归并**不是追加：模型靠先后顺序判断谁在回谁，顺序错了不如不给。
+    # lines 此刻是 [(age, 文本)] 之前的纯字符串形式装不下排序键，所以上面
+    # 改成同时收集 _rows；这里统一排序后再渲染。
+    own = list(_own.get(gid) or ())
+    if own and _rows:
+        # _rows 是 (显示名, ts, 文本) 三元组，这里只需要 ts。
+        # 原来写成 `for _n, ts in _rows` 按两元组解包，只要机器人最近说过话
+        # （_own 非空）就必抛 ValueError: too many values to unpack，
+        # 整个 decide 落到 fail-open「照旧说话」——实测今天崩 12 次 / 判成 9 次。
+        # 后果正是「主谓宾弄错」：to（这句是谁对谁说的）这条判断根本没送进模型。
+        newest_ts = max(r[1] for r in _rows)
+        for text, ts in own:
+            age = float(newest_ts - ts)
+            if age < 0 or age > SPAN:
+                continue
+            _rows.append(("你自己", ts, text))
+        _rows.sort(key=lambda r: r[1])
+        lines = ["[%s] %s：%s" % (_ago(float(newest_ts - r[1])), r[0], r[2][:60])
+                 for r in _rows]
     c = (cur or "").strip()
     if c and (not lines or c not in lines[-1]):
         lines.append("（刚刚这条）%s" % c[:60])
-    return "\n".join(lines[-LOOKBACK:])
+    # 上限放宽到 LOOKBACK + OWN_MAX：LOOKBACK 是为了控真人消息的 token，
+    # 机器人自己的话是新增的必要信息，不该把真人消息挤掉。
+    return "\n".join(lines[-(LOOKBACK + OWN_MAX):])
 
 
 def _parse(raw: str) -> dict | None:
@@ -270,6 +369,11 @@ def verdict(f: dict) -> tuple[str, str]:
     """
     if f["stop"]:
         return "沉默", "有人叫别插话"
+    # 「在回你」是最强的正向信号：被人接了话还装死，是真人绝不会有的行为。
+    # 位置有讲究 —— 排在 stop 后面（明说别插话就闭嘴），但排在 venting/arrange
+    # 前面（诉苦的人回了你还不理，比抖机灵更伤人）。ack 仍然否决，见下。
+    if f.get("replying_to_bot") and not f["ack"]:
+        return "回话", "在回你"
     if f["venting"]:
         return "沉默", "有人在诉苦"
     if f["arrange"] and not f["banter"]:
@@ -313,11 +417,12 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[decide] 已加载：%s%s 超时%.0fs 回看%d条 刚说过%.0fs内不插话 "
-            "熔断%d次/%.0fs",
+            "[decide] 已加载：%s%s 超时%.0fs 回看%d条/%.0f分钟内 "
+            "刚说过%.0fs内只回接话/%.0fs内全闭嘴 自己的话记%d条 熔断%d次/%.0fs",
             "开" if ENABLED else "关",
             "（影子模式，只看不拦）" if SHADOW else "",
-            TIMEOUT, LOOKBACK, MIN_GAP, FAIL_MAX, COOLDOWN,
+            TIMEOUT, LOOKBACK, SPAN / 60.0, MIN_GAP, GAP_HARD, OWN_MAX,
+            FAIL_MAX, COOLDOWN,
         )
 
     # ---------------------------------------------------------- 记自己何时说过
@@ -329,8 +434,24 @@ class Main(star.Star):
         """
         try:
             gid = str(event.get_group_id() or "")
-            if gid:
-                _last_send[gid] = time.time()
+            if not gid:
+                return
+            _last_send[gid] = time.time()
+            # 顺手记下正文。respond/stage.py 在 OnAfterMessageSentEvent 之后才
+            # clear_result()，所以这里还拿得到（已核对源码）。
+            text = ""
+            try:
+                res = event.get_result()
+                if res is not None:
+                    text = (res.get_plain_text() or "").strip()
+            except BaseException:
+                text = ""
+            if not text:
+                return
+            q = _own.get(gid)
+            if q is None:
+                q = _own[gid] = deque(maxlen=OWN_MAX)
+            q.append((text[:60], time.time()))
         except BaseException:
             pass
 
@@ -375,6 +496,15 @@ class Main(star.Star):
 
             if event.get_message_type() != MessageType.GROUP_MESSAGE:
                 return
+            # dsh-initiate 造的「主动开口」合成事件：直接让路。
+            # 本插件判的是「要不要插进正在进行的对话」，而主动开口的前提是
+            # **没有**正在进行的对话 —— 同一把尺子量出来的结论是反的，
+            # 而且这里有 stop_event 权限，判沉默就把整次开口掐死了。
+            # 那边已经用相反形状的判据（必须有正向证据才开口）判过一轮。
+            if event.get_extra("dsh_initiate"):
+                _stat["skip_initiate"] = _stat.get("skip_initiate", 0) + 1
+                logger.info("[decide] 主动开口事件，让路不判")
+                return
             gid = str(event.get_group_id() or "")
             if not gid:
                 _stat["skip_nogid"] += 1
@@ -401,9 +531,11 @@ class Main(star.Star):
 
             # 刚说过话就先闭嘴。压发言占比最直接、且完全不花钱的一根杠杆。
             gap = time.time() - _last_send.get(gid, 0.0)
-            if gap < MIN_GAP:
+            # 硬地板：一定是自己连着说，不问模型（零成本）。
+            if gap < GAP_HARD:
                 _stat["gap_silence"] += 1
-                brief = "刚说过 %.0fs 前（<%.0fs），这轮不说话" % (gap, MIN_GAP)
+                brief = "刚说过 %.0fs 前（<%.0fs 硬地板），这轮不说话" % (
+                    gap, GAP_HARD)
                 _last.append(time.strftime("%H:%M:%S ") + brief)
                 del _last[:-12]
                 if SHADOW:
@@ -412,6 +544,11 @@ class Main(star.Star):
                 logger.info("[decide] %s（省一次主调用）", brief)
                 event.stop_event()
                 return
+            # 软区间：照常问模型，但下面只有「在回你」才放行。
+            # 这里多花一次判断步（≈主调用的 4%），换「被人回了不装死」。
+            in_gap = gap < MIN_GAP
+            if in_gap:
+                _stat["gap_soft"] = _stat.get("gap_soft", 0) + 1
 
             if time.time() < _breaker_until:
                 _stat["breaker"] += 1
@@ -455,6 +592,13 @@ class Main(star.Star):
             _stat["asked"] += 1
 
             act, why = verdict(f)
+            # 软区间收紧：刚说过话，只有「在回你」才准开口。
+            # 不在这里提前 return 是刻意的 —— 走同一条沉默路径，日志形状一致，
+            # 统计口径也一致（否则「为什么没说话」又要分两处查）。
+            if in_gap and act == "回话" and not f.get("replying_to_bot"):
+                _stat["gap_soft_silence"] = _stat.get("gap_soft_silence", 0) + 1
+                act = "沉默"
+                why = "刚说过 %.0fs（<%.0fs）且不是在回你" % (gap, MIN_GAP)
             flags = "".join(k[0].upper() if f[k] else "." for k in _BOOLS)
             brief = "%s [%s] %s topic=%s tone=%s avoid=%s %.0fms" % (
                 act, flags, why, f.get("topic") or "-", f.get("tone") or "-",
@@ -503,6 +647,8 @@ class Main(star.Star):
             % (s["skip_addressed"], s["skip_cmd"], s["skip_ask"],
                s["skip_thin"], s["breaker"]),
             "  刚说过%.0fs内直接闭嘴 %d 次" % (MIN_GAP, s["gap_silence"]),
+            "  窗口砍掉超过%.0f分钟的旧话 %d 条（防拿上个话题的语气判这句）"
+            % (SPAN / 60.0, s["span_dropped"]),
             "真问模型 %d 次，平均 %.0fms（正则兜底解析 %d 次）"
             % (s["asked"], avg, s["parse_fallback"]),
             "  结果：沉默 %d｜开口 %d  →  判沉默率 %.0f%%"

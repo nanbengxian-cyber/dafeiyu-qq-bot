@@ -10,7 +10,7 @@
 # 「富人」这个词根本不在那句话里 —— 它在**上一条别人说的话**里。
 # 也就是说它抓错了「当前该回哪一句」。
 #
-# 根因不在人格提示词，在会话历史的形状。量出来的现状（真实群 100000001）：
+# 根因不在人格提示词，在会话历史的形状。量出来的现状（真实群 <群号>）：
 #
 #   历史 293 轮 / 588 条消息 / 25.7 万字 / token_usage 5.2 万
 #   其中「陈旧注入块」487 个：
@@ -66,6 +66,7 @@
 #   tool_calls」这种 OpenAI 会直接 400 的序列。
 # · 任何异常都吞掉并原样返回，宁可不清理也不能让消息发不出去。
 
+# [patch:initiate-compat-v1 认识 dsh-initiate 的合成事件]
 import os
 import re
 
@@ -106,6 +107,16 @@ _SPONTANEOUS = (
     "先看清这句话是谁对谁说的，只挑你真能接的点，用一句短话插进去；"
     "接不上就说句最短的废话带过，别硬编内容。</reply_context>"
 )
+# 第三档：dsh-initiate 的主动开口。前两档都在描述「有一句话」，
+# 而这一档根本没有那句话 —— 群里静着，是它自己决定开口的。
+# 落到 _SPONTANEOUS 会让模型去「看清这句话是谁对谁说的」，
+# 那句话不存在，于是它会接一句凭空想象出来的话。
+# 具体安静了多久、刚才在聊什么，由 dsh-initiate 的 <initiate_context> 块给。
+_INITIATED = (
+    "<reply_context>没人在跟你说话，群里这会儿是静着的，是你自己决定开个口。"
+    "所以：别回答什么、别应答、别问「大家在吗」这种废话；"
+    "就像人翻到一个冷掉的群随口丢一句那样，说一句你真想说的短话。</reply_context>"
+)
 
 # 注入块的形状：整段以 <小写标签> 开头。用结构判断而不是枚举插件名，
 # 这样以后任何插件新增 <xxx_context> 块都会被自动清掉，不用改这里。
@@ -127,7 +138,9 @@ _EMPTY_AT_REPLACEMENT = "（只@了你，没说内容）"
 
 # 这些标签即使出现在 index>=1 也不删 —— 它们描述的是**这条消息本身**
 # 带的内容（图片说明），不是外部注入的一轮性背景。
-_NEVER_DROP = {"image_caption"}
+# quoted_message 由 dsh-quote 注入，描述的是**这条消息本身**引用了谁的哪句话，
+# 和框架原来的 <Quoted Message> 同语义，所以和 image_caption 一样留在历史里。
+_NEVER_DROP = {"image_caption", "quoted_message"}
 # reply_context 由本插件在当轮注入；它进历史后就过期了，所以**不**加白名单，
 # 让下一轮的清理把它删掉。这里写下来是为了防止以后有人误加。
 
@@ -317,13 +330,14 @@ class Main(star.Star):
 
             if event.get_message_type() != MessageType.GROUP_MESSAGE:
                 return
-            addressed = bool(getattr(event, "is_at_or_wake_command", False))
-            req.extra_user_content_parts.append(
-                TextPart(text=_ADDRESSED if addressed else _SPONTANEOUS)
-            )
-            logger.info(
-                "[ctxclean] 这轮是%s", "被喊的" if addressed else "自己插话"
-            )
+            if event.get_extra("dsh_initiate"):
+                kind, block = "主动开口", _INITIATED
+            elif bool(getattr(event, "is_at_or_wake_command", False)):
+                kind, block = "被喊的", _ADDRESSED
+            else:
+                kind, block = "自己插话", _SPONTANEOUS
+            req.extra_user_content_parts.append(TextPart(text=block))
+            logger.info("[ctxclean] 这轮是%s", kind)
         except BaseException as e:
             logger.error("[ctxclean] 标注失败: %s", e)
 

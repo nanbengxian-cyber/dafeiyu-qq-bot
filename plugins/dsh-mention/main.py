@@ -68,6 +68,7 @@
 # 插 At 的代码在第 429 行——钩子跑在前面，所以这里插入的 At 位置和框架一致，
 # 后续的分段回复、t2i 等逻辑都能正常处理。
 
+# [patch:initiate-compat-v1 认识 dsh-initiate 的合成事件]
 import os
 import time
 from collections import deque
@@ -197,6 +198,10 @@ class Main(star.Star):
             # 机器人自己的话不算插话，否则它一开口就把自己算进去了
             if uid == str(event.get_self_id() or ""):
                 return
+            # dsh-initiate 的合成事件不是真人发言，记进来会污染
+            # 「他发问后别人又说了几条」这个计数（那是另外两条 @ 规则的判据）。
+            if event.get_extra("dsh_initiate"):
+                return
             q = _recent.get(gid)
             if q is None:
                 q = _recent[gid] = deque(maxlen=_RECENT_MAX)
@@ -223,6 +228,13 @@ class Main(star.Star):
         try:
             result = event.get_result()
             if result is None or not result.chain:
+                return
+
+            # 主动开口没有「发送者」可 @：dsh-initiate 的合成事件用的是哨兵号
+            # （不能用机器人自己的号，ignore_bot_self_message=True 会把事件掐掉），
+            # 插进去就是一个点不动的 @。
+            if event.get_extra("dsh_initiate"):
+                logger.info("[mention] at=False 主动开口，没有对象可@")
                 return
 
             # 和框架保持一致：只给纯文本/图文消息加 @，别去动转发、语音等复杂链
