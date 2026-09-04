@@ -2,9 +2,9 @@
 
 [中文](#中文) · [English](#english)
 
-一套让 QQ 群机器人「像真人群友一样说话」的完整工程：16 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
+一套让 QQ 群机器人「像真人群友一样说话」的完整工程：19 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
 
-A complete engineering effort to make a QQ group bot *talk like an actual group member*: 16 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
+A complete engineering effort to make a QQ group bot *talk like an actual group member*: 19 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
 
 ---
 
@@ -18,16 +18,28 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
-| [`plugins/`](plugins/) | 16 个 AstrBot 插件，9600 行 —— 机器人的全部能力 | Python |
+| [`plugins/`](plugins/) | 19 个 AstrBot 插件，约 1.09 万行 —— 机器人的全部能力 | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
-| [`docs/`](docs/) | 部署手册与 12 份问题根因分析 | Markdown |
+| [`docs/`](docs/) | 部署手册与 13 份问题根因分析 | Markdown |
+
+### 最新更新 · 2026-09-04
+
+三块新能力已在真群上线（不再是影子模式）：
+
+- **冷场会自己开口。** 安静超过 15 分钟它自己起个话头，每天最多 3 次、两次间隔 1 小时、只在活跃时段（本群实测 10:00–02:59，03:00–09:59 几乎无人说话）。开口走完整消息管道，所以贴纸、@ 策略、分段发送全部照常。判断失败或超时一律沉默 —— fail-**closed**，因为主动说错话的代价大于不说话。
+- **说话带情绪。** 六种情绪同时只有一种，一条消息最多触发一种。必须有「针对谁」的结构证据才算：群友互骂、自嘲、转述第三方、整句引用都不改变它的情绪。清零走道歉 / 连续 2 条中性 / 问题被回答 / 分情绪 TTL 四条路，而不是只等超时。
+- **看得懂引用了。** 按 QQ 号说清「谁在说 / 引用谁的哪句 / 是不是自己说的 / @ 的是谁」。
+
+同时修掉一个藏了半天的真崩溃：`dsh-decide` 把三元组按两元组解包，只要机器人刚说过话就必抛异常，当天崩 12 次 / 成功 9 次。因为兜底是 fail-open，表面上一切正常，实际超过一半发言都没收到「这句是谁对谁说的」的判断 —— 这就是「主谓宾弄错」的直接原因。
+
+上线前：**61 项新增单元测试**（情绪 36 + 引用 25）＋ **1618 条真实历史回放**。回放揪出两个真误判：把「余额 / 额度」里的「额」当成尴尬语气词（9 次尴尬命中里 8 次误判），以及把没有指向的话当成在骂它（38 次命中里 25 次整句没有「你」）。细节见 [46-主动开口与情绪系统](docs/46-主动开口与情绪系统.md)。
 
 ### 成品下载
 
 安卓控制台 App 在 [Releases](../../releases) 页面下载（约 110 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
 
-### 16 个插件在解决什么
+### 19 个插件在解决什么
 
 每个插件对应一个**实际发生过的问题**，不是功能清单式的堆砌。
 
@@ -40,6 +52,9 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-decide`](plugins/dsh-decide/) | 主动插话前先用小模型判断「在聊什么、该不该开口」，判沉默就掐掉整次主模型调用，省约 9400 token。 |
 | [`dsh-mention`](plugins/dsh-mention/) | 每条回复都 @ 人。只在「调了工具 / 被别人的消息刷走 / 隔太久」时才 @。 |
 | [`dsh-claimguard`](plugins/dsh-claimguard/) | 被骗认输。有人说「叫我爸爸」「单挑你输了」它就当真 —— 靠注入事实而不是改人格来修。 |
+| [`dsh-initiate`](plugins/dsh-initiate/) | 冷场就一直安静。真人会自己起话头，它不会。五道纯代码闸门（冷场 15 分钟~6 小时、活跃时段、1 小时冷却、每日 3 次）过了才让小模型看一眼有没有值得接的话头；决定开口就造合成事件走**完整消息管道**，贴纸剥离/@ 策略/分段发送全部照常。判断失败一律沉默。 |
+| [`dsh-emotion`](plugins/dsh-emotion/) | 语气永远一个样。六种情绪同时只有一种，固定优先级仲裁保证一条消息只触发一种（「你好厉害但也真让我失望」只取低落）。清零四条路：道歉、连续 2 条中性、问题被回答、分情绪 TTL。 |
+| [`dsh-quote`](plugins/dsh-quote/) | 看不懂引用，把别人做的事说成自己做的。框架的引用块只给昵称，而群里有真人把昵称改成和机器人一样 —— **凭昵称在群聊里永远认不了人**。改为按 QQ 号写清「谁在说 / 引用谁的哪句 / 是不是自己说的 / 这次 @ 谁」。 |
 
 **多模态**
 
@@ -62,7 +77,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-poke`](plugins/dsh-poke/) | 戳一戳没反应。回话不问 LLM，三道限流防对戳循环。 |
 | [`dsh-welcome`](plugins/dsh-welcome/) | 入群欢迎。用 LLM 现场生成而不是写死模板（模板会破人设）。 |
 
-### 反复踩到的四个坑
+### 反复踩到的七个坑
 
 这些教训在多个插件上重复验证过，写在这里省得再踩：
 
@@ -70,6 +85,9 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 2. **不触发时必须打日志。** 否则每次排查只能靠猜。`dsh-imagegen` 的「有时候不生图」查了三轮，前两轮全是因为没有日志。
 3. **绕过消息管道直接调 LLM 的地方，必须自己复制一份标记剥离逻辑。** `llm_generate` 不走管道，贴纸钩子不会触发，`[贴纸:探头]` 就这样漏进过群聊。
 4. **阈值必须由实测分布决定。** `dsh-mention` v1 有条「延迟 ≥8s 就 @」的规则，但量到的是机器人自己想了多久 —— 一次带人格的调用普遍 5~15 秒，于是等价于「无条件 @」，24 小时 8 条回复 100% 都 @ 了。
+5. **fail-open 会把崩溃伪装成质量下降。** `dsh-decide` 有个三元组按两元组解包的 bug，只要机器人刚说过话就必抛 `ValueError`，整次判断落到 fail-open「照旧说话」——**当天崩 12 次、成功 9 次**，超过一半发言模型都没收到「这句是谁对谁说的」。功能看起来完全正常，只是说得不对。凡是 fail-open 的兜底，必须在兜底路径上打 WARN 并计数。
+6. **命中数归零不等于误判修好了。** 收紧「提问」规则后 `dsh-emotion` 的好奇命中从 14 掉到 0，看着像不再误判，实际是全漏了 —— 群里最常见的追问「那你为什么没有」疑问词在句中，而新正则只锚定句首。规则改动必须逐样本对比，不能只看总数。
+7. **影子模式的价值在于回放，不在于等。** 挂着跑一晚只能看到当晚那几条；拿 1618 条历史语料回放，两个真误判 20 分钟就暴露了（把「余额/额度」当成尴尬语气词、把没有指向的话当成在骂它）。
 
 ### 文档
 
@@ -84,6 +102,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [42-空头承诺根因与修复](docs/42-空头承诺根因与修复.md) | 「嘴上答应却不做」的机制 |
 | [43-说话更真实方案](docs/43-说话更真实方案.md) · [44-实施记录](docs/44-说话更真实实施记录.md) | 方案与落地数据 |
 | [45-戳一戳与违规禁言](docs/45-戳一戳与违规禁言.md) | 权限模型与限流设计 |
+| [46-主动开口与情绪系统](docs/46-主动开口与情绪系统.md) | 冷场主动开口的五道闸门、单一主情绪的仲裁与清零、引用按 QQ 号认人；含影子回放揪出的两个真误判 |
 | [50-多模态接入与验证记录](docs/50-多模态接入与验证记录.md) | 图/视频/语音/联网的逐项实测，含失败记录 |
 | [60-长期目标与技术方案](docs/60-长期目标与技术方案.md) | 整体架构与演进方向 |
 
@@ -111,6 +130,11 @@ python3 plugins/dsh-style/test_style.py
 python3 plugins/dsh-decide/test_decide.py
 python3 plugins/dsh-poke/test_poke.py
 python3 plugins/dsh-sticker/test_sticker.py
+python3 plugins/dsh-emotion/test_emotion.py    # 36 项
+python3 plugins/dsh-quote/test_quote.py        # 25 项
+
+# 拿你自己的历史语料回放情绪判定，找误判（单测只能验证你已经想到的情况）
+python3 plugins/dsh-emotion/replay_emotion.py
 ```
 
 控制台 App 自己出包（不需要 Gradle 和 Android Studio）：
@@ -156,16 +180,28 @@ Four independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
-| [`plugins/`](plugins/) | 16 AstrBot plugins, 9.6k lines — all bot capabilities | Python |
+| [`plugins/`](plugins/) | 19 AstrBot plugins, ~10.9k lines — all bot capabilities | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
-| [`docs/`](docs/) | Deployment manual and 12 root-cause analyses | Markdown |
+| [`docs/`](docs/) | Deployment manual and 13 root-cause analyses | Markdown |
+
+### Latest update · 2026-09-04
+
+Three new capabilities are live in a real group (no longer shadow mode):
+
+- **It starts conversations when the room goes quiet.** After 15 minutes of silence it opens a thread itself — at most 3 times a day, 1 hour apart, and only during active hours (measured 10:00–02:59 for this group; 03:00–09:59 is nearly empty). It speaks through the full message pipeline, so sticker stripping, mention policy, and segmented sending all still apply. Any judgment failure or timeout means silence — fail-**closed**, because saying the wrong thing unprompted costs more than saying nothing.
+- **It speaks with emotion.** Six emotions, exactly one at a time, and a single message triggers at most one. Structural evidence of *who is being addressed* is required: members insulting each other, self-deprecation, third-party narration, and whole-message quotes never move its emotion. Resets go through apology / two consecutive neutral messages / question answered / per-emotion TTL, not just expiry.
+- **It understands quotes.** By QQ ID it now states who is speaking, whose line was quoted, whether that line was its own, and who was mentioned.
+
+Also fixed a real crash that had been hiding for half a day: `dsh-decide` unpacked a 3-tuple as a 2-tuple, so once the bot had spoken recently it always threw — 12 crashes vs 9 successful judgments that day. Because the fallback was fail-open, everything looked fine while over half the replies never received the "who is speaking to whom" verdict. That was the direct cause of the bot mixing up subject and object.
+
+Before rollout: **61 new unit tests** (36 emotion + 25 quote) and a **1618-message replay over real history**. The replay caught two genuine misjudgments: treating the character in "balance/quota" as an awkward filler (8 of 9 awkward hits were false), and treating undirected insults as aimed at the bot (25 of 38 hits had no second-person reference at all). Details in [46-主动开口与情绪系统](docs/46-主动开口与情绪系统.md).
 
 ### Download
 
 The Android console app is on the [Releases](../../releases) page (~110 KB, Android 5.0+). Enter your own server address on the login screen; the package embeds no server details.
 
-### What the 16 plugins fix
+### What the 19 plugins fix
 
 Each plugin addresses a **problem that actually happened**, not a feature checklist.
 
@@ -178,6 +214,9 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-decide`](plugins/dsh-decide/) | Before jumping in unprompted, a small model judges "what's being discussed, should I speak". A "stay silent" verdict cancels the entire main-model call, saving ~9400 tokens. |
 | [`dsh-mention`](plugins/dsh-mention/) | @-mentioning on every reply. Now only when a tool was used, the message got buried, or too much time passed. |
 | [`dsh-claimguard`](plugins/dsh-claimguard/) | Being talked into submission. Someone says "call me daddy" or "you lost our duel" and it complies — fixed by injecting facts, not by editing the persona. |
+| [`dsh-initiate`](plugins/dsh-initiate/) | Staying silent forever once the room goes quiet. Five pure-code gates (idle 15min–6h, active hours, 1h cooldown, 3/day) run before a small model even looks for a thread worth picking up; once it decides, a **synthetic event goes through the full message pipeline**, so sticker stripping, mention policy, and segmented sending all still apply. Any judgment failure means silence. |
+| [`dsh-emotion`](plugins/dsh-emotion/) | One flat tone forever. Six emotions, exactly one at a time; fixed-priority arbitration guarantees a single message triggers only one ("you're great, but you really let me down" yields sadness only). Four reset paths: apology, two consecutive neutral messages, question answered, per-emotion TTL. |
+| [`dsh-quote`](plugins/dsh-quote/) | Misreading quotes and claiming someone else's work as its own. The framework's quote block carries only a nickname — and a real member had renamed themselves to match the bot. **Nicknames can never identify anyone in a group chat.** Now it states, by QQ ID: who is speaking, whose line they quoted, whether that line was the bot's own, and who was mentioned. |
 
 **Multimodal**
 
@@ -200,7 +239,7 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-poke`](plugins/dsh-poke/) | No reaction to pokes. The reply never calls an LLM; three rate limits prevent poke loops. |
 | [`dsh-welcome`](plugins/dsh-welcome/) | Greeting new members. Generated by the LLM rather than a fixed template (templates break character). |
 
-### Four lessons learned the hard way
+### Seven lessons learned the hard way
 
 Each was re-validated across multiple plugins:
 
@@ -208,6 +247,9 @@ Each was re-validated across multiple plugins:
 2. **Log the non-trigger path.** Otherwise every investigation is guesswork. `dsh-imagegen`'s "sometimes doesn't generate" took three rounds; the first two failed purely for lack of logs.
 3. **Anywhere you call an LLM outside the message pipeline, duplicate the marker-stripping logic.** `llm_generate` bypasses the pipeline, so the sticker hook never fires — that's how `[sticker:peek]` leaked into the group.
 4. **Thresholds must come from measured distributions.** `dsh-mention` v1 had "mention if delay ≥ 8s", but the delay measured *the bot's own thinking time* — a persona-laden call routinely takes 5–15s, making the rule equivalent to "always mention". Result: 8 of 8 replies over 24 hours carried a mention.
+5. **Fail-open disguises a crash as a quality regression.** `dsh-decide` unpacked a 3-tuple as a 2-tuple, so once the bot had spoken recently it always raised `ValueError` and fell through to fail-open "just talk anyway" — **12 crashes vs 9 successful judgments in one day**, meaning over half the replies never received the "who is speaking to whom" verdict. The feature looked perfectly healthy; it was just wrong. Any fail-open fallback must log at WARN and count.
+6. **A trigger count dropping to zero doesn't mean the misjudgment is fixed.** After tightening the question rule, `dsh-emotion`'s curiosity hits fell from 14 to 0 — which looked like "no more false positives" but was total blindness: the most common follow-up in this group ("so why don't you") has its question word mid-sentence, while the new regex anchored to the start. Rule changes require per-sample comparison, never just totals.
+7. **Shadow mode is valuable for replay, not for waiting.** Running it overnight only reveals that night's handful of messages; replaying 1618 archived messages exposed both real misjudgments in 20 minutes (treating the substring in "balance/quota" as an awkward filler word, and treating undirected insults as aimed at the bot).
 
 ### Quick start
 
@@ -233,6 +275,11 @@ python3 plugins/dsh-style/test_style.py
 python3 plugins/dsh-decide/test_decide.py
 python3 plugins/dsh-poke/test_poke.py
 python3 plugins/dsh-sticker/test_sticker.py
+python3 plugins/dsh-emotion/test_emotion.py    # 36 cases
+python3 plugins/dsh-quote/test_quote.py        # 25 cases
+
+# Replay emotion decisions over your own history to surface misjudgments
+python3 plugins/dsh-emotion/replay_emotion.py
 ```
 
 Build the console APK yourself (no Gradle, no Android Studio):
