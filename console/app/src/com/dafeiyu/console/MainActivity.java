@@ -14,6 +14,7 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.CompoundButton;
+import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -71,6 +72,7 @@ public class MainActivity extends Activity {
         tab = store.tab();
         setContentView(buildShell());
         loadAll(false);
+        checkServerVersion();
     }
 
     // ---------------------------------------------------------------- 外壳
@@ -271,6 +273,44 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 版本端点只负责提示，不自动安装：明文 HTTP 下自动下载并静默安装不可控。 */
+    private void checkServerVersion() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Map<String, Object> info = store.api().version();
+                    final String url = store.api().base() + "/console.apk";
+                    Object apk = info.get("apk");
+                    Long serverCode = apk instanceof Map ? Json.lng(apk, "version_code") : null;
+                    if (apk instanceof Map && Json.bool(apk, "available", false)
+                            && serverCode != null && serverCode.longValue() > 1L) {
+                        final long bytes = Json.lng(apk, "size") == null ? 0
+                                : Json.lng(apk, "size").longValue();
+                        ui.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                new AlertDialog.Builder(MainActivity.this)
+                                        .setTitle("服务器有新的控制台 APK")
+                                        .setMessage("新版大小 " + (bytes / 1024) + " KB，打开下载页更新。")
+                                        .setNegativeButton("稍后", null)
+                                        .setPositiveButton("打开下载", new DialogInterface.OnClickListener() {
+                                            @Override
+                                            public void onClick(DialogInterface d, int which) {
+                                                startActivity(new Intent(Intent.ACTION_VIEW,
+                                                        android.net.Uri.parse(url)));
+                                            }
+                                        }).show();
+                            }
+                        });
+                    }
+                } catch (Exception ignored) {
+                    // 版本提示失败不影响状态和配置页。
+                }
+            }
+        }, "version").start();
+    }
+
     // ---------------------------------------------------------------- 渲染
 
     private void render() {
@@ -468,6 +508,26 @@ public class MainActivity extends Activity {
                 }
             });
             box.addView(bar);
+        } else if (k.isText()) {
+            final EditText input = new EditText(this);
+            input.setText(KnobModel.csvText(cur));
+            input.setTextColor(Theme.TEXT);
+            input.setTextSize(16);
+            input.setSingleLine(false);
+            input.setHint(k.name + (k.isCsv() ? "（逗号分隔）" : ""));
+            input.setEnabled(!k.readOnly());
+            input.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+                @Override
+                public void onFocusChange(View v, boolean hasFocus) {
+                    if (!hasFocus && !k.readOnly()) {
+                        edited.put(k.path, k.isCsv()
+                                ? KnobModel.csvParse(input.getText().toString())
+                                : input.getText().toString());
+                    }
+                }
+            });
+            box.addView(input, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         } else {
             TextView t = new TextView(this);
             t.setText(k.name + "：" + KnobModel.show(k, cur));

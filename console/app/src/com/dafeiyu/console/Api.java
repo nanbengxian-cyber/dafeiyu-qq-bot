@@ -174,6 +174,11 @@ public class Api {
         return get("/api/console/config", 12000);
     }
 
+    /** 轻量版本检查：不拉状态、不请求模型列表。 */
+    public Map<String, Object> version() throws ApiException {
+        return get("/api/console/version", 12000);
+    }
+
     public Map<String, Object> setKnobs(Map<String, Object> values) throws ApiException {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("values", values);

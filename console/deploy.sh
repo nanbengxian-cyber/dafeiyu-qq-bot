@@ -49,14 +49,14 @@ fi
 # ---------------------------------------------------------------- 只验证
 if [ "$MODE" != "--verify" ]; then
 
-  for f in server/console_api.py server/console_spec.py server/patch_qrweb.py; do
+  for f in server/console_api.py server/console_spec.py server/envfile.py server/patch_qrweb.py; do
     [ -s "$f" ] || die "缺 $f"
   done
   [ -s "$APK" ] || die "缺 $APK（先跑 bash build.sh）"
 
   # 本地先把要传的东西自查一遍。传上去才发现语法错，服务已经重启了，代价高。
   say "本地自查"
-  python3 -m py_compile server/console_api.py server/console_spec.py
+  python3 -m py_compile server/console_api.py server/console_spec.py server/envfile.py
   ok "Python 语法通过"
   bash test/run-tests.sh >/dev/null 2>&1 || die "JVM 单测没过，不部署"
   ok "JVM 单测通过"
@@ -80,7 +80,7 @@ EOS
   say "上传后端与 APK"
   mkdir -p /tmp/qqdeploy
   scp -q -o StrictHostKeyChecking=accept-new \
-    server/console_api.py server/console_spec.py server/patch_qrweb.py \
+    server/console_api.py server/console_spec.py server/envfile.py server/patch_qrweb.py \
     "$SERVER:$REMOTE/" || die "上传后端失败"
   ok "console_api.py / console_spec.py / patch_qrweb.py"
 
@@ -96,7 +96,7 @@ cd /opt/qqbot
 out=$(python3 patch_qrweb.py qrweb_auth.py 2>&1) || { echo "$out" >&2; exit 1; }
 echo "$out" | sed 's/^/  /'
 python3 -m py_compile qrweb_auth.py
-chmod 644 console_api.py console_spec.py public/dafeiyu-console.apk
+chmod 644 console_api.py console_spec.py envfile.py public/dafeiyu-console.apk
 EOS
   ok "补丁已应用且语法正确"
 

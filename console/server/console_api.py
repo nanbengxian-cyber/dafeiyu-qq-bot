@@ -21,6 +21,12 @@ pyjwt 要 151ms）。secret 从 cmd_config.json 读，只在进程内存里用�
 写操作的并发保护：GET 配置 → 改 → POST 回去 是读改写，中间要是有人在 WebUI 上也保存了，
 后写的会覆盖前一个。所以每次写之前记 cmd_config.json 的 md5，POST 之前再核一次，
 不一致直接 409 让你重试 —— 宁可失败也不静默吞掉别人的改动。
+
+插件旋钮（v2 新增）：22 个 dsh-* 插件的开关都在 imagegen.env 里（astrbot 的 env_file），
+不在 cmd_config.json。这类旋钮的 path 以 `env:` 开头，读写走 envfile.py 的行级编辑
+（保留那 55 行注释），同样有 md5 防冲突。它们**改完要重启容器才生效**，
+所以一律 hot=False，手机上会标出来，而且 /api/console/status 会告诉你「有几项等着重启」。
+敏感变量（API key 之类）在 spec 里 secret=True，值永不出服务器：schema 只报「已设置/未设置」。
 """
 
 import base64
@@ -34,13 +40,16 @@ import time
 import urllib.error
 import urllib.request
 
+import envfile
 from console_spec import (
     ACTION_IDS,
     ACTIONS,
     ALLOWED_PATHS,
+    ENV_PATHS,
     KNOBS,
     MODE_IDS,
     MODES,
+    PLUGIN_GROUPS,
     PLUGIN_LABELS,
 )
 
@@ -48,6 +57,10 @@ CFG_PATH = os.environ.get("CONSOLE_CFG", "/opt/qqbot/astrbot/data/cmd_config.jso
 DASH = os.environ.get("CONSOLE_DASH", "http://127.0.0.1:6185")
 PUBLIC_DIR = os.environ.get("QRWEB_DIR", "/opt/qqbot/public")
 COMPOSE_DIR = os.environ.get("CONSOLE_COMPOSE_DIR", "/opt/qqbot")
+# 插件的旋钮住在这个 env 文件里（astrbot 容器的 env_file）。
+ENV_PATH = os.environ.get("CONSOLE_ENV", "/opt/qqbot/imagegen.env")
+# APK 自更新时给手机比对的包。
+APK_NAME = os.environ.get("CONSOLE_APK", "dafeiyu-console.apk")
 CONTAINERS = ("astrbot", "napcat")
 
 # 状态缓存：手机上下拉刷新可能连点，docker inspect ×2 + plugin/get 每次约 200ms，
@@ -151,6 +164,190 @@ def plant(obj, path, value):
 KNOB_BY_PATH = {k["path"]: k for k in KNOBS}
 
 
+# ---------------------------------------------------------------- env 旋钮
+#
+# 插件的开关住在 imagegen.env，不在 cmd_config.json。这类旋钮的 path 长这样：
+#   env:DSH_VOICE_AUTO
+# 前缀是唯一判据，不看别的 —— 两套存储的读写路径完全不同，混了就会写错文件。
+
+
+ENV_PREFIX = "env:"
+
+
+def is_env_path(path):
+    return isinstance(path, str) and path.startswith(ENV_PREFIX)
+
+
+def env_var(path):
+    return path[len(ENV_PREFIX):]
+
+
+def env_fingerprint():
+    return envfile.fingerprint(ENV_PATH)
+
+
+def read_env():
+    """读 env 文件。读不到不抛异常 —— env 文件缺失时控制台的其他部分还该能用，
+    只是插件旋钮那一片显示成「读不到」。"""
+    try:
+        return envfile.read(ENV_PATH)
+    except envfile.EnvError:
+        return {}
+
+
+def env_display(knob, raw):
+    """把 env 里的字符串转成手机端要的类型。
+
+    raw 为 None 表示这个变量在文件里没设 —— 这时回**代码里的默认值**，
+    因为插件实际生效的就是那个默认值。回 null 会让人以为功能没开。
+    """
+    if knob.get("secret"):
+        # 密钥类只报「设了没设」。值一个字节都不出服务器 ——
+        # 8088 是明文 HTTP，把 key 传到手机上等于在网络里裸奔。
+        return bool(raw)
+    if raw is None:
+        raw = knob.get("default")
+        if raw is None:
+            return None
+    kind = knob["type"]
+    text = str(raw)
+    if kind == "bool":
+        return text.strip().lower() in ("1", "true", "yes", "on")
+    if kind == "int":
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+    if kind == "float":
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    if kind == "csv":
+        return [p.strip() for p in text.split(",") if p.strip()]
+    return text
+
+
+def coerce_env(knob, value):
+    """校验手机传来的 env 值，返回要写进文件的 Python 值（envfile 负责格式化）。"""
+    kind = knob["type"]
+    name = knob.get("name", knob["path"])
+    if knob.get("secret"):
+        # 密钥只允许在服务器上改。手机端拿不到旧值，也就没法判断自己是不是在覆盖，
+        # 而写错一个 key 的后果是整条能力静默失效。
+        raise ApiError("%s 是密钥，只能在服务器上改" % name, 403)
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        if value in (0, 1, "0", "1", "true", "false", "True", "False"):
+            return value in (1, "1", "true", "True")
+        raise ApiError("%s 要 true/false，收到 %r" % (name, value), 400)
+    if kind in ("int", "float"):
+        if isinstance(value, bool):
+            raise ApiError("%s 要数字，收到布尔" % name, 400)
+        try:
+            num = int(value) if kind == "int" else float(value)
+        except (TypeError, ValueError):
+            raise ApiError("%s 要数字，收到 %r" % (name, value), 400) from None
+        lo, hi = knob.get("min"), knob.get("max")
+        if lo is not None and num < lo:
+            raise ApiError("%s 不能小于 %s（收到 %s）" % (name, lo, num), 400)
+        if hi is not None and num > hi:
+            raise ApiError("%s 不能大于 %s（收到 %s）" % (name, hi, num), 400)
+        return num
+    if kind == "enum":
+        opts = knob.get("options") or []
+        vals = [o.get("value") if isinstance(o, dict) else o for o in opts]
+        if value not in vals:
+            raise ApiError("%s 只能是 %s 之一" % (name, vals), 400)
+        return value
+    if kind == "csv":
+        if isinstance(value, (list, tuple)):
+            items = [str(v).strip() for v in value]
+        else:
+            items = [p.strip() for p in str(value).split(",")]
+        items = [p for p in items if p]
+        pat = knob.get("item_pattern")
+        if pat:
+            for it in items:
+                if not re.fullmatch(pat, it):
+                    raise ApiError("%s 里的 %r 格式不对" % (name, it), 400)
+        return items
+    if kind == "str":
+        text = str(value)
+        if len(text) > int(knob.get("max_len", 200)):
+            raise ApiError("%s 太长了（上限 %s 字）" % (name, knob.get("max_len", 200)), 400)
+        pat = knob.get("pattern")
+        if pat and not re.fullmatch(pat, text):
+            raise ApiError("%s 格式不对" % name, 400)
+        return text
+    raise ApiError("未知的旋钮类型 %s" % kind, 500)
+
+
+def apply_env_knobs(values):
+    """写一批 env 旋钮。返回改动列表。
+
+    和配置旋钮分开写是刻意的：两者的存储、生效方式、失败后果都不一样。
+    env 改完要重启容器，配置是热的 —— 混在一个函数里迟早会把「改完就生效」
+    和「改完还要重启」搞混，那正是最容易骗到人的一类错。
+    """
+    if not values:
+        return []
+    unknown = [p for p in values if p not in ALLOWED_PATHS or not is_env_path(p)]
+    if unknown:
+        raise ApiError("这些插件开关不允许改：%s" % ", ".join(sorted(unknown)), 403)
+
+    updates = {}
+    knobs = {}
+    for path, raw in values.items():
+        knob = KNOB_BY_PATH[path]
+        knobs[path] = knob
+        updates[env_var(path)] = coerce_env(knob, raw)
+
+    before = env_fingerprint()
+    if before is None:
+        raise ApiError("读不到 env 文件 %s" % ENV_PATH, 500)
+    try:
+        changed = envfile.write(ENV_PATH, updates, expect_fingerprint=before, allow_add=True)
+    except envfile.EnvError as exc:
+        # 「被别处改了」要给 409，让手机提示刷新重试；其余是 400 级的用法错误。
+        code = 409 if "被别处改" in str(exc) else 400
+        raise ApiError(str(exc), code) from exc
+
+    out = []
+    for path, knob in knobs.items():
+        var = env_var(path)
+        if var in changed:
+            old, new = changed[var]
+            out.append({"path": path, "from": old, "to": new,
+                        "needs_restart": True})
+    if out:
+        invalidate_status()
+    return out
+
+
+def pending_restart():
+    """有没有 env 改动在等重启。
+
+    判据：env 文件的 mtime 比 astrbot 容器的启动时间新。这是「实际生效的是哪一份」
+    的直接证据 —— 比自己记一个「改过了」的标志可靠得多（标志会因为进程重启丢掉，
+    也会因为别人在服务器上直接 vi 而漏掉）。
+    """
+    try:
+        env_mtime = os.path.getmtime(ENV_PATH)
+    except OSError:
+        return None
+    rc, out, _ = _sh(["docker", "inspect", "-f", "{{.State.StartedAt}}", "astrbot"])
+    if rc != 0 or not out:
+        return None
+    started = _epoch_from(out.strip())
+    if started is None:
+        return None
+    if env_mtime <= started:
+        return {"pending": False}
+    return {"pending": True, "seconds": int(env_mtime - started)}
+
+
 def coerce(knob, value):
     """按 KNOBS 的声明校验并转型。越界直接报错，**不静默钳制** ——
     钳制会让手机上显示的值和真实值不一样，比报错难查得多。"""
@@ -239,11 +436,11 @@ def _containers():
     return out
 
 
-def _uptime_from(started):
-    """`2026-09-02T14:41:53.216306727Z` → 已运行秒数。
+def _epoch_from(started):
+    """`2026-09-02T14:41:53.216306727Z` → epoch 秒。
 
     docker 给的是 **UTC**，纳秒精度。`time.mktime` 会按本地时区(CST)再偏 8 小时，
-    算出来能差出 28800 秒，所以必须用 `calendar.timegm` 按 UTC 解。
+    算出来能差 28800 秒，所以必须用 `calendar.timegm` 按 UTC 解。
     """
     import calendar
 
@@ -251,7 +448,13 @@ def _uptime_from(started):
         tup = time.strptime(started[:19], "%Y-%m-%dT%H:%M:%S")
     except (ValueError, TypeError):
         return None
-    return int(time.time() - calendar.timegm(tup))
+    return calendar.timegm(tup)
+
+
+def _uptime_from(started):
+    """同上，但回「已运行多少秒」。"""
+    at = _epoch_from(started)
+    return None if at is None else int(time.time() - at)
 
 
 def _host():
@@ -314,28 +517,60 @@ def _plugins():
             {
                 "name": name,
                 "label": PLUGIN_LABELS.get(name, name),
+                "group": PLUGIN_GROUPS.get(name, "其他"),
                 "enabled": bool(item.get("activated")),
                 "version": item.get("version"),
             }
         )
-    out.sort(key=lambda x: x["name"])
+    # 先按分组（照 PLUGIN_GROUPS 声明的顺序），组内按中文名 —— 手机上列 22 个插件时，
+    # 按 dsh- 字母序排等于随机顺序，按功能归组人才找得到。
+    order = {}
+    for i, g in enumerate(_group_order()):
+        order[g] = i
+    out.sort(key=lambda x: (order.get(x["group"], 99), x["label"]))
     return out
+
+
+def _group_order():
+    """插件分组的显示顺序 = PLUGIN_GROUPS 里第一次出现的顺序。"""
+    seen = []
+    for name in PLUGIN_GROUPS:
+        g = PLUGIN_GROUPS[name]
+        if g not in seen:
+            seen.append(g)
+    return seen
 
 
 def current_mode(cfg):
     """反推当前处于哪个模式：模式声明的 knobs 全部命中才算。
     命中不了返回 None（显示「自定义」）—— 不猜、不取最接近的那个。"""
+    env = read_env()
     for mode in MODES:
         knobs = mode.get("knobs") or {}
         if not knobs:
             continue
-        if all(dig(cfg, path) == value for path, value in knobs.items()):
+        if all(_knob_matches(cfg, env, path, value)
+               for path, value in knobs.items()):
             models = mode.get("models") or {}
             if models:
                 if not _models_match(cfg, models):
                     continue
             return mode["id"]
     return None
+
+
+def _knob_matches(cfg, env, path, want):
+    """某个旋钮当前值是否等于模式声明的值。两种存储各走各的读法。
+
+    env 里存的全是字符串，所以要先按 spec 的类型转一遍再比 —— 直接拿 "1" 和
+    True 比永远不等，那样任何含 env 旋钮的模式都会永远显示成「自定义」。
+    """
+    if is_env_path(path):
+        knob = KNOB_BY_PATH.get(path)
+        if knob is None:
+            return False
+        return env_display(knob, env.get(env_var(path))) == want
+    return dig(cfg, path) == want
 
 
 def _models_match(cfg, want):
@@ -431,7 +666,12 @@ def build_status(force=False):
         },
         "tools": _recent_tool_calls(),
         "plugins": _plugins(),
+        "plugin_groups": _group_order(),
         "mode": current_mode(cfg),
+        # env 改了但容器还没重启 —— 手机上要显眼提示，否则人会以为改完就生效了
+        "env_pending": pending_restart(),
+        # 手机用它判断要不要提示更新（自更新的服务端一半）
+        "apk": apk_info(),
     }
     _status_cache["at"] = now
     _status_cache["data"] = data
@@ -441,6 +681,64 @@ def build_status(force=False):
 def invalidate_status():
     _status_cache["at"] = 0.0
     _status_cache["data"] = None
+
+
+# ---------------------------------------------------------------- APK 版本
+#
+# 自更新的服务端一半。手机拿 /api/console/version 和自己的 versionCode 比，
+# 服务器上的更新就提示下载。
+#
+# 版本号从哪来：**从 APK 文件本身读**，而不是让人在这里手写一个数字。
+# 手写的版本号迟早会和实际包不一致（改了包忘了改数字），而那种不一致是
+# 「明明推了新包手机却不提示更新」这类问题里最难查的。
+# APK 里的 AndroidManifest.xml 是二进制格式，不能直接正则；这里用 aapt 读，
+# 没有 aapt 就回落成用 md5 当版本标识 —— 至少「变了没变」永远是准的。
+
+
+def _apk_path():
+    return os.path.join(PUBLIC_DIR, APK_NAME)
+
+
+_apk_cache = {"key": None, "data": None}
+
+
+def apk_info():
+    """服务器上那个 APK 的版本信息。文件不在就回 None。
+
+    结果按 (mtime, size) 缓存 —— aapt 要 100ms 上下，而 status 是最常调的端点。
+    """
+    path = _apk_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_mtime, st.st_size)
+    if _apk_cache["key"] == key:
+        return _apk_cache["data"]
+
+    info = {
+        "available": True,
+        "size": st.st_size,
+        "built_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+        "url": "/console.apk",
+    }
+    try:
+        with open(path, "rb") as fh:
+            info["md5"] = hashlib.md5(fh.read()).hexdigest()
+    except OSError:
+        info["md5"] = None
+
+    rc, out, _ = _sh(["aapt", "dump", "badging", path], timeout=20)
+    if rc == 0:
+        m = re.search(r"versionCode='(\d+)'", out)
+        if m:
+            info["version_code"] = int(m.group(1))
+        m = re.search(r"versionName='([^']*)'", out)
+        if m:
+            info["version_name"] = m.group(1)
+    _apk_cache["key"] = key
+    _apk_cache["data"] = info
+    return info
 
 
 # ---------------------------------------------------------------- schema
@@ -471,32 +769,83 @@ def build_schema():
         if "image" in (p.get("modalities") or [])
     ]
     return {
-        "version": 1,
-        "knobs": KNOBS,
+        # version 是**schema 结构**的版本，不是 APK 版本。
+        # 2 = 加了 env: 旋钮、csv/str 类型、plugin_groups、secret 标记。
+        # 老 APK 拿到 2 也不会崩（它会跳过不认识的 type），但会少显示一批开关，
+        # 所以状态里带了 apk 版本信息让它提示更新。
+        "version": 2,
+        "knobs": [_public_knob(k) for k in KNOBS],
         "modes": MODES,
         "actions": [a for a in ACTIONS if a.get("enabled", True)],
         "chat_models": models,
         "vision_providers": visions,
         "chat_provider": chat_id,
+        "plugin_labels": PLUGIN_LABELS,
+        "plugin_groups": _group_order(),
+        # 手机端据此决定「保存后是否提示要重启」的文案
+        "env_hint": "插件开关改完要按「重载环境变量」才生效",
     }
 
 
+def _public_knob(knob):
+    """对外的旋钮描述。密钥类只保留元信息，不带默认值。
+
+    default 也要滤掉：DSH_*_API_KEY 的 default 一般是空串没关系，
+    但只要有一个 spec 里写了真值，就会顺着 schema 漏到手机上。
+    在这里统一拦掉，比在 spec 里逐条小心可靠。
+    """
+    out = dict(knob)
+    if out.get("secret"):
+        out.pop("default", None)
+        out.pop("options", None)
+        out.pop("pattern", None)
+    return out
+
+
 def build_config():
+    """所有旋钮的当前值。两种存储合成一张表 —— 手机端只认 path，不关心存在哪。"""
     cfg, _ = read_cfg()
-    return {"values": {k["path"]: dig(cfg, k["path"]) for k in KNOBS}}
+    env = read_env()
+    values = {}
+    for knob in KNOBS:
+        path = knob["path"]
+        if is_env_path(path):
+            values[path] = env_display(knob, env.get(env_var(path)))
+        else:
+            values[path] = dig(cfg, path)
+    return {"values": values, "env_pending": pending_restart()}
 
 
 # ---------------------------------------------------------------- 写操作
 
 
 def apply_knobs(values):
-    """一次性写一批配置项。空 dict 直接返回，不做无意义的保存。"""
+    """一次性写一批旋钮。配置项和 env 项分别处理，各自的失败互不牵连。
+
+    为什么允许混着提交：手机上一页里既有配置项也有插件开关，让用户按两次保存
+    很别扭。但两边的写入路径完全独立 —— 配置走 dashboard API（热生效），
+    env 走文件（要重启）—— 所以这里拆开做，返回的每条改动都带 needs_restart，
+    界面据此提示。
+    """
     if not values:
         return []
     unknown = [p for p in values if p not in ALLOWED_PATHS]
     if unknown:
         raise ApiError("这些配置项不允许改：%s" % ", ".join(sorted(unknown)), 403)
 
+    env_values = {p: v for p, v in values.items() if is_env_path(p)}
+    cfg_values = {p: v for p, v in values.items() if not is_env_path(p)}
+
+    changed = []
+    if cfg_values:
+        changed += _apply_cfg_knobs(cfg_values)
+    if env_values:
+        changed += apply_env_knobs(env_values)
+    return changed
+
+
+def _apply_cfg_knobs(values):
+    """写 cmd_config.json 里的项，走 dashboard API。"""
     before = cfg_fingerprint()
     payload = dash_call("/api/config/get", timeout=40)
     cfg = payload.get("config")
@@ -511,7 +860,8 @@ def apply_knobs(values):
         if old == value:
             continue
         plant(cfg, path, value)
-        changed.append({"path": path, "from": old, "to": value})
+        changed.append({"path": path, "from": old, "to": value,
+                        "needs_restart": False})
     if not changed:
         return []
 
@@ -639,7 +989,6 @@ ACTION_CMDS = {
     "restart_napcat": ["docker", "restart", "napcat"],
 }
 
-
 def run_action(action_id):
     if action_id not in ACTION_IDS or action_id not in ACTION_CMDS:
         raise ApiError("没有这个动作：%s" % action_id, 404)
@@ -677,6 +1026,11 @@ def handle(method, path, query, body):
             return 200, build_schema()
         if path == "/api/console/config":
             return 200, build_config()
+        if path == "/api/console/version":
+            # 自更新用：手机比对自己的 versionCode 和这里的。
+            # 单独一个端点是为了让「查更新」这件事便宜 —— status 要 docker inspect
+            # 和 plugin/get，几百毫秒；这个只 stat 一个文件。
+            return 200, {"apk": apk_info(), "schema_version": 2}
         return 404, {"error": "no such endpoint"}
 
     if method != "POST":

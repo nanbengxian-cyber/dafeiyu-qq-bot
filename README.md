@@ -23,7 +23,33 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
 | [`docs/`](docs/) | 部署手册与 13 份问题根因分析 | Markdown |
 
-### 最新更新 · 2026-09-04
+### 最新更新 · 2026-09-05（控制台改成服务端驱动）
+
+安卓控制台 App 从「写死 14 个旋钮」改成**按服务端下发的 schema 渲染**。这解决的是一个很实际的问题：
+插件从 16 个长到 22 个、可调变量长到 248 个之后，每加一个开关就要重新打包装 APK，根本跟不上。
+
+- **一次暴露 104 个旋钮**，覆盖 22 个插件的总开关与主要调参（此仓库已开源其中 19 个插件）。
+- **加功能不用重装 App。** 只要新旋钮用的是 App 已认得的类型（`bool` `int` `float` `enum` `str` `csv`），
+  在服务端 `console_spec.py` 里加一条、重启后台，手机下拉刷新就出现。App 遇到认不出的类型是**跳过**而不是崩，
+  这是向前兼容的关键。只有新增一种控件（比如以后要画时间选择器）才需要更新 APK。
+- **插件开关直接读写 `imagegen.env`**（22 个插件的变量都在这个 `env_file` 里），行级替换：
+  保留全部注释与顺序、保持原文件权限、原子替换、写前核对 MD5 防并发覆盖。
+  那 55 行注释记着每个值为什么这么设，比变量本身值钱。
+- **踩到的三条硬约束，全部由服务端兜住**：
+  ① 布尔只能写 `1`/`0` —— 22 个插件对布尔有 4 种解析写法，其中 11 个变量用 `!= "0"` 判定，写 `false` 会被当成**开**；
+  ② `int`/`float` 填非数字或留空会让插件 **import 时抛异常、整个插件加载失败**（只有 `dsh-memory` 有 try/except 回落），
+  所以每个数值旋钮都带 min/max，越界直接 400 而不静默钳制；
+  ③ 代码里 `max()/min()` 硬夹紧的变量，滑块下限必须写成它的硬下限，否则会出现「手机显示 1、实际生效 3」的错觉。
+- **改完 env 必须重建容器。** astrbot 的环境变量来自 docker compose 的 `env_file`，容器内 `os.environ` 只在**容器重建**时更新 ——
+  `docker restart` 不重读 `env_file`（这个坑踩过）。所以这类旋钮一律标 `hot=false`，界面上写明「要按一次重载环境变量」。
+- **7 个敏感变量只报「已设置 / 未设置」**（画图 / 语音 / 视频 / 搜索的 API key 与音色 ID），真实值一个字节都不出服务器，
+  手机端也改不了 —— 控制台是明文 HTTP。
+- **自更新只提示、不静默安装。** 新增轻量端点 `/api/console/version`（只 stat 一个文件），
+  服务器上的包 `versionCode` 更新时弹一次提示、点「打开下载」跳浏览器。明文 HTTP 上自动装包不可控，所以刻意不做。
+
+验证：后端 **105 项**单测、端到端 **83 项**、纯 JVM **391 项**，加上部署后 **18 项**真机实测全过。
+
+### 上一次更新 · 2026-09-04
 
 三块新能力已在真群上线（不再是影子模式）：
 
@@ -37,7 +63,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 ### 成品下载
 
-安卓控制台 App 在 [Releases](../../releases) 页面下载（约 110 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
+安卓控制台 App 在 [Releases](../../releases) 页面下载（约 121 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
 
 ### 19 个插件在解决什么
 
@@ -94,7 +120,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | 文档 | 内容 |
 |---|---|
 | [10-云服务器部署手册](docs/10-云服务器部署手册.md) | 从买服务器到跑起来，Docker + NapCat + AstrBot 全流程 |
-| [20-控制台App说明](docs/20-控制台App说明.md) | 安卓 App 的三个页签、七种预设模式、安全边界 |
+| [20-控制台App说明](docs/20-控制台App说明.md) | 安卓 App 的三个页签、104 个旋钮、七种预设模式、服务端驱动更新与安全边界 |
 | [30-回复触发条件](docs/30-回复触发条件.md) | 什么情况下机器人会说话 |
 | [31-记忆系统与群员轮廓](docs/31-记忆系统与群员轮廓.md) | 记忆的存储结构与隐私设计 |
 | [40-答非所问根因与修复](docs/40-答非所问根因与修复.md) | 25.7 万字上下文的量化分析 |
@@ -142,7 +168,9 @@ python3 plugins/dsh-emotion/replay_emotion.py
 ```bash
 cd console
 KEYSTORE=/path/to/your.jks KS_PASS=yourpass bash build.sh
-bash test/run-tests.sh    # 391 项纯 JVM 单测
+bash test/run-tests.sh              # 391 项纯 JVM 单测
+python3 server/test_console.py      # 105 项后端单测
+python3 server/test_qrweb_e2e.py    # 83 项端到端
 ```
 
 ### 需要自备的东西
@@ -185,7 +213,42 @@ Four independently usable parts:
 | [`console/`](console/) | Android console app + server backend | Java / Python |
 | [`docs/`](docs/) | Deployment manual and 13 root-cause analyses | Markdown |
 
-### Latest update · 2026-09-04
+### Latest update · 2026-09-05 (the console is now server-driven)
+
+The Android console app moved from *14 hard-coded knobs* to **rendering whatever schema the server sends**.
+This solves a concrete problem: once the plugin count grew from 16 to 22 and the tunable variables to 248,
+shipping a new APK for every new switch stopped being viable.
+
+- **104 knobs exposed at once**, covering the master switches and main parameters of 22 plugins
+  (19 of those plugins are open-sourced in this repo).
+- **Adding features no longer needs a reinstall.** As long as a new knob uses a type the app already knows
+  (`bool` `int` `float` `enum` `str` `csv`), adding one line to `console_spec.py` and restarting the backend
+  makes it appear after a pull-to-refresh. The app **skips** types it does not recognize instead of crashing —
+  that is what makes forward compatibility work. Only a genuinely new widget requires a new APK.
+- **Plugin switches read and write `imagegen.env` directly** (all 22 plugins get their variables from that
+  `env_file`) using line-level edits: comments and ordering preserved, original file permissions kept,
+  atomic replace, MD5 checked before writing to prevent clobbering a concurrent change.
+  Those 55 comment lines record *why* each value is what it is — they are worth more than the values.
+- **Three hard constraints, all absorbed server-side:**
+  ① Booleans must be written as `1`/`0` — the 22 plugins parse booleans four different ways, and 11 variables
+  test `!= "0"`, so `false` would read as **on**;
+  ② an `int`/`float` set to a non-number or left empty makes the plugin **throw at import time and fail to load
+  entirely** (only `dsh-memory` falls back), so every numeric knob carries min/max and out-of-range values
+  return 400 rather than being silently clamped;
+  ③ for variables clamped by `max()/min()` in code, the slider minimum must equal that hard floor, or the phone
+  would show `1` while `3` is actually in effect.
+- **Env changes require recreating the container.** AstrBot's environment comes from docker compose's `env_file`,
+  and `os.environ` inside the container only updates on **container recreation** — `docker restart` does not
+  re-read `env_file` (learned the hard way). Such knobs are marked `hot=false` and the UI says so explicitly.
+- **7 secret variables report presence only** (image / voice / video / search API keys and the voice ID).
+  Their real values never leave the server and cannot be edited from the phone — the console is plaintext HTTP.
+- **Self-update prompts, never installs silently.** A new lightweight endpoint `/api/console/version`
+  (a single `stat`) lets the app notice a newer `versionCode` on the server and offer a browser download.
+  Automatic installation over plaintext HTTP is not controllable, so it is deliberately not done.
+
+Verified by **105** backend unit tests, **83** end-to-end tests, **391** pure-JVM tests, and **18** live checks after deploy.
+
+### Previous update · 2026-09-04
 
 Three new capabilities are live in a real group (no longer shadow mode):
 

@@ -101,6 +101,11 @@ def main():
     os.makedirs(pub)
     cfg_path = os.path.join(tmp, "cmd_config.json")
     _write(cfg_path, BASE_CFG)
+    # 新版 schema 含 env: 旋钮；端到端测试提供一个隔离的 env 文件，
+    # 避免测试机没有 /opt/qqbot 时把 CONFIG 端点误判成后端故障。
+    env_path = os.path.join(tmp, "imagegen.env")
+    with open(env_path, "w", encoding="utf-8") as fh:
+        fh.write("DSH_DECIDE=1\nDSH_AT_MODE=1\n")
 
     # 扫码页要用的四个文件
     with open(os.path.join(pub, "index.html"), "w") as fh:
@@ -134,6 +139,7 @@ def main():
     os.makedirs(work)
     shutil.copy(os.path.join(HERE, "console_api.py"), work)
     shutil.copy(os.path.join(HERE, "console_spec.py"), work)
+    shutil.copy(os.path.join(HERE, "envfile.py"), work)
     qrweb = os.path.join(work, "qrweb_auth.py")
     shutil.copy(os.path.join(HERE, "qrweb_auth.py.orig"), qrweb)
     rc = subprocess.run([sys.executable, os.path.join(HERE, "patch_qrweb.py"), qrweb],
@@ -151,6 +157,7 @@ def main():
         "QRWEB_PORT": str(port),
         "QRWEB_BIND": "127.0.0.1",
         "CONSOLE_CFG": cfg_path,
+        "CONSOLE_ENV": env_path,
         "CONSOLE_DASH": "http://127.0.0.1:%d" % dash_port,
         "CONSOLE_STATUS_TTL": "0",
         "QRWEB_FAIL_LIMIT": "3",

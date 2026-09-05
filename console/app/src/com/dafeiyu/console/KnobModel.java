@@ -26,7 +26,7 @@ public final class KnobModel {
         public final String path;
         public final String name;
         public final String group;
-        /** bool / int / float / enum */
+        /** bool / int / float / enum / str / csv */
         public final String type;
         public final String hint;
         public final String unit;
@@ -36,10 +36,14 @@ public final class KnobModel {
         public final Double step;
         /** enum 才有；其余为空表 */
         public final List<String> options;
+        /** 密钥类：服务端只回「设了没设」，手机端不许改 */
+        public final boolean secret;
+        /** str 的长度上限 */
+        public final int maxLen;
 
         Knob(String path, String name, String group, String type, String hint,
              String unit, boolean hot, Double min, Double max, Double step,
-             List<String> options) {
+             List<String> options, boolean secret, int maxLen) {
             this.path = path;
             this.name = name;
             this.group = group;
@@ -51,6 +55,8 @@ public final class KnobModel {
             this.max = max;
             this.step = step;
             this.options = options;
+            this.secret = secret;
+            this.maxLen = maxLen;
         }
 
         public boolean isBool() {
@@ -63,6 +69,28 @@ public final class KnobModel {
 
         public boolean isEnum() {
             return "enum".equals(type);
+        }
+
+        /** 文本类：str 和 csv 都用输入框，区别只在提交时 csv 切成数组。 */
+        public boolean isText() {
+            return "str".equals(type) || "csv".equals(type);
+        }
+
+        public boolean isCsv() {
+            return "csv".equals(type);
+        }
+
+        /**
+         * 这个旋钮住在 imagegen.env 里（插件开关），不在 cmd_config.json。
+         * 唯一区别体现在生效方式：env 的改完必须重启容器。
+         */
+        public boolean isEnv() {
+            return path.startsWith("env:");
+        }
+
+        /** 密钥类只能在服务器上改，界面上显示成只读。 */
+        public boolean readOnly() {
+            return secret;
         }
     }
 
@@ -104,6 +132,12 @@ public final class KnobModel {
         public final Map<String, String> visionProviders = new LinkedHashMap<String, String>();
         /** 插件：name → 中文名 */
         public final Map<String, String> pluginLabels = new LinkedHashMap<String, String>();
+        /** 插件分组的显示顺序，服务端给的 */
+        public final List<String> pluginGroups = new ArrayList<String>();
+        /** schema 结构版本。服务端加了新类型会升，用来判断该不该提示更新 APK */
+        public int schemaVersion = 1;
+        /** 「env 改完要重启」的文案，服务端下发，界面直接用 */
+        public String envHint = "";
 
         public Knob knob(String path) {
             for (Knob k : knobs) {
@@ -141,6 +175,15 @@ public final class KnobModel {
     private KnobModel() {
     }
 
+    /**
+     * 认得的旋钮类型。不在这个集合里的一律跳过 ——
+     * 这是「服务端先加功能、APK 后跟上」能安全并存的关键：
+     * 老包遇到新类型只是少显示一项，不会整页打不开。
+     */
+    private static final java.util.Set<String> KNOWN_TYPES =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "bool", "int", "float", "enum", "str", "csv"));
+
     // ---------------------------------------------------------------- 解析
 
     /**
@@ -148,23 +191,36 @@ public final class KnobModel {
      *
      * 刻意宽容：将来服务端多给字段（比如新加一种 type）不该让手机崩。
      * 认不出的旋钮**跳过**而不是报错 —— 老 APK 遇到新旋钮时少显示一项，
-     * 比整页打不开好得多。这正是「schema 驱动」要的向前兼容。
+     * 比整页打不开好得多。这正是「schema 驱动」要的向前兼容，
+     * 也是为什么服务端加开关不用重装 APK。
      */
     public static Schema parse(Map<String, Object> root) {
         Schema s = new Schema();
+        Long schemaVersion = Json.lng(root, "version");
+        s.schemaVersion = schemaVersion == null ? 1 : schemaVersion.intValue();
+        s.envHint = Json.str(root, "env_hint");
         for (Object o : Json.arr(root, "knobs")) {
             String path = Json.str(o, "path");
             String type = Json.str(o, "type");
             if (path.isEmpty() || type.isEmpty()) {
                 continue;
             }
-            if (!"bool".equals(type) && !"int".equals(type)
-                    && !"float".equals(type) && !"enum".equals(type)) {
+            if (!KNOWN_TYPES.contains(type)) {
                 continue; // 不认识的类型，跳过而不是崩
             }
             List<String> options = new ArrayList<String>();
             for (Object op : Json.arr(o, "options")) {
-                if (op != null) {
+                if (op == null) {
+                    continue;
+                }
+                // 选项可以是裸值，也可以是 {"value":..,"label":..}。
+                // 服务端两种都在用，这里都认。
+                if (op instanceof Map) {
+                    String v = Json.str(op, "value");
+                    if (!v.isEmpty()) {
+                        options.add(v);
+                    }
+                } else {
                     options.add(String.valueOf(op));
                 }
             }
@@ -179,7 +235,9 @@ public final class KnobModel {
                     Json.dbl(o, "min"),
                     Json.dbl(o, "max"),
                     Json.dbl(o, "step"),
-                    options));
+                    options,
+                    Json.bool(o, "secret", false),
+                    (Json.lng(o, "max_len") == null ? 200 : Json.lng(o, "max_len").intValue())));
         }
         for (Object o : Json.arr(root, "modes")) {
             String id = Json.str(o, "id");
@@ -218,6 +276,11 @@ public final class KnobModel {
                 s.pluginLabels.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
             }
         }
+        for (Object o : Json.arr(root, "plugin_groups")) {
+            if (o != null) {
+                s.pluginGroups.add(String.valueOf(o));
+            }
+        }
         return s;
     }
 
@@ -225,8 +288,20 @@ public final class KnobModel {
 
     /** 把值显示成人话。滑块旁边和「已改动」提示都用它，保证两处口径一致。 */
     public static String show(Knob k, Object value) {
+        if (k.secret) {
+            // 服务端对密钥类只回 true/false（值一个字节都不出服务器）
+            return truthy(value) ? "已设置" : "未设置";
+        }
         if (value == null) {
             return "—";
+        }
+        if (k.isCsv()) {
+            String joined = csvText(value);
+            return joined.isEmpty() ? "（空）" : joined;
+        }
+        if ("str".equals(k.type)) {
+            String text = String.valueOf(value);
+            return text.isEmpty() ? "（空）" : text;
         }
         if (k.isBool()) {
             return truthy(value) ? "开" : "关";
@@ -260,6 +335,51 @@ public final class KnobModel {
             end--;
         }
         return s.substring(0, end);
+    }
+
+    /**
+     * csv 值 → 输入框里的文本。服务端给的是数组，界面上要显示成
+     * 「100000001, 123456」这种一眼能改的形式。
+     */
+    public static String csvText(Object value) {
+        if (value == null) {
+            return "";
+        }
+        if (value instanceof List) {
+            StringBuilder sb = new StringBuilder();
+            for (Object o : (List<?>) value) {
+                if (o == null) {
+                    continue;
+                }
+                String s = String.valueOf(o).trim();
+                if (s.isEmpty()) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                sb.append(s);
+            }
+            return sb.toString();
+        }
+        return String.valueOf(value).trim();
+    }
+
+    /** 输入框里的文本 → csv 数组。空段丢掉，两端空白去掉。 */
+    public static List<String> csvParse(String text) {
+        List<String> out = new ArrayList<String>();
+        if (text == null) {
+            return out;
+        }
+        // 中文输入法下逗号常常打成「，」，这里一并认 —— 否则用户会得到一个
+        // 「格式不对」而完全看不出哪里不对。
+        for (String part : text.replace('，', ',').split(",")) {
+            String s = part.trim();
+            if (!s.isEmpty()) {
+                out.add(s);
+            }
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- 数值换算
@@ -358,6 +478,22 @@ public final class KnobModel {
         if (k == null) {
             return "这个配置项服务器不认";
         }
+        if (k.readOnly()) {
+            return k.name + "是密钥，只能在服务器上改";
+        }
+        if (k.isCsv()) {
+            // csv 一律合法（空表也允许 —— 比如「限定群」清空就是「所有群」）。
+            // 每一项的格式服务端用 item_pattern 校验，这里不重复一份正则：
+            // 两边各写一份迟早会不一致，而不一致时用户看到的是「手机说行、服务器说不行」。
+            return null;
+        }
+        if ("str".equals(k.type)) {
+            String text = value == null ? "" : String.valueOf(value);
+            if (text.length() > k.maxLen) {
+                return k.name + "太长了（上限 " + k.maxLen + " 字）";
+            }
+            return null;
+        }
         if (k.isBool()) {
             if (value instanceof Boolean) {
                 return null;
@@ -387,8 +523,17 @@ public final class KnobModel {
         return null;
     }
 
-    /** 提交前把值规范成服务端期望的类型（int 给整数、float 给小数）。 */
+    /** 提交前把值规范成服务端期望的类型（int 给整数、float 给小数、csv 给数组）。 */
     public static Object normalize(Knob k, Object value) {
+        if (k.isCsv()) {
+            if (value instanceof List) {
+                return value;
+            }
+            return csvParse(value == null ? "" : String.valueOf(value));
+        }
+        if ("str".equals(k.type)) {
+            return value == null ? "" : String.valueOf(value);
+        }
         if (k.isBool()) {
             return Boolean.valueOf(truthy(value));
         }
