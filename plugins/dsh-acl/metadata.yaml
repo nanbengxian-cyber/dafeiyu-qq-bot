@@ -1,0 +1,5 @@
+name: dsh-acl
+desc: 指令权限门卫。按 QQ 号（不是昵称，群里有重名）+ 群内身份把指令分成 owner／admin／所有人三档；高优先级 handler 在真正的指令 handler 之前 stop_event 拦下越权调用。框架自带的 permission_type 只认 admins_id（本机是 WebUI 账号），群里没人能过，所以自己判。判定失败一律 fail-open 放行。指令 /权限 /权限状态。
+version: 1.0.0
+author: 大肥鱼
+repo: local

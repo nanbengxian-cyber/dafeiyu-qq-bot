@@ -2,9 +2,9 @@
 
 [中文](#中文) · [English](#english)
 
-一套让 QQ 群机器人「像真人群友一样说话」的完整工程：19 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
+一套让 QQ 群机器人「像真人群友一样说话」的完整工程：27 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
 
-A complete engineering effort to make a QQ group bot *talk like an actual group member*: 19 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
+A complete engineering effort to make a QQ group bot *talk like an actual group member*: 27 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
 
 ---
 
@@ -18,12 +18,45 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
-| [`plugins/`](plugins/) | 19 个 AstrBot 插件，约 1.09 万行 —— 机器人的全部能力 | Python |
+| [`plugins/`](plugins/) | 27 个 AstrBot 插件，约 1.61 万行 —— 机器人的全部能力 | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
-| [`docs/`](docs/) | 部署手册与 13 份问题根因分析 | Markdown |
+| [`docs/`](docs/) | 部署手册与 14 份问题根因分析 | Markdown |
 
-### 最新更新 · 2026-09-05（控制台改成服务端驱动）
+### 最新更新 · 2026-09-05 晚（真人感第二批：黑话 / 打字节奏 / 错别字 / 效果观察）
+
+四个新插件加一处框架配置。这一批跟前面几批性质不同 —— 前面修的都是**明确的故障**
+（答非所问、被骗认输、认错人、崩溃），这一批修的是「没有故障，但一眼能看出是 AI」。
+
+- **听懂群里的黑话（`dsh-glossary`）。** 43 条词条，命中才注入。词条不是抄现成热梗库 ——
+  三个外部库合计 549 个词，拿本群 2478 条真语料回测只真命中 9 条，其中命中最多的词是
+  `15`（对应「被蹲了 15 次」和一个 QQ 号）。改成挖自己的语料，判据是
+  「这条短语被当成一整条消息发出来、且至少两个人发过」，一次就捞出全表命中最高的「神了」。
+- **打字延迟按长度算。** 原来固定 1.2~2.8 秒随机，跟长度无关，所以有时是反的：
+  一条「典」等 2.8 秒，一条二十字的 1.2 秒就出来。框架自带 `interval_method: "log"`，
+  我们没开 —— 改一行配置，1 字变 0.7 秒、20 字变 3.2 秒。
+- **偶尔打同音错别字（`dsh-typo`）。** 每条 6% 概率、一条最多错一个字、35% 概率补一条
+  「\*的」自我纠正。用**人工核过的 60 组固定同音表**而不是 `pypinyin` 动态生成：
+  动态生成的输出集合是开放的，在 94 人的真群里不赌生僻字。
+- **允许被支线勾走（`dsh-drift`）。** 「永远严格贴着上一条回答」本身就是 AI 味。
+  两条**结构性**硬边界防止把已修的「答非所问」引回来：被 @ 时绝不漂移、
+  当前消息像在提问时绝不漂移。
+- **有人在跟别的 AI 说话就不抢话（`dsh-decide`）。** 参考实现允许名字后面跟空格，
+  原样搬过来在本群有两条假命中（`gpt progpt plus`、`gpt pro的缓存差不多95%左右`）——
+  本群成天在聊模型，模型名就是话题词。收紧成「只认标点分隔符、不收 `GPT`/`ds` 这种短写法」后
+  1899 条语料假命中归零。
+- **说完之后看群里什么反应（`dsh-effect`）。** 这是最大的结构性缺口：在此之前所有改动都是
+  **开环**的 —— 注入样本、注入词表，然后祈祷。现在每条回复后开 180 秒观察窗口，
+  判断群里的反应（认可 / 跟着玩 / 平淡 / 没看懂 / 指出说错 / 嫌烦 / **没人理**）、
+  反应冲的是**内容还是人设**、以及这句话**推进还是带偏**了对话。
+  窗口内没人发言直接判「没人理」，不花模型调用。
+  **这一版只测量、不自动改行为** —— 拿没验证过的信号自动拧旋钮，等于没有仪表就调发动机。
+
+验证：黑话词表审查后注入块从 196 字压到 135 字、命中率不变（8.4%），证明删掉的 3 条是死词；
+新插件四套纯函数单测 + 1899 条真语料回测 + `dsh-effect` 一次真实端到端结算全过。
+细节见 [47-真人感第二批](docs/47-真人感第二批-黑话与打字节奏与效果观察.md)。
+
+### 上一次更新 · 2026-09-05 白天（控制台改成服务端驱动）
 
 安卓控制台 App 从「写死 14 个旋钮」改成**按服务端下发的 schema 渲染**。这解决的是一个很实际的问题：
 插件从 16 个长到 22 个、可调变量长到 248 个之后，每加一个开关就要重新打包装 APK，根本跟不上。
@@ -49,7 +82,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 验证：后端 **105 项**单测、端到端 **83 项**、纯 JVM **391 项**，加上部署后 **18 项**真机实测全过。
 
-### 上一次更新 · 2026-09-04
+### 更早 · 2026-09-04
 
 三块新能力已在真群上线（不再是影子模式）：
 
@@ -65,7 +98,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 安卓控制台 App 在 [Releases](../../releases) 页面下载（约 121 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
 
-### 19 个插件在解决什么
+### 27 个插件在解决什么
 
 每个插件对应一个**实际发生过的问题**，不是功能清单式的堆砌。
 
@@ -81,6 +114,11 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-initiate`](plugins/dsh-initiate/) | 冷场就一直安静。真人会自己起话头，它不会。五道纯代码闸门（冷场 15 分钟~6 小时、活跃时段、1 小时冷却、每日 3 次）过了才让小模型看一眼有没有值得接的话头；决定开口就造合成事件走**完整消息管道**，贴纸剥离/@ 策略/分段发送全部照常。判断失败一律沉默。 |
 | [`dsh-emotion`](plugins/dsh-emotion/) | 语气永远一个样。六种情绪同时只有一种，固定优先级仲裁保证一条消息只触发一种（「你好厉害但也真让我失望」只取低落）。清零四条路：道歉、连续 2 条中性、问题被回答、分情绪 TTL。 |
 | [`dsh-quote`](plugins/dsh-quote/) | 看不懂引用，把别人做的事说成自己做的。框架的引用块只给昵称，而群里有真人把昵称改成和机器人一样 —— **凭昵称在群聊里永远认不了人**。改为按 QQ 号写清「谁在说 / 引用谁的哪句 / 是不是自己说的 / 这次 @ 谁」。 |
+| [`dsh-glossary`](plugins/dsh-glossary/) | 听不懂群里的黑话。43 条词条，命中才注入，带真语料例句（只给释义时它听得懂「典」但永远不会自己说「典」）。词条挖自本群语料而非现成热梗库：三个外部库 549 个词只真命中 9 条。假命中比不注入更糟，所以每条带 `avoid` 排除上下文。 |
+| [`dsh-human`](plugins/dsh-human/) | 回复的**形状**不像真人。实测真人带逗号 16.4%、机器人 67.7%，「短句，短句」句式机器人占 54.8% 而真人没有。提示词治不了（写在人格里两周照旧），按结构在发送前把逗号粘起来的两句拆成两条。 |
+| [`dsh-typo`](plugins/dsh-typo/) | 几千条一个错别字都没有。60 组人工核过的同音表，每条 6% 概率错一个字，35% 概率补一条「\*的」自我纠正。48 条保护名单（黑话词条、人名、贴纸标记、链接）一个字都不许动。 |
+| [`dsh-drift`](plugins/dsh-drift/) | 永远严格贴着上一条回答 —— 这种「过度切题」本身就是 AI 味。三档漂移写成分级提示词。两条结构性硬边界防止把已修的答非所问引回来：被 @ 不漂移、像提问不漂移。 |
+| [`dsh-effect`](plugins/dsh-effect/) | 所有改动都是开环的：注入完就祈祷，说出去的话有没有落地系统完全不知道。说完开 180 秒观察窗口，判反应（认可/跟着玩/平淡/没看懂/指出说错/嫌烦/没人理）、冲内容还是冲人设、推进还是带偏。窗口内没人发言直接判「没人理」，不花调用。 |
 
 **多模态**
 
@@ -102,8 +140,11 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-guard`](plugins/dsh-guard/) | 违规禁言。三层：关键词预筛（0 成本，真群实测仅 2.2% 命中）→ 小模型只输出布尔 → **代码**决定禁不禁。 |
 | [`dsh-poke`](plugins/dsh-poke/) | 戳一戳没反应。回话不问 LLM，三道限流防对戳循环。 |
 | [`dsh-welcome`](plugins/dsh-welcome/) | 入群欢迎。用 LLM 现场生成而不是写死模板（模板会破人设）。 |
+| [`dsh-acl`](plugins/dsh-acl/) | 指令谁都能发。三档权限（所有人/群主+管理员/仅群主），身份只按 **QQ 号**判 —— 群里有重名，群名片也能随时改。状态查询也要拦：它们不改东西，但会把渠道地址、模型名、配额、token 花销全打到群里。 |
+| [`dsh-fwd`](plugins/dsh-fwd/) | 转发的聊天记录看不见。框架只给一个「[聊天记录]」占位符。按嵌套层数展开，保头保尾，图片视频有独立预算。 |
+| [`dsh-spine`](plugins/dsh-spine/) | 被追问就改口、被质疑就道歉。跟 `dsh-claimguard` 的区别是它管的是**立场稳定性**而不是事实。 |
 
-### 反复踩到的七个坑
+### 反复踩到的十一个坑
 
 这些教训在多个插件上重复验证过，写在这里省得再踩：
 
@@ -114,6 +155,11 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 5. **fail-open 会把崩溃伪装成质量下降。** `dsh-decide` 有个三元组按两元组解包的 bug，只要机器人刚说过话就必抛 `ValueError`，整次判断落到 fail-open「照旧说话」——**当天崩 12 次、成功 9 次**，超过一半发言模型都没收到「这句是谁对谁说的」。功能看起来完全正常，只是说得不对。凡是 fail-open 的兜底，必须在兜底路径上打 WARN 并计数。
 6. **命中数归零不等于误判修好了。** 收紧「提问」规则后 `dsh-emotion` 的好奇命中从 14 掉到 0，看着像不再误判，实际是全漏了 —— 群里最常见的追问「那你为什么没有」疑问词在句中，而新正则只锚定句首。规则改动必须逐样本对比，不能只看总数。
 7. **影子模式的价值在于回放，不在于等。** 挂着跑一晚只能看到当晚那几条；拿 1618 条历史语料回放，两个真误判 20 分钟就暴露了（把「余额/额度」当成尴尬语气词、把没有指向的话当成在骂它）。
+
+8. **自己群的语料 > 任何现成词库。** 三个外部热梗库合计 549 个词，在本群真命中 9 条；本群语料一次挖掘就贡献了全表命中最高的词。有效的结构信号是「这条短语被当成一整条消息发出来、且至少两个人发过」—— 口头禅和梗才会被单独发出来当一整条消息，普通词永远不会。
+9. **先问模型知不知道，再决定要不要教它。** 43 个黑话词条逐条问主模型，它一条都没说「不确定」，绝大多数直接答对。这直接改变了插件的定位：从「词典」变成「语用层」，释义压到最短，力气花在它答错的 6 个词和它推不出的本群惯例上。没做这次探针，就会一直在维护一张模型不需要的词典。
+10. **抄参考实现的判据必须重新回测。** MaiBot 的「别的 AI 被喊」正则原样搬过来在本群有两条假命中，因为本群的话题恰好就是模型本身；它的 30%/字 错别字率放到这里等于满屏错字。参考实现给的是思路，**阈值和边界必须拿自己的语料重定**。
+11. **加「更像人」的功能前，先想清楚它会不会把已修的 bug 引回来。** 注意力漂移和「答非所问」是同一方向上的两端，所以漂移的两条边界（被 @ 不漂移、像提问不漂移）是**结构性**的，不是提示词里的一句提醒。
 
 ### 文档
 
@@ -129,6 +175,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [43-说话更真实方案](docs/43-说话更真实方案.md) · [44-实施记录](docs/44-说话更真实实施记录.md) | 方案与落地数据 |
 | [45-戳一戳与违规禁言](docs/45-戳一戳与违规禁言.md) | 权限模型与限流设计 |
 | [46-主动开口与情绪系统](docs/46-主动开口与情绪系统.md) | 冷场主动开口的五道闸门、单一主情绪的仲裁与清零、引用按 QQ 号认人；含影子回放揪出的两个真误判 |
+| [47-真人感第二批](docs/47-真人感第二批-黑话与打字节奏与效果观察.md) | 黑话词表（含三个外部热梗库的回测数据与「先问模型知不知道」的探针结论）、打字节奏、同音错别字、注意力漂移、回复效果闭环 |
 | [50-多模态接入与验证记录](docs/50-多模态接入与验证记录.md) | 图/视频/语音/联网的逐项实测，含失败记录 |
 | [60-长期目标与技术方案](docs/60-长期目标与技术方案.md) | 整体架构与演进方向 |
 
@@ -208,12 +255,48 @@ Four independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
-| [`plugins/`](plugins/) | 19 AstrBot plugins, ~10.9k lines — all bot capabilities | Python |
+| [`plugins/`](plugins/) | 27 AstrBot plugins, ~16.1k lines — all bot capabilities | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
-| [`docs/`](docs/) | Deployment manual and 13 root-cause analyses | Markdown |
+| [`docs/`](docs/) | Deployment manual and 14 root-cause analyses | Markdown |
 
-### Latest update · 2026-09-05 (the console is now server-driven)
+### Latest update · 2026-09-05 evening (human-likeness, batch 2)
+
+Four new plugins plus one framework config change. This batch differs in kind from the earlier ones:
+those fixed **outright defects** (off-topic replies, being talked into submission, misidentifying people,
+crashes). This one fixes "nothing is broken, but you can tell it's an AI at a glance".
+
+- **Understanding the group's slang (`dsh-glossary`).** 43 entries, injected only on a hit. The entries are
+  *not* imported from off-the-shelf meme dictionaries — three external libraries totalling 549 terms scored
+  only 9 genuine hits against 2478 real messages, and their top hit was `15` (matching "got camped 15 times"
+  and someone's QQ ID). Mining our own corpus works instead, using the signal "this phrase was sent as an
+  entire message, by at least two different people" — which immediately surfaced the table's most-hit term.
+- **Typing delay now scales with length.** It used to be a flat random 1.2–2.8s regardless of length, so it
+  was sometimes backwards: a one-character reply waited 2.8s while a twenty-character one went out in 1.2s.
+  The framework already ships `interval_method: "log"`; we simply had not enabled it.
+- **Occasional homophone typos (`dsh-typo`).** 6% per message, at most one character, plus a 35% chance of a
+  follow-up self-correction. Uses a **hand-reviewed 60-pair homophone table** rather than generating with
+  `pypinyin`: generated output is an open set, and that is not a bet worth taking in a real 94-person group.
+- **Letting it get pulled onto a tangent (`dsh-drift`).** Always answering strictly on-topic is itself an AI
+  tell. Two **structural** hard limits keep the previously fixed off-topic bug from returning: never drift
+  when mentioned, never drift when the current message looks like a question.
+- **Not talking over another AI (`dsh-decide`).** The reference implementation allows whitespace after the
+  name; copied verbatim it produced two false positives here, because model names *are* this group's topic.
+  Tightening it to "punctuation delimiters only, no short forms like `GPT`/`ds`" brought false positives to
+  zero across 1899 messages.
+- **Watching what the group does after it speaks (`dsh-effect`).** This was the biggest structural gap:
+  every change until now was **open-loop** — inject samples, inject glossary, then hope. Now each reply opens
+  a 180s observation window and the group's reaction is classified (appreciation / playful / neutral /
+  confusion / factual correction / rejection / **ignored**), along with whether the reaction targets the
+  **content or the persona**, and whether the reply **advanced or derailed** the conversation. Zero messages
+  in the window means "ignored" for free, with no model call. **This version only measures; it changes no
+  behaviour** — auto-tuning on an unvalidated signal is adjusting an engine with no instruments.
+
+Verification: after review the glossary's injected block shrank from 196 to 135 characters with an unchanged
+8.4% hit rate, proving the three removed entries were dead. Four pure-function test suites, a 1899-message
+corpus backtest, and one real end-to-end settlement of `dsh-effect` all pass.
+
+### Previous update · 2026-09-05 daytime (the console is now server-driven)
 
 The Android console app moved from *14 hard-coded knobs* to **rendering whatever schema the server sends**.
 This solves a concrete problem: once the plugin count grew from 16 to 22 and the tunable variables to 248,
@@ -248,7 +331,7 @@ shipping a new APK for every new switch stopped being viable.
 
 Verified by **105** backend unit tests, **83** end-to-end tests, **391** pure-JVM tests, and **18** live checks after deploy.
 
-### Previous update · 2026-09-04
+### Earlier · 2026-09-04
 
 Three new capabilities are live in a real group (no longer shadow mode):
 
@@ -264,7 +347,7 @@ Before rollout: **61 new unit tests** (36 emotion + 25 quote) and a **1618-messa
 
 The Android console app is on the [Releases](../../releases) page (~110 KB, Android 5.0+). Enter your own server address on the login screen; the package embeds no server details.
 
-### What the 19 plugins fix
+### What the 27 plugins fix
 
 Each plugin addresses a **problem that actually happened**, not a feature checklist.
 
@@ -280,6 +363,11 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-initiate`](plugins/dsh-initiate/) | Staying silent forever once the room goes quiet. Five pure-code gates (idle 15min–6h, active hours, 1h cooldown, 3/day) run before a small model even looks for a thread worth picking up; once it decides, a **synthetic event goes through the full message pipeline**, so sticker stripping, mention policy, and segmented sending all still apply. Any judgment failure means silence. |
 | [`dsh-emotion`](plugins/dsh-emotion/) | One flat tone forever. Six emotions, exactly one at a time; fixed-priority arbitration guarantees a single message triggers only one ("you're great, but you really let me down" yields sadness only). Four reset paths: apology, two consecutive neutral messages, question answered, per-emotion TTL. |
 | [`dsh-quote`](plugins/dsh-quote/) | Misreading quotes and claiming someone else's work as its own. The framework's quote block carries only a nickname — and a real member had renamed themselves to match the bot. **Nicknames can never identify anyone in a group chat.** Now it states, by QQ ID: who is speaking, whose line they quoted, whether that line was the bot's own, and who was mentioned. |
+| [`dsh-glossary`](plugins/dsh-glossary/) | Not understanding the group's slang. 43 entries, injected only on a hit, each carrying real corpus usage examples (with definitions alone it *understood* the local memes but never used them). Entries are mined from our own corpus, not imported: three external meme libraries totalling 549 terms produced only 9 genuine hits. A false hit is worse than no injection, so every entry carries an `avoid` exclusion context. |
+| [`dsh-human`](plugins/dsh-human/) | The **shape** of replies doesn't look human. Measured: 16.4% of human messages contain a comma versus 67.7% of the bot's, and the "short clause, short clause" pattern accounts for 54.8% of bot messages and 0% of human ones. Prompting cannot fix this (it sat in the persona for two weeks unchanged); the fix splits comma-glued clauses into separate messages before sending. |
+| [`dsh-typo`](plugins/dsh-typo/) | Thousands of messages without a single typo. A hand-reviewed 60-pair homophone table, 6% chance of one wrong character per message, 35% chance of a follow-up self-correction. A 48-entry protect list (glossary terms, names, sticker markers, links) is never touched. |
+| [`dsh-drift`](plugins/dsh-drift/) | Always answering strictly on-topic — that over-precision is itself an AI tell. Three drift levels expressed as graded prompts. Two structural hard limits keep the previously fixed off-topic bug from returning: never drift when mentioned, never drift when the message looks like a question. |
+| [`dsh-effect`](plugins/dsh-effect/) | Every change was open-loop: inject and hope, with no idea whether anything landed. Now each reply opens a 180s observation window and classifies the reaction (appreciation / playful / neutral / confusion / factual correction / rejection / ignored), whether it targets content or persona, and whether the reply advanced or derailed the thread. Zero messages in the window means "ignored" for free. |
 
 **Multimodal**
 
@@ -301,8 +389,11 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-guard`](plugins/dsh-guard/) | Moderation. Three layers: regex prefilter (free; only 2.2% hit rate measured on real traffic) → small model emitting booleans only → **code** decides whether to mute. |
 | [`dsh-poke`](plugins/dsh-poke/) | No reaction to pokes. The reply never calls an LLM; three rate limits prevent poke loops. |
 | [`dsh-welcome`](plugins/dsh-welcome/) | Greeting new members. Generated by the LLM rather than a fixed template (templates break character). |
+| [`dsh-acl`](plugins/dsh-acl/) | Anyone could run any command. Three tiers (everyone / owner + admins / owner only), with identity resolved **by QQ ID only** — nicknames collide and group cards can be changed at will. Status queries are gated too: they change nothing, but they print endpoint addresses, model names, quotas, and token spend into the group. |
+| [`dsh-fwd`](plugins/dsh-fwd/) | Forwarded chat records are invisible — the framework only passes a `[chat record]` placeholder. Expands them by nesting depth, keeping head and tail, with separate budgets for images and video. |
+| [`dsh-spine`](plugins/dsh-spine/) | Backing down when pressed, apologising when doubted. Unlike `dsh-claimguard` this governs **positional consistency** rather than facts. |
 
-### Seven lessons learned the hard way
+### Eleven lessons learned the hard way
 
 Each was re-validated across multiple plugins:
 
@@ -313,6 +404,11 @@ Each was re-validated across multiple plugins:
 5. **Fail-open disguises a crash as a quality regression.** `dsh-decide` unpacked a 3-tuple as a 2-tuple, so once the bot had spoken recently it always raised `ValueError` and fell through to fail-open "just talk anyway" — **12 crashes vs 9 successful judgments in one day**, meaning over half the replies never received the "who is speaking to whom" verdict. The feature looked perfectly healthy; it was just wrong. Any fail-open fallback must log at WARN and count.
 6. **A trigger count dropping to zero doesn't mean the misjudgment is fixed.** After tightening the question rule, `dsh-emotion`'s curiosity hits fell from 14 to 0 — which looked like "no more false positives" but was total blindness: the most common follow-up in this group ("so why don't you") has its question word mid-sentence, while the new regex anchored to the start. Rule changes require per-sample comparison, never just totals.
 7. **Shadow mode is valuable for replay, not for waiting.** Running it overnight only reveals that night's handful of messages; replaying 1618 archived messages exposed both real misjudgments in 20 minutes (treating the substring in "balance/quota" as an awkward filler word, and treating undirected insults as aimed at the bot).
+
+8. **Your own group's corpus beats any off-the-shelf dictionary.** Three external meme libraries totalling 549 terms produced 9 genuine hits here; one pass over our own corpus contributed the single most-hit entry in the table. The signal that works is "this phrase was sent as an entire message, by at least two different people" — catchphrases and memes get sent alone; ordinary words never do.
+9. **Ask the model whether it already knows, before deciding to teach it.** Asked one by one, the main model said "not sure" for none of the 43 slang entries and got most of them right. That changed the plugin's purpose outright: from *dictionary* to *pragmatics layer*, with definitions compressed to the minimum and effort spent on the 6 terms it got wrong plus the local conventions it cannot infer. Without that probe we would still be maintaining a dictionary the model never needed.
+10. **Re-backtest any criterion copied from a reference implementation.** MaiBot's "someone is addressing another AI" pattern, copied verbatim, produced two false positives here, because model names *are* this group's topic; its 30%-per-character typo rate would have meant a screen full of typos. A reference gives you the idea — **thresholds and boundaries must be re-derived from your own corpus.**
+11. **Before adding a "more human" feature, work out whether it can bring back a bug you already fixed.** Attention drift and off-topic replies are two ends of the same axis, which is why drift's two limits (never when mentioned, never on questions) are **structural** rather than a line of prompt guidance.
 
 ### Quick start
 
