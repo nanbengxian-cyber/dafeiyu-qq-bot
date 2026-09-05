@@ -163,7 +163,18 @@ def init_db(path: str = None) -> None:
 
 
 def parse_verdict(raw: str) -> dict | None:
-    """从模型输出里抠出结论。取值不在枚举里就退回安全值，绝不写脏数据。"""
+    """从模型输出里抠出结论。取值不在枚举里就退回安全值，绝不写脏数据。
+
+    三层，一层不成换下一层：
+      ① 整段就是 JSON；
+      ② 从 ```json 之类的壳里把 {...} 抠出来；
+      ③ **逐字段正则捞**。第三层是上线第一天就用上的 ——
+         真实失败样本是模型输出被截断在 why 里：
+             {"strategy":"humor","stance":"rejection","target":"bot_persona",
+              "contribution":"wrong_push","why":"某群友骂人，另一个说绷不住了，
+         四个枚举字段全都在截断点**之前**，完全可以救回来，只有 why 是残句。
+         没有这一层就白扔掉一条已经花过钱的评分。
+    """
     text = (raw or "").strip()
     if not text:
         return None
@@ -178,7 +189,14 @@ def parse_verdict(raw: str) -> dict | None:
             except BaseException:
                 obj = None
     if not isinstance(obj, dict):
-        return None
+        # ③ 逐字段捞。至少要捞到一个枚举字段，否则这段输出根本不是结论。
+        obj = {}
+        for key in ("strategy", "stance", "target", "contribution", "why"):
+            hit = re.search(r'"%s"\s*:\s*"([^"]*)"' % key, text)
+            if hit:
+                obj[key] = hit.group(1)
+        if not ({"strategy", "stance", "target", "contribution"} & set(obj)):
+            return None
 
     def pick(key: str, allowed: tuple[str, ...], default: str) -> str:
         v = str(obj.get(key, "") or "").strip().lower()

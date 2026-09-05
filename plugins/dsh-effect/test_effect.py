@@ -80,6 +80,20 @@ assert len(v["why"]) <= 60
 for bad in ("", "   ", "抱歉我无法完成", "[1,2,3]", "null", "{坏掉的"):
     assert m.parse_verdict(bad) is None, bad
 
+# ------------------------------------------------------------ 解析：输出被截断（上线第一天的真实失败样本）
+# 模型把 why 写太长导致 completion 被截断，JSON 缺收尾的 } —— 但四个枚举字段都在
+# 截断点之前，必须救回来，不能白扔掉一条已经花过钱的评分。
+truncated = ('{"strategy":"humor","stance":"rejection","target":"bot_persona",'
+             '"contribution":"wrong_push","why":"某群友骂人，另一个说绷不住了，')
+v = m.parse_verdict(truncated)
+assert v is not None, "截断的 JSON 必须能救回来"
+assert v["strategy"] == "humor" and v["stance"] == "rejection", v
+assert v["target"] == "bot_persona" and v["contribution"] == "wrong_push", v
+# 只剩残缺的 why、一个枚举字段都没有时，仍然算解析失败
+assert m.parse_verdict('{"why":"只有理由没有结论') is None
+# 逐字段捞出来的脏值同样要过枚举校验
+assert m.parse_verdict('{"stance":"超级棒","strategy":"讲笑话"')["stance"] == "neutral"
+
 # ------------------------------------------------------------ 枚举本身
 assert "ignored" in m.STANCES            # 「没人理」是真群里最常见的结果
 assert "bot_persona" in m.TARGETS        # 冲人设 vs 冲内容必须分开
