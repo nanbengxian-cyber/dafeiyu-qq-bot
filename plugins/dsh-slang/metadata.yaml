@@ -1,1 +1,5 @@
-placeholder
+name: dsh-slang
+desc: 群聊黑话学习 —— 自动从群聊挖「疑似黑话」候选，LLM 结合证据考究释义，每 8 小时 AI 自动审核候选（通过/拒绝/再等等）后注入上下文帮模型听懂；群主仍可用 /黑话确认、/黑话拒绝 手动兜底。
+version: 1.1.0
+author: 大肥鱼
+repo: local
