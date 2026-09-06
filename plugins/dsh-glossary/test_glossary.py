@@ -110,7 +110,7 @@ assert terms("ds 后训练后甲上来了") == ["ds"]
 # 666 走同一条边界规则：夹在别的数字里不算
 assert terms("1666") == []
 assert terms("66678") == []
-assert terms("QQ 2774066612") == []
+assert terms("QQ 2774066000") == []
 # 666 的金额用法由 avoid 挡
 assert terms("这套要666元") == []
 assert terms("充了666块") == []

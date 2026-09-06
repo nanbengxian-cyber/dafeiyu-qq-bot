@@ -114,7 +114,7 @@ def main():
         fh.write(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
     with open(os.path.join(pub, "status.json"), "w") as fh:
         json.dump({"state": "online", "message": "机器人在线",
-                   "account": "200000002", "last_seen_seconds": 5,
+                   "account": "100000002", "last_seen_seconds": 5,
                    "qr_available": True, "qr_age_seconds": 30,
                    "detect_reason": "探针 get_status online=true",
                    "updated_epoch": int(time.time())}, fh)
@@ -212,7 +212,7 @@ def main():
         code, body, _, _ = req(root + "/", cookie=cookie)
         check("登录后能看扫码页", code == 200 and "扫码页占位" in body)
         code, body, _, _ = req(root + "/status.json", cookie=cookie)
-        check("登录后能看 status.json", code == 200 and "200000002" in body)
+        check("登录后能看 status.json", code == 200 and "100000002" in body)
         code, _, _, _ = req(root + "/index.html.bak.999", cookie=cookie)
         check("登录后 .bak 依然 404", code == 404, "code=%d" % code)
 

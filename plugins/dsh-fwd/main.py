@@ -483,7 +483,7 @@ def render_block(recs: list, total: int, omitted: int, head_cnt: int = None,
     head += "。"
     if masked:
         # 实测：私聊记录被转发时 QQ 会把所有节点的 user_id/nickname 抹成同一个
-        # （97 条全是 "QQ用户(1094950020)"）。不说清楚，模型会把两个人的话
+        # （97 条全是 "QQ用户(100000020)"）。不说清楚，模型会把两个人的话
         # 当成一个人说的，然后自信地讲错。
         head += "（注意：QQ 隐去了发言人身份，下面每行的名字都一样，"
         head += "实际可能是两个人在对话，需要你从上下文语气自己判断谁在说话。）"

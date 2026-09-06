@@ -42,7 +42,7 @@ check("B1 从组件读", target_of([PokeComp("123")],{}), "123")
 check("B2 组件返回0时回落raw", target_of([PokeComp(None)],{"target_id":456}), "456")
 check("B3 没组件也没raw", target_of([],{}), None)
 check("B4 int 转成 str", target_of([PokeComp(789)],{}), "789")
-ME="200000002"
+ME="100000002"
 def is_me(t): return bool(t) and t==ME
 check("B5 戳我 -> 要回", is_me(target_of([PokeComp(ME)],{})), True)
 check("B6 戳别人 -> 不回", is_me(target_of([PokeComp("2001")],{})), False)

@@ -23,7 +23,7 @@
 #
 # dsh-memory 已经在 buffer 表里滚动存着每群最近 240 条群友原话
 # （group_id, user_id, name, text, ts），而且**只存真人**——实测
-# `select count(*) from buffer where user_id='200000002'`（机器人自己）= 0。
+# `select count(*) from buffer where user_id='100000002'`（机器人自己）= 0。
 # 所以 buffer 天然是一份干净的真人语料，不需要另建采集。
 # 好处是样本会跟着群里真人自然漂移：群风变了，机器人跟着变。
 #

@@ -180,7 +180,7 @@ def main():
     pub = os.path.join(tmp, "public")
     os.makedirs(pub)
     with open(os.path.join(pub, "status.json"), "w") as fh:
-        json.dump({"state": "online", "message": "机器人在线", "account": "200000002",
+        json.dump({"state": "online", "message": "机器人在线", "account": "100000002",
                    "detect_reason": "探针 get_status online=true",
                    "last_seen_seconds": 12, "qr_available": True,
                    "qr_age_seconds": 100, "updated_epoch": int(time.time())}, fh)

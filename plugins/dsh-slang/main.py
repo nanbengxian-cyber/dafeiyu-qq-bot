@@ -33,7 +33,7 @@ reject、defer。defer 满 DSH_SLANG_AUTO_MAX_DEFER（3）次自动转拒绝；�
         （BUDGET=300 超预算退化成只给释义、裁低次数词条、单条截断）；
         影子模式只记录不注入。
 
-命令（群主，QQ 号 DSH_SLANG_OWNER，默认 2774067216）：
+命令（群主，QQ 号由 DSH_SLANG_OWNER 配置，仓库内不写真实号）：
   /黑话学习状态  统计 + 影子记录
   /黑话候选      候选列表（按出现次数）
   /黑话详情 <词>  词条 + 证据原文
@@ -70,8 +70,8 @@ def _set(name: str, default: str = "") -> set[str]:
 
 ENABLED = _flag("DSH_SLANG")
 SHADOW = _flag("DSH_SLANG_SHADOW", "1")          # 默认影子：只学不注入
-GROUPS = _set("DSH_SLANG_GROUPS", "476573490")
-OWNERS = _set("DSH_SLANG_OWNER", "2774067216")
+GROUPS = _set("DSH_SLANG_GROUPS", "")  # 真实群号由服务器 env 配置，仓库内不留
+OWNERS = _set("DSH_SLANG_OWNER", "")  # 真实群主 QQ 由服务器 env 配置，仓库内不留
 MIN_MSG = int(os.environ.get("DSH_SLANG_MIN_MSG", "60"))       # 攒够多少条触发提取
 COOLDOWN = float(os.environ.get("DSH_SLANG_COOLDOWN", "600"))  # 两次提取最小间隔(秒)
 SAMPLE = int(os.environ.get("DSH_SLANG_SAMPLE", "30"))         # 每次取样最近多少条

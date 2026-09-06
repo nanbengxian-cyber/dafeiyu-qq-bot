@@ -188,7 +188,7 @@ ok("G2 两个人不加身份提示", "隐去了发言人身份" not in blk)
 ok("G3 正文有名字", "甲: 第一句" in blk, blk)
 ok("G4 提醒图片是转述", "方括号里是转述" in blk)
 
-same = M.flatten([ev("QQ用户", 1094950020, 1788449400 + i,
+same = M.flatten([ev("QQ用户", 100000020, 1788449400 + i,
                      [seg("text", text="第%d句" % i)]) for i in range(6)])
 blk2 = M.render_block(same, 6, 0, 6)
 ok("G5 同一身份要提示可能是两个人", "隐去了发言人身份" in blk2, blk2[:200])

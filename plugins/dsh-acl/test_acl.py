@@ -127,8 +127,8 @@ check("B9 help 不受管", level_of("help"), "all")
 print("\nC 授权判定（QQ 号 + 群内身份）")
 
 OWNER_UID = "100000001"      # 群主，在 OWNERS 里
-ADMIN_UID = "3311610642"      # 群管理，不在 OWNERS 里
-MEMBER_UID = "3590729542"     # 普通成员
+ADMIN_UID = "3311610000"      # 群管理，不在 OWNERS 里
+MEMBER_UID = "3590729000"     # 普通成员
 BOT_UID = "100000009"        # 机器人自己也是 admin
 
 check("C1 群主用 owner 级", allowed("owner", OWNER_UID, "owner"), True)

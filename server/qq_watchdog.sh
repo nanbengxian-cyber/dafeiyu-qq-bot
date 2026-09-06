@@ -1,7 +1,7 @@
 #!/bin/bash
 # qq_watchdog.sh —— QQ 登录看守进程（v2）。
 #
-# 背景：账号 200000002 被 QQ 风控盯得很紧，每 20~60 分钟就掉线一次。
+# 背景：账号 100000002 被 QQ 风控盯得很紧，每 20~60 分钟就掉线一次。
 # 掉线后快速登录报「身份已失效」、NapCat 快速登录列表为空，扫码是唯一恢复路径；
 # 而 NapCat **只在进程启动时出码**、且**不会自动续期**（实测 mtime 冻结在生成
 # 那一刻，3 分钟无新码也无过期日志），QQ 码只活约 2 分钟。所以看守要做三件事：
@@ -47,7 +47,7 @@ RESTART_COOLDOWN=${RESTART_COOLDOWN:-150}
 # 主循环间隔
 INTERVAL=${INTERVAL:-10}
 # 日志里取不到账号时显示的兜底号码（当前在用的 2 号）
-FALLBACK_UIN=${FALLBACK_UIN:-200000002}
+FALLBACK_UIN=${FALLBACK_UIN:-100000002}
 # NapCat 容器内 OneBot HTTP 探针地址（host=127.0.0.1，不对外）
 PROBE_URL=${PROBE_URL:-http://127.0.0.1:3000/get_status}
 PROBE_TIMEOUT=${PROBE_TIMEOUT:-5}
@@ -82,7 +82,7 @@ log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 # 当前实际登录的账号号码。
-# 从日志里取而不是扫 config 目录：那里残留着已封的 1 号 200000001 的
+# 从日志里取而不是扫 config 目录：那里残留着已封的 1 号 100000001 的
 # 配置文件，按文件名排序会取错人。
 # 结果缓存 60s——docker logs --since 6h 是这个脚本里最贵的一次调用，
 # 而 write_status 每 10s 就要用一次，加上告警邮件里也要用，不缓存会白烧 CPU。
