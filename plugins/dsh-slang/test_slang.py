@@ -526,6 +526,23 @@ def t15_auto_review_gates():
     assert e3["reviewCount"] == m.AUTO_MAX_DEFER
     assert m._stat["confirmed"] == 0
     assert any("defer 达上限" in a["reason"] for a in m._auto_log)
+    # ---- 敏感词硬拒：命中 _SENSITIVE_RE 直接拒，不发 LLM、不给转正机会 ----
+    e4, _ = m._upsert(m._entries, "中出", {"uid": "u1", "name": "A", "text": "中出", "ts": 1.0})
+    e4["count"] = 5
+    e4["createdAt"] = "2026-01-01T00:00:00"
+    plugin2 = _plugin([json.dumps([{"content": "中出", "decision": "approve", "meaning": "网络用语"}])])
+    _LOOP.run_until_complete(m._run_auto_review(plugin2.context))
+    assert e4["status"] == m.REJECTED, "敏感词必须硬拒"
+    assert any("敏感词表" in a["reason"] for a in m._auto_log)
+    # ---- _clean_msg：@ 昵称(QQ号) 展开剥离，昵称里的字不能进语料 ----
+    raw = "@混..混蛋，不..不要一...一边中出..一边告白啊(2813927478) 我只用过UU远程"
+    assert m._clean_msg(raw) == " 我只用过UU远程", "昵称+QQ号应被剥掉"
+    raw2 = "@CKpad(778933351) 你猜"
+    assert m._clean_msg(raw2) == " 你猜"
+    raw3 = "今天这波真神了"
+    assert m._clean_msg(raw3) == raw3, "无 @ 的消息原样保留"
+    assert m._AT_EXPAND_RE.search("@别人(123) 嗨") is not None, "@别人(123) 应能被剥掉"
+    assert m._clean_msg("@别人(123) 嗨") == " 嗨"
     # ---- _auto_due：8h 到点判定 ----
     now = 100000.0
     assert m._auto_due(now, 0) is True, "从未审过应到点"
