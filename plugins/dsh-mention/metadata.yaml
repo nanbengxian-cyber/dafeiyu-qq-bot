@@ -2,4 +2,4 @@ name: dsh-mention
 desc: 智能 @ 控制。替代 AstrBot 全局 reply_with_mention 开关，只在「换人回复 / 回复超时 / 隔太久算新话题」时才 @ 对方，同一个人连续对话不 @，减少群里刷屏感。提供 /艾特模式 查看策略。
 version: 1.0.0
 author: 大肥鱼
-repo: https://github.com/nanbengxian-cyber/dafeiyu-qq-bot
+repo: local

@@ -58,8 +58,8 @@
 #   · imagegen_done / voice_done / video_done 三个 extra —— 那三个插件的
 #     **兜底钩子**路径不经过函数工具（模型嘴上答应但没调工具时插件自己动手），
 #     只看工具事件会漏。这三个 extra 本来就是它们防重复用的，顺手复用。
-# extras 在 clear_result() 里不会被清（源码只置 self._result = None），而
-# on_tool_end 会调 clear_result —— 所以必须用 extras 而不是往 result 上做记号。
+#   extras 在 clear_result() 里不会被清（源码只置 self._result = None），而
+#   on_tool_end 会调 clear_result —— 所以必须用 extras 而不是往 result 上做记号。
 #
 # 配套改动：platform_settings.reply_with_mention 必须设为 false，否则框架会
 # 先插一个 At，本插件再判断就变成「双 @」。本插件是唯一的 At 来源。
@@ -102,6 +102,16 @@ _RECENT_MAX = 40
 
 # group_id -> (上次回复的用户 id, 时间戳)，只给 /艾特模式 展示用
 _last_reply: dict[str, tuple[str, float]] = {}
+
+
+# 只有「被 @/唤醒」的消息才有资格被 @——这是「他在跟机器人说话」的铁证。
+# 之前只数插了几条、慢了多少秒，没看原消息是不是冲着机器人来的，于是
+# 随机接话时艾特「最后发言的人」——那人根本没在问，就是「艾特错人」
+# （2026-09-06 群主反馈「我压根就没问」）。
+# 刻意**不用**提问正则放宽：群友互相提问（「你们晚上吃啥」）不是问机器人，
+# 机器人插话是随机行为，插话对象不配被 @。宁可漏，不可艾特错人。
+def _addressed(event: AstrMessageEvent) -> bool:
+    return bool(getattr(event, "is_at_or_wake_command", False))
 
 
 def _used_tool(event: AstrMessageEvent) -> str:
@@ -155,9 +165,26 @@ def _decide(event: AstrMessageEvent) -> tuple[bool, str]:
     tool = _used_tool(event)
     inter = _interleaved(gid, uid, msg_ts)
 
+    # 媒体工具（生图/语音/视频）收尾不 @：图/语音/视频已经自动发到群里了，
+    # 收尾那句话只是补充说明，不需要把任何人叫回来——@ 只会艾特错人
+    # （实测 2026-09-07：模型在回甲时顺手给乙生图，收尾文本挂在甲事件上，
+    #  "新表情包来了，分类你自己搞" @到了甲头上，答非所问）。
+    MEDIA_TOOLS = ("generate_image", "send_voice", "generate_video")
+    if tool in MEDIA_TOOLS:
+        tool = ""
+
     # 三条规则，按「证据强度」排，谁先命中就用谁的理由
     if AT_TOOL and tool:
         return True, "用了工具(%s，等了%.0fs)" % (tool, delay)
+
+    # 工具之外，只有「他确实在跟机器人说话」才配被 @。
+    # 随机插话接的是普通闲聊，sender 只是最后发言的人——插他=艾特错人。
+    # 群主 2026-09-06 反馈「我压根就没问」，就是这一条在误伤：
+    # 之前只数插了几条，没看原消息是不是提问。
+    if not _addressed(event):
+        return False, "非提问非被@（插话=%d/%d 延迟=%.0f/%.0fs），不@" % (
+            inter, AT_INTERLEAVE, delay, AT_SLOW)
+
     if AT_INTERLEAVE > 0 and inter >= AT_INTERLEAVE:
         return True, "中间插了%d条别人的话" % inter
     if delay >= AT_SLOW:
@@ -200,7 +227,8 @@ class Main(star.Star):
                 return
             # dsh-initiate 的合成事件不是真人发言，记进来会污染
             # 「他发问后别人又说了几条」这个计数（那是另外两条 @ 规则的判据）。
-            if event.get_extra("dsh_initiate"):
+            # dsh-proactive 同理：哨兵号发言不算群友发言。
+            if event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive"):
                 return
             q = _recent.get(gid)
             if q is None:
@@ -230,11 +258,11 @@ class Main(star.Star):
             if result is None or not result.chain:
                 return
 
-            # 主动开口没有「发送者」可 @：dsh-initiate 的合成事件用的是哨兵号
+            # 主动开口/兴趣探头没有「发送者」可 @：合成事件用的是哨兵号
             # （不能用机器人自己的号，ignore_bot_self_message=True 会把事件掐掉），
             # 插进去就是一个点不动的 @。
-            if event.get_extra("dsh_initiate"):
-                logger.info("[mention] at=False 主动开口，没有对象可@")
+            if event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive"):
+                logger.info("[mention] at=False 合成事件，没有对象可@")
                 return
 
             # 和框架保持一致：只给纯文本/图文消息加 @，别去动转发、语音等复杂链
