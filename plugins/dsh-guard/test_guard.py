@@ -145,7 +145,7 @@ if _os.path.exists(_gp):
               all(x in _out for x in ("阿强", "测试", "上下文")), True)
         check("A2c 输出示例里的 JSON 花括号活下来了", '{"politics"' in _out, True)
         check("A2d 没有残留未替换的占位符",
-              bool(re.search(r"\{(name|text|ctx)\}\}", _out)), False)
+              bool(re.search(r"\{(name|text|ctx)\}", _out)), False)
     except BaseException as _e:
         check("A2a PROMPT.format 不抛异常  <<%s: %s>>" % (type(_e).__name__, _e),
               False, True)
@@ -173,7 +173,7 @@ check("B8 只有severity也算有结果", _parse('{"severity":3}')["severity"], 
 check("B9 severity 超范围被夹紧", _parse('{"severity":9,"politics":true}')["severity"], 3)
 check("B10 severity 负数被夹紧", _parse('{"severity":-5,"politics":true}')["severity"], 0)
 check("B11 severity 非数字回落0", _parse('{"severity":"高","politics":true}')["severity"], 0)
-check("B12 why 超长被截", len(_parse('{"severity":2,"why":"'+'啊'*50+'"}')["why"]), 24)
+check("B12 why 超长被截", len(_parse('{"severity":2,"why":"'+"啊"*50+'"}')["why"]), 24)
 check("B13 缺字段默认False", _parse('{"severity":2}')["nsfw"], False)
 
 BAN_SEC,BAN_SEC_HIGH,MAX_BAN_SEC,WARN_TIMES=600,1800,1800,2

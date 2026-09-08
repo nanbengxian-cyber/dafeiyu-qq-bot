@@ -110,18 +110,33 @@ _LEAK_FRAG = re.compile(
     re.I,
 )
 
-# 模型自造的伪媒体标记。[语音]/[图片]/[视频] 这类舞台提示，实测长在行首。
-# 三重收窄防误伤：① 只认行首；② 括号里只有那个词；③ 带冒号的一律不碰
-# （[贴纸:嘲笑] 有自己的链，[At:123] 是框架的）。
+
+# 恰好两个连续反引号 = 空的行内代码段，任何正常文本里都不该出现。
+# 无条件清，顺带兜住「上一个插件清完、残渣传到下一个插件」的情形。
+# 1 个（`pip install x`）和 3 个（```python）一律不碰。
+_EMPTY_SPAN = re.compile(r"(?<!`)``(?!`)")
+# 单独成行的反引号（跨行围栏被清空后的残渣）
+_LONE_FENCE_LINE = re.compile(r"(?m)^[ \t]*`{1,3}[ \t]*$\n?")
+
+# 模型自造的伪媒体标记。人格教了它 [贴纸:名称]，它就泛化出 [语音]/[图片]
+# 当舞台提示写，实测两次都长在行首：「[语音] 行吧念给你听——…」。
+# 这类标记不会变成任何真东西（真语音是插件发的），只会原样进群，
+# 还会被 _clean_for_tts 当正文念出来。
+# 三重收窄防误伤：① 只认行首；② 括号里只有那个词（「[语音条挺长]」不动）；
+# ③ 带冒号的一律不碰（[贴纸:嘲笑] 有自己的链，[At:123] 是框架的）。
 _MEDIA_TAG_RE = re.compile(
     r"(?m)^[ \t\u3000]*[\[【]\s*"
     r"(?:语音|語音|音频|音頻|voice|audio|图片|圖片|image|photo|pic"
     r"|视频|視頻|video|表情|动图|動圖|gif)"
     r"\s*[\]】][ \t\u3000]*"
 )
+
+
 # 形态 V：模型自己加的旁白 —— 「（图片自动发给你）」「（语音已发送）」。
-# 不是伪调用，但同属「把机制说出来」这类。条件：内容 ≤14 字 + 媒体名词 +
-# 发送动作词，三者齐了才清。
+# 不是伪调用，但同属「把机制说出来」这类：东西已经发了，这句纯属多余。
+# 清括号比清标记危险得多（群友也会用括号讲话），所以三个条件同时满足才清：
+# 内容 ≤14 字 + 含媒体名词 + 含发送动作词。
+# 「（这图真好看）」缺动作词、「（我发链接给你）」缺媒体名词，都留着。
 _STAGE_NOTE_RE = re.compile(
     r"[（(]"
     r"(?=[^）)\n]{0,14}[）)])"
@@ -129,23 +144,25 @@ _STAGE_NOTE_RE = re.compile(
     r"[^）)\n]*(?:自动发|已发|发给|发送|附上|见下|在下面|随后发|马上发)"
     r"[^）)\n]*[）)]"
 )
+
 # 形态 W：不带参数的裸标记 —— `[tool_call]`、`[工具调用]`、`[函数调用]`。
+# 前面所有形态都要求有冒号或括号，这种光秃秃的全放过了。实测进过群。
 _BARE_CALL_RE = re.compile(
     r"[\[【]\s*(?:tool_call|tool_calls|function_call|function_calls|"
     r"工具调用|函数调用|调用工具|工具call)\s*[\]】]",
     re.I,
 )
-# 清理完一个字都不剩时的回落短话
+# 清理完一个字都不剩时的回落短话 —— 群里只看到一个光秃秃的 @ 更像 bug。
 _EMPTY_FALLBACKS = ("这就来", "等着", "来了", "行", "好嘞")
-# 恰好两个连续反引号 = 空的行内代码段
-_EMPTY_SPAN = re.compile(r"(?<!`)``(?!`)")
-_LONE_FENCE_LINE = re.compile(r"(?m)^[ \t]*`{1,3}[ \t]*$\n?")
-# 形态 Z：中文工具名 + 方括号 —— `[生成图片: 一只猫]`。
+
+# 形态 Z：把工具名翻译成中文再套方括号 —— `[生成图片: 一只猫]`。
+# 判据是**动词开头**而不是枚举译名：模型换个说法（制作视频／合成语音）照样命中。
+# [贴纸:x]、[At:1]、[引用消息(张三: 在吗)]、[备注:x] 都不以这些动词开头，安全。
 _CN_ACTS = "生成|发送|调用|播放|合成|搜索|联网|读取|查看|获取|制作|画"
 _LEAK_Z = re.compile(
     rf"[\[【]\s*(?:{_CN_ACTS})[^\]】\n]{{0,10}}[:：][^\]】\n]*[\]】]?"
 )
-# 中文译名 -> 英文工具名（_extract_arg 用）
+# 中文译名 -> 英文工具名，供 _extract_arg 抠参数用。
 _CN_TOOL_ALIAS = {
     "generate_image": r"生成图片|生成图像|画图|生成一张图|作图|绘图|制作图片",
     "send_voice": r"发送语音|语音合成|合成语音|播放语音|发语音",
@@ -154,8 +171,14 @@ _CN_TOOL_ALIAS = {
     "read_webpage": r"读取网页|查看网页|打开网页",
     "bilibili_video": r"查看视频信息|获取视频信息|查B站",
 }
-# markdown 图片：![alt](url)。QQ 不渲染，一定原样进群。
+
+# markdown 图片：![alt](url)。QQ 不渲染 markdown，这东西一定原样进群，
+# 而且实测那个地址是模型现编的（pollinations.ai，插件根本没用过）。
+# 整段删：alt 文字对群友没有任何用处。
 _MD_IMG_RE = re.compile(r"!\[[^\]\n]*\]\([^)\n]*\)")
+# markdown 链接：[文字](url) -> 只留文字。同样是「QQ 不渲染」的问题。
+# 限定 http(s) 开头，避免误伤别的方括号写法；[贴纸:名称] 后面没有 (...)，
+# 本来就不会命中。
 _MD_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]*)\]\(\s*https?://[^)\n]*\)")
 
 
@@ -168,6 +191,10 @@ def _strip_all_leaks(text: str) -> str:
     out = _LEAK_FRAG.sub("", out)
     out = _EMPTY_SPAN.sub("", out)
     if out != before:
+        # 真的清掉过泄漏，才去处理落单的反引号。
+        # 没泄漏时一个字符都不动 —— 群友正常发的代码不能被弄坏。
+        # 这个判据只看泄漏，不看下面的伪媒体标记：单纯清个 [语音]
+        # 不该连带动人家的反引号。
         out = _LONE_FENCE_LINE.sub("", out)
         if out.count("`") % 2:
             out = out.replace("`", "")
@@ -182,8 +209,9 @@ def _strip_all_leaks(text: str) -> str:
 
 
 def _extract_arg(text: str, tool: str, arg: str) -> str | None:
-    """从泄漏的调用里抠出某个参数的值。带引号、不带引号、XML、JSON 都认。"""
+    """从泄漏的调用里抠出某个参数的值。带引号、不带引号都认。"""
     src = text or ""
+    # 带引号：arg="值" / arg='值'
     m = re.search(
         rf"\b{tool}\s*\([^)]*?\b{arg}\s*=\s*(?P<q>[\"\'])(?P<v>.*?)(?<!\\)(?P=q)",
         src, re.S,
@@ -192,6 +220,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         v = (m.group("v") or "").strip()
         if v:
             return v
+    # XML：<parameter name="arg">值</parameter>
     m = re.search(
         rf"<\s*(?:antml:)?parameter\s+name\s*=\s*[\"\']{arg}[\"\']\s*>(.*?)"
         r"(?:</\s*(?:antml:)?parameter\s*>|$)",
@@ -201,6 +230,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         v = m.group(1).strip()
         if v:
             return v
+    # JSON："arg": "值"
     m = re.search(
         rf"[\"\']{arg}[\"\']\s*:\s*[\"\'](.+?)[\"\']", src, re.S
     )
@@ -208,60 +238,77 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         v = m.group(1).strip()
         if v:
             return v
+    # 裸值：arg=值 一直到右括号（半角/全角）或行尾/结尾。
+    # 这是本轮新增的形态，实测最常见。
     m = re.search(
         rf"\b{tool}\s*\(\s*(?:\w+\s*=\s*[^,)]*,\s*)*?{arg}\s*=\s*"
         r"(?P<v>[^\n]*?)\s*(?:[\)）]|$)",
         src, re.S,
     )
     if m:
-        v = (m.group("v") or "").strip().strip("\"\'")
+        v = (m.group("v") or "").strip().strip("\"'")
         if v:
             return v
+    # 裸标签：<send_voice>要念的话</send_voice> —— 标签里包的就是参数值。
+    # 放最后：前面几种形态更精确，能命中就不必走这里。
     m = re.search(
         rf"<\s*{tool}\s*>(.*?)(?:</\s*{tool}\s*>|$)", src, re.S | re.I
     )
     if m:
-        v = (m.group(1) or "").strip().strip("\"\'")
+        v = (m.group(1) or "").strip().strip("\"'")
         if v:
             return v
+    # 方括号形态：[send_voice:要念的话] —— 冒号后面就是参数值。
     m = re.search(
         rf"[\[【]\s*{tool}\s*[:：]([^\]】\n]*)[\]】]?", src, re.I
     )
     if m:
-        v = (m.group(1) or "").strip().strip("\"\'")
+        v = (m.group(1) or "").strip().strip("\"'")
         if v:
             return v
+    # 中文译名：[生成图片: 一只猫]。实测模型会把工具名翻成中文再套方括号。
     alias = _CN_TOOL_ALIAS.get(tool)
     if alias:
         m = re.search(
             rf"[\[【]\s*(?:{alias})\s*[:：]([^\]】\n]*)[\]】]?", src
         )
         if m:
-            v = (m.group(1) or "").strip().strip("\"\'")
+            v = (m.group(1) or "").strip().strip("\"'")
             if v:
                 return v
     return None
 
 
+
 def _leak_relay(event, raw, tool, arg):
     """清理 + 抠参数，并在插件之间接力原文。
 
-    坑：四个插件的 on_llm_response 钩子按**插件加载顺序**依次跑，谁先跑谁就把
-    泄漏标记清掉了，后面的插件想从标记里抠参数就什么都拿不到。所以第一个发现
-    泄漏的插件把**原文**存进 event.extra，后面的都从这儿读。清理本身幂等。
+    坑：四个插件的 on_llm_response 钩子按**插件加载顺序**依次跑
+    （call_event_hook 就是拿 registry 顺序 for 循环，没有优先级）。
+    谁先跑谁就把泄漏标记清掉了，后面的插件再想从标记里抠参数就什么
+    都拿不到 —— 实测 dsh-video 最先加载，于是 imagegen 和 voice 的
+    「抠自泄漏调用」这条高保真路径直接失效（日志里能看到
+     [video] 已清理… 之后 imagegen 只能自己重新推 prompt）。
+
+    所以：第一个发现泄漏的插件把**原文**存进 event.extra，后面的都从
+    这儿读。清理本身是幂等的，重复跑没有副作用。
     """
     raw = raw or ""
     cleaned = _strip_all_leaks(raw)
     if raw.strip() and not cleaned.strip():
+        # 整条回复就是一个泄漏标记，清完什么都不剩。四个插件按加载顺序跑，
+        # 第一个动手的换成短话，后面的看到 cleaned == raw 就不再动，不会叠加。
         cleaned = random.choice(_EMPTY_FALLBACKS)
     src = raw
     if cleaned != raw:
+        # 我是第一个动手的，把原文留给后面的插件
         try:
             if not event.get_extra("dsh_leak_raw"):
                 event.set_extra("dsh_leak_raw", raw)
         except Exception:  # noqa: BLE001
             pass
     else:
+        # 已经被前面的插件清过了，去接力里取原文
         try:
             src = event.get_extra("dsh_leak_raw") or raw
         except Exception:  # noqa: BLE001
@@ -270,154 +317,302 @@ def _leak_relay(event, raw, tool, arg):
     return cleaned, leaked
 
 
+
 # ---------------------------------------------------------------- 配置
 
-ENABLED = os.environ.get("DSH_WEB", "1") not in ("0", "false", "False", "")
-# 单次抓取正文最多保留多少字
-MAX_CHARS = int(os.environ.get("DSH_WEB_MAX_CHARS", "6000"))
-# 一条消息最多自动抓几个链接
-MAX_URLS = int(os.environ.get("DSH_WEB_MAX_URLS", "3"))
-# 单次请求超时（秒）
-TIMEOUT = int(os.environ.get("DSH_WEB_TIMEOUT", "15"))
-# 一次消息处理的总预算（秒）：宁可这轮不抓，也不能把群聊卡住
-BUDGET = float(os.environ.get("DSH_WEB_BUDGET", "35"))
-# 同一条指令最多同时几个链接
-SEARCH_COUNT = int(os.environ.get("DSH_WEB_SEARCH_COUNT", "5"))
-SEARCH_SNIPPET = int(os.environ.get("DSH_WEB_SNIPPET", "160"))
-SEARCH_ENGINE = os.environ.get("DSH_WEB_SEARCH_ENGINE", "zhipu").strip().lower()
-
-ZHIPU_BASE = os.environ.get(
-    "DSH_WEB_ZHIPU_BASE", "https://open.bigmodel.cn/api/paas/v4"
-).rstrip("/")
-ZHIPU_KEY = os.environ.get("DSH_WEB_ZHIPU_KEY", "")
-DDG_BASE = os.environ.get("DSH_WEB_DDG_BASE", "https://html.duckduckgo.com/html/")
-
-UA = (
+ENABLED = os.environ.get("DSH_WEB_ENABLE", "1") not in ("0", "false", "False")
+UA = os.environ.get(
+    "DSH_WEB_UA",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
+TIMEOUT = int(os.environ.get("DSH_WEB_TIMEOUT", "20"))
+# 单页最多注入多少字（模型上下文是钱，也别把群聊挤掉）
+MAX_CHARS = int(os.environ.get("DSH_WEB_MAX_CHARS", "1500"))
+# 下载上限，防止有人发个 500MB 的文件把 1.6G 内存打满
+MAX_BYTES = int(os.environ.get("DSH_WEB_MAX_BYTES", str(3 * 1024 * 1024)))
+# 一条消息里最多抓几个链接
+MAX_URLS = int(os.environ.get("DSH_WEB_MAX_URLS", "2"))
+# 钩子总预算：宁可这轮不看网页，也不能让回复卡住
+BUDGET = float(os.environ.get("DSH_WEB_BUDGET", "25"))
+# 同一 URL 的抓取结果缓存多久
+CACHE_TTL = int(os.environ.get("DSH_WEB_CACHE_TTL", "1800"))
+MAX_REDIRECTS = 5
+# 正文低于这个字数就当没抓到——宁可说读不了，也别让模型拿着半句话去编
+MIN_TEXT = int(os.environ.get("DSH_WEB_MIN_TEXT", "120"))
 
-# 抓不到的站点特征（香港实测）——抓到这些就老实说抓不到，别让模型编
-KNOWN_BLOCKED = ("mp.weixin.qq.com", "weixin", "juejin", "36kr", "baijiahao",
-                 "weibo", "zhihu", "wikipedia.org", "b23.tv", "bilibili")
+ZHIPU_KEY = os.environ.get("DSH_WEB_SEARCH_KEY", "")
+ZHIPU_BASE = os.environ.get(
+    "DSH_WEB_SEARCH_BASE", "https://open.bigmodel.cn/api/paas/v4"
+).rstrip("/")
+SEARCH_ENGINE = os.environ.get("DSH_WEB_SEARCH_ENGINE", "search_std")
+SEARCH_COUNT = int(os.environ.get("DSH_WEB_SEARCH_COUNT", "5"))
+# 每条搜索结果注入多少字
+SEARCH_SNIPPET = int(os.environ.get("DSH_WEB_SEARCH_SNIPPET", "260"))
 
-# path -> 页面正文缓存（同一轮/邻近轮次复用）
-_cache: dict[str, str] = {}
-_stat = {"inject": 0, "fetch": 0, "fail": 0, "watch": 0, "no_urls": 0}
+# url -> (时间戳, 标题, 正文)
+_cache: dict[str, tuple[float, str, str]] = {}
+
+URL_RE = re.compile(r"https?://[^\s\u4e00-\u9fff，。！？；、）】》\"'<>]+", re.I)
+# 群里也常见不带协议头的裸链接
+BARE_RE = re.compile(
+    r"(?<![\w.@/-])((?:www\.|b23\.tv/|bilibili\.com/)[^\s\u4e00-\u9fff，。！？；、）】》\"'<>]+)",
+    re.I,
+)
+BV_RE = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
+AV_RE = re.compile(r"\bav(\d{1,12})\b", re.I)
+
+_BILI_HOSTS = ("bilibili.com", "b23.tv", "acg.tv", "bilibili.tv")
 
 # ---------------------------------------------------------------- SSRF 防护
 
-_PRIVATE_NETS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("198.18.0.0/15"),
-    ipaddress.ip_network("::1"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
+
+def _is_public_ip(host: str) -> tuple[bool, str]:
+    """解析主机名，要求所有解析结果都是公网 IP。返回 (放行, 拒绝原因)。
+
+    DNS 失败和「解析到内网」要分开报：前者是域名不存在/打不通，后者是安全拦截。
+    混成一句话会让排查时把两件事搞混。
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False, "域名解析不了（可能不存在或网络不通）"
+    if not infos:
+        return False, "域名解析不到地址"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%")[0])
+        except ValueError:
+            return False, "解析出的地址不合法"
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False, "指向内网地址，已拒绝"
+    return True, ""
+
+
+async def _check_url(url: str) -> tuple[bool, str]:
+    """协议 + 主机 + IP 三层校验。返回 (放行, 拒绝原因)。"""
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return False, "URL 格式不对"
+    if p.scheme not in ("http", "https"):
+        return False, f"只支持 http/https（收到 {p.scheme or '空'}）"
+    if not p.hostname:
+        return False, "没有主机名"
+    # DNS 解析放线程池：解析可能阻塞几秒，别卡住事件循环
+    ok, why = await asyncio.to_thread(_is_public_ip, p.hostname)
+    if not ok:
+        return False, why
+    return True, ""
+
+
+# ---------------------------------------------------------------- 正文提取
+
+_CONTENT_SELECTORS = [
+    "article",
+    "main",
+    "[role=main]",
+    "#mw-content-text",
+    "#js_content",
+    ".rich_media_content",
+    ".article-content",
+    ".post-content",
+    ".markdown-body",
+    "#readme",
+    ".repository-content",
+    ".topic_content",
+    ".article",
+    "#content",
+    ".content",
+]
+_DROP_TAGS = [
+    "script", "style", "nav", "footer", "header", "noscript",
+    "aside", "form", "iframe", "svg", "button", "select",
 ]
 
 
-def _ok_net(ip_s: str) -> bool:
+async def _read_capped(resp) -> bytes:
+    """分块读到上限。踩过的坑：StreamReader.read(n) 只返回当前缓冲区里的数据，
+    直接 read(MAX_BYTES) 在 gzip 大页面上只能拿到第一块（26KB），HTML 被截断，
+    <article> 之类的正文容器还没出现，于是「抓到了但没正文」。必须循环。"""
+    buf = bytearray()
+    async for chunk in resp.content.iter_chunked(65536):
+        buf.extend(chunk)
+        if len(buf) >= MAX_BYTES:
+            break
+    return bytes(buf)
+
+
+# 拦截页/错误页的特征。这些页面 HTTP 都是 200，正文也有几十个字，
+# 光看长度分辨不出来，只能认特征词。
+# 正文里出现就判定被拦（这些说法只会出现在拦截页，正常文章不会这么开头）
+_BLOCK_IN_TEXT = [
+    ("参数错误", "链接参数不对或已失效"),
+    ("完成验证后即可继续访问", "被要求验证"),
+    ("请输入验证码", "被要求验证码"),
+    ("Enable JavaScript and cookies to continue", "要求 JS/Cookie"),
+    ("请开启 JavaScript", "要求 JS"),
+    ("访问页面不存在", "页面不存在"),
+    ("页面找不到了", "页面不存在"),
+    ("页面不存在或已删除", "页面不存在"),
+]
+# 只在标题里出现才判定被拦。放标题是为了避免误杀——一篇正经讲「验证码」
+# 的文章正文里当然会出现「验证码」，但它的标题不会是「百度安全验证」。
+_BLOCK_IN_TITLE = [
+    ("安全验证", "被安全验证拦下"),
+    ("环境异常", "被要求验证（环境异常）"),
+    ("验证码", "被要求验证码"),
+    ("Just a moment", "被 Cloudflare 拦下"),
+    ("Attention Required", "被 Cloudflare 拦下"),
+    ("Sina Visitor System", "微博要求登录"),
+    ("Too Many Req", "被限流"),
+    ("Wikimedia Error", "被限流"),
+    ("404", "页面不存在"),
+    ("Not Found", "页面不存在"),
+    ("Access Denied", "被拒绝访问"),
+    ("Forbidden", "被拒绝访问"),
+]
+
+
+def _looks_blocked(title: str, text: str) -> str:
+    """像拦截页/错误页就返回原因，否则返回空串。"""
+    head = text[:400]
+    for needle, why in _BLOCK_IN_TEXT:
+        if needle in head:
+            return why
+    for needle, why in _BLOCK_IN_TITLE:
+        if needle.lower() in title.lower():
+            return why
+    return ""
+
+
+def _extract(html: str) -> tuple[str, str]:
+    """从 HTML 里抽出 (标题, 正文纯文本)。抽不到正文就返回 meta 描述。"""
     try:
-        ip = ipaddress.ip_address(ip_s.strip())
-    except ValueError:
-        return False
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-        return False
-    return all(not ip in n for n in _PRIVATE_NETS)
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return "", re.sub(r"<[^>]+>", " ", html)[:MAX_CHARS]
+
+    soup = BeautifulSoup(html, "lxml")
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    if not title:
+        node = soup.select_one('meta[property="og:title"]')
+        if node and node.get("content"):
+            title = node["content"].strip()
+
+    meta_desc = ""
+    for sel in ('meta[property="og:description"]', 'meta[name="description"]'):
+        node = soup.select_one(sel)
+        if node and node.get("content"):
+            meta_desc = node["content"].strip()
+            break
+
+    for tag in soup(_DROP_TAGS):
+        tag.decompose()
+
+    best = None
+    for sel in _CONTENT_SELECTORS:
+        node = soup.select_one(sel)
+        if node and len(node.get_text(" ", strip=True)) > 200:
+            best = node
+            break
+    body = best or soup.body or soup
+    text = re.sub(r"\s+", " ", body.get_text(" ", strip=True))
+
+    # 正文太短说明是前端渲染 / 验证码页，退回 meta 描述（至少有点信息）
+    if len(text) < 200 and meta_desc:
+        text = meta_desc
+    return title, text
 
 
-async def _resolve(url: str) -> str | None:
-    host = urlparse(url).hostname
-    if not host:
-        return None
-    try:
-        infos = await asyncio.get_event_loop().getaddrinfo(
-            host, None, type=socket.SOCK_STREAM
-        )
-    except OSError:
-        return None
-    for info in infos:
-        ip = info[4][0]
-        if _ok_net(ip):
-            return ip
-    return None
+# ---------------------------------------------------------------- 抓取
 
 
-async def _fetch(url: str) -> tuple[str, str]:
-    """抓一个 URL 的正文纯文本。返回 (text, error)。"""
-    if url in _cache:
-        return _cache[url], ""
-    par = urlparse(url)
-    if par.scheme not in ("http", "https"):
-        return "", "只支持 http/https"
-    ip = await _resolve(url)
-    if not ip:
-        return "", f"解析不了 {par.hostname}（或不是公网地址）"
+async def _fetch(url: str) -> tuple[str, str, str]:
+    """抓一个 URL，返回 (标题, 正文, 错误)。手动跟随重定向并逐跳校验。"""
+    hit = _cache.get(url)
+    if hit and time.time() - hit[0] < CACHE_TTL:
+        return hit[1], hit[2], ""
 
+    current = url
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=TIMEOUT)
         ) as session:
-            async with session.get(
-                url,
-                headers={"User-Agent": UA},
-                allow_redirects=True,
-                ssl=False,
-            ) as resp:
-                final = str(resp.url)
-                if urlparse(final).hostname != urlparse(url).hostname:
-                    # 重定向跳走了：重新校验目标 IP
-                    ip2 = await _resolve(final)
-                    if not ip2:
-                        return "", "重定向目标不是公网地址"
-                if resp.status != 200:
-                    return "", f"HTTP {resp.status}"
-                ctype = resp.headers.get("Content-Type", "").lower()
-                if ctype and "html" not in ctype and "text" not in ctype and "json" not in ctype:
-                    return "", f"不是网页（{ctype[:40]}）"
-                body = await resp.text(errors="replace")
+            for _ in range(MAX_REDIRECTS):
+                ok, why = await _check_url(current)
+                if not ok:
+                    return "", "", why
+                async with session.get(
+                    current, headers=headers, allow_redirects=False, ssl=False
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        loc = resp.headers.get("Location")
+                        if not loc:
+                            return "", "", f"HTTP {resp.status} 但没给跳转地址"
+                        current = urljoin(str(resp.url), loc)
+                        continue
+                    if resp.status >= 400:
+                        return "", "", f"HTTP {resp.status}"
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if not any(
+                        k in ctype for k in ("html", "text/plain", "json", "xml")
+                    ):
+                        return "", "", f"不是网页（{ctype.split(';')[0] or '未知类型'}）"
+                    raw = await _read_capped(resp)
+                    charset = resp.charset or "utf-8"
+                    try:
+                        html = raw.decode(charset, errors="replace")
+                    except (LookupError, UnicodeDecodeError):
+                        html = raw.decode("utf-8", errors="replace")
+                    break
+            else:
+                return "", "", "重定向太多次"
     except asyncio.TimeoutError:
-        return "", f"抓取超时（>{TIMEOUT}s）"
+        return "", "", f"超时（>{TIMEOUT}s）"
     except aiohttp.ClientError as e:
-        return "", f"{type(e).__name__}: {e}"
+        return "", "", f"连不上：{type(e).__name__}"
+    except Exception as e:  # noqa: BLE001
+        return "", "", f"{type(e).__name__}: {e}"
 
-    text = _html_to_text(body)
-    if not text.strip():
-        return "", "页面没有可读正文（可能是前端渲染）"
+    title, text = _extract(html)
+    blocked = _looks_blocked(title, text)
+    if blocked:
+        return title, "", blocked
+    if len(text) < MIN_TEXT:
+        return title, "", "抓到页面但取不到正文（大概是前端渲染或要验证码）"
     text = text[:MAX_CHARS]
-    _cache[url] = text
-    _stat["fetch"] += 1
-    return text, ""
-
-
-def _html_to_text(html: str) -> str:
-    """把 HTML 转成能读的纯文本：剥标签、收空白、拆段落。"""
-    import html as _html
-
-    s = _html.unescape(html or "")
-    s = re.sub(r"<script[^>]*>.*?</script>", " ", s, flags=re.S | re.I)
-    s = re.sub(r"<style[^>]*>.*?</style>", " ", s, flags=re.S | re.I)
-    s = re.sub(r"<[^>]+>", "\n", s)
-    s = re.sub(r"[ \t\u3000]+", " ", s)
-    s = re.sub(r"\n\s*\n+", "\n\n", s)
-    return s.strip()
+    _cache[url] = (time.time(), title, text)
+    if len(_cache) > 200:
+        for k in sorted(_cache, key=lambda x: _cache[x][0])[:100]:
+            _cache.pop(k, None)
+    return title, text, ""
 
 
 # ---------------------------------------------------------------- 搜索
 
+
 async def _search_zhipu(query: str) -> tuple[list[dict], str]:
-    """智谱 web_search。每条自带摘要，最稳的一条路。"""
     if not ZHIPU_KEY:
-        return [], "没配智谱 key"
+        return [], "未配置搜索 key"
     try:
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT + 10)
         ) as session:
             async with session.post(
                 f"{ZHIPU_BASE}/web_search",
@@ -425,106 +620,64 @@ async def _search_zhipu(query: str) -> tuple[list[dict], str]:
                     "Authorization": f"Bearer {ZHIPU_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={"model": "web_search", "query": query},
+                json={
+                    "search_engine": SEARCH_ENGINE,
+                    "search_query": query,
+                    "count": SEARCH_COUNT,
+                },
             ) as resp:
                 if resp.status != 200:
-                    return [], f"HTTP {resp.status}"
-                data = await resp.json(content_type=None)
-    except (asyncio.TimeoutError, aiohttp.ClientError, ValueError) as e:
+                    return [], f"HTTP {resp.status} {(await resp.text())[:160]}"
+                data = await resp.json()
+    except asyncio.TimeoutError:
+        return [], "搜索超时"
+    except Exception as e:  # noqa: BLE001
         return [], f"{type(e).__name__}: {e}"
-    results = (data.get("search_result") or [])[:SEARCH_COUNT]
-    # content 本身带标签，剥成干净文本
+
     out = []
-    for r in results:
-        c = re.sub(r"<[^>]+>", "", r.get("content") or "")
+    for it in (data.get("search_result") or [])[:SEARCH_COUNT]:
         out.append(
             {
-                "title": r.get("title") or "",
-                "link": r.get("link") or r.get("url") or "",
-                "content": c.strip()[:SEARCH_SNIPPET * 3],
-                "date": "",
+                "title": (it.get("title") or "").strip(),
+                "link": (it.get("link") or "").strip(),
+                "content": re.sub(r"\s+", " ", it.get("content") or "").strip(),
+                "date": (it.get("publish_date") or "").strip(),
             }
         )
     return out, "" if out else "没有结果"
 
 
 async def _search_ddg(query: str) -> tuple[list[dict], str]:
-    """DuckDuckGo html 端点兜底。"""
+    """备用搜索：DuckDuckGo lite（实测这台机器可达）。"""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return [], "缺少 bs4"
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=TIMEOUT)
         ) as session:
-            async with session.get(
-                DDG_BASE,
-                params={"q": query},
+            async with session.post(
+                "https://lite.duckduckgo.com/lite/",
+                data={"q": query},
                 headers={"User-Agent": UA},
-                ssl=False,
             ) as resp:
                 if resp.status != 200:
                     return [], f"HTTP {resp.status}"
-                html = await resp.text(errors="replace")
-    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                html = await resp.text()
+    except Exception as e:  # noqa: BLE001
         return [], f"{type(e).__name__}: {e}"
 
-    from html.parser import HTMLParser
-
-    links, snips = [], []
-    class _P(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self._cur = None
-        def handle_starttag(self, tag, attrs):
-            if tag == "a":
-                d = dict(attrs)
-                cls = d.get("class", "")
-                if "result__a" in cls:
-                    self._cur = {"href": d.get("href", "")}
-            elif tag == "a" and self._cur is None:
-                pass
-        def handle_endtag(self, tag):
-            if tag == "a" and self._cur:
-                links.append(self._cur)
-                self._cur = None
-        def handle_data(self, data):
-            if self._cur is not None:
-                self._cur["text"] = (self._cur.get("text") or "") + data
-    p = _P()
-    try:
-        p.feed(html)
-    except Exception:  # noqa: BLE001
-        pass
-
-    # 摘要块：result__snippet
-    snips = []
-    class _S(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self._on = False
-            self._buf = []
-        def handle_starttag(self, tag, attrs):
-            if dict(attrs).get("class", "") == "result__snippet":
-                self._on = True
-        def handle_endtag(self, tag):
-            if tag == "p" and self._on:
-                snips.append("".join(self._buf).strip())
-                self._on = False
-                self._buf = []
-        def handle_data(self, data):
-            if self._on:
-                self._buf.append(data)
-    s = _S()
-    try:
-        s.feed(html)
-    except Exception:  # noqa: BLE001
-        pass
-
+    soup = BeautifulSoup(html, "lxml")
+    links = soup.select("a.result-link")
+    snips = soup.select("td.result-snippet")
     out = []
     for a, sn in list(zip(links, snips))[:SEARCH_COUNT]:
         out.append(
             {
-                "title": a.get("text", "").strip(),
+                "title": a.get_text(" ", strip=True),
                 "link": a.get("href", ""),
-                "content": sn[:SEARCH_SNIPPET],
+                "content": sn.get_text(" ", strip=True),
                 "date": "",
             }
         )
@@ -653,47 +806,132 @@ async def _bili_info(text: str) -> tuple[str, str]:
         return "", last_err
 
     if data.get("code") != 0:
-        return "", f"B站返回 code {data.get('code')}"
+        return "", f"B 站返回 {data.get('code')}：{data.get('message')}"
     d = data.get("data") or {}
-    owner = (d.get("owner") or {}).get("name") or "未知UP"
+    stat = d.get("stat") or {}
+    owner = d.get("owner") or {}
+    pub = ""
+    if d.get("pubdate"):
+        pub = time.strftime("%Y-%m-%d", time.localtime(int(d["pubdate"])))
     lines = [
-        f"标题：{d.get('title') or '未知'}",
-        f"UP：{owner}｜时长：{_fmt_dur(d.get('duration') or 0)}",
-        f"播放：{_fmt_cnt(d.get('stat', {}).get('view') or 0)}｜"
-        f"点赞：{_fmt_cnt(d.get('stat', {}).get('like') or 0)}｜"
-        f"弹幕：{_fmt_cnt(d.get('stat', {}).get('danmaku') or 0)}",
-        f"简介：{d.get('desc') or '（无）'}",
+        f"B 站视频《{d.get('title', '?')}》",
+        f"UP 主：{owner.get('name', '?')}｜时长 {_fmt_dur(d.get('duration', 0))}｜发布 {pub}",
+        f"播放 {_fmt_cnt(stat.get('view'))}｜点赞 {_fmt_cnt(stat.get('like'))}｜"
+        f"弹幕 {_fmt_cnt(stat.get('danmaku'))}｜评论 {_fmt_cnt(stat.get('reply'))}｜"
+        f"收藏 {_fmt_cnt(stat.get('favorite'))}｜投币 {_fmt_cnt(stat.get('coin'))}",
     ]
+    desc = re.sub(r"\s+", " ", (d.get("desc") or "").strip())
+    if desc:
+        lines.append(f"简介：{desc[:300]}")
+    pages = d.get("pages") or []
+    if len(pages) > 1:
+        lines.append(f"共 {len(pages)} 个分P：" + "、".join(
+            (p.get("part") or "")[:20] for p in pages[:5]
+        ))
     return "\n".join(lines), ""
 
 
-BV_RE = re.compile(r"BV[0-9A-Za-z]{8,12}")
-AV_RE = re.compile(r"av(\d+)")
+# 时政内容识别。命中的搜索结果/网页正文不注入给模型 ——
+# 上游渠道会对这类内容直接 content_filter 拒绝**整个** completion，
+# 结果群里收到一行「LLM 响应错误: …内容安全过滤被拒绝」，比不回答更难看。
+# 实测触发场景：「搜一下今天有什么新闻」搜到领导人出访 + 政治局会议。
+# 只收几乎必然踩线的词；「经济」「疫情」这类正常词不收，避免大面积误杀。
+SENSITIVE_RE = re.compile(
+    r"习近平|李强总理|政治局|中共中央|总书记|国家主席|人大常委|全国政协"
+    r"|台独|港独|疆独|藏独|法轮|六四|达赖|维吾尔|新疆再教育"
+    r"|颜色革命|政变|军事演习|统一台湾|武统"
+)
 
-# 链接提取：http(s) 或裸域名/BV 号
-URL_RE = re.compile(
-    r"https?://[^\s<>\"']+"
-    r"|[A-Za-z0-9-]+\.[a-z]{2,}(?:/[^\s<>\"']*)?"
-    r"|BV[0-9A-Za-z]{8,12}"
-    r"|b23\.tv/\S+"
+# 国际冲突：单收「战争」会误杀游戏和历史闲聊（实测本群出现过
+# 「我玩的是德国线，苏联那边太肝了」，dsh-guard 预筛第一版就因此误命中）。
+# 所以要两个独立信号同时出现才算：具体国家/地区 **且** 冲突动作。
+#   「美国和伊朗的战争」→ 国家✓ 冲突✓ → 拦
+#   「我玩的是德国线」  → 国家✓ 冲突✗ → 放过
+#   「这游戏打仗好玩」  → 国家✗ 冲突✓ → 放过
+# 与 dsh-memory 的同名表保持一致：上游渠道对时政会拒整条 completion，
+# 任何一处漏了都会换来群里一行「LLM 响应错误」。
+_GEO = (
+    r"美国|美军|中国|俄罗斯|俄军|乌克兰|以色列|伊朗|巴勒斯坦|加沙|叙利亚"
+    r"|朝鲜|韩国|日本|印度|巴基斯坦|台湾|台海|中东|北约|哈马斯|真主党|胡塞"
+    r"|美伊|美俄|美朝|美台|中美|中日|中印|俄乌|俄美|巴以|以巴|朝韩|印巴|日韩"
+)
+_CONFLICT = (
+    r"战争|开战|宣战|停火|休战|交战|打仗|军事|导弹|空袭|轰炸|袭击|制裁"
+    r"|冲突|入侵|撤军|驻军|核武|核弹|谈判僵局|和谈"
+)
+_GEO_CONFLICT_RE = re.compile(
+    r"(?=.*(%s))(?=.*(%s))" % (_GEO, _CONFLICT), re.S
 )
 
 
-def _urls(text: str) -> list[str]:
-    found = []
-    for m in URL_RE.finditer(text or ""):
-        u = m.group(0)
-        if "." not in u and not u.startswith("BV") and "b23" not in u:
+
+def _drop_sensitive(res: list[dict]) -> tuple[list[dict], int]:
+    """摘掉时政条目，返回 (保留的, 摘掉的条数)。"""
+    keep = []
+    for r in res:
+        blob = "%s %s" % (r.get("title") or "", r.get("content") or "")
+        if SENSITIVE_RE.search(blob) or _GEO_CONFLICT_RE.search(blob):
             continue
-        if not u.startswith("http"):
-            u = "https://" + u
-        if u not in found:
-            found.append(u)
-    return found[:MAX_URLS]
+        keep.append(r)
+    return keep, len(res) - len(keep)
 
 
-def _is_bili(u: str) -> bool:
-    return any(k in u for k in ("bilibili", "b23.tv", "BV", "av"))
+# ---------------------------------------------------------------- 自动搜索
+
+# 用户明确要求联网搜索。刻意只收显式动词，不收「X是什么」这类泛问句：
+# 泛问句模型自己答得挺好（「哈基米是什么梗」实测答对），每句都去搜纯浪费。
+SEARCH_CMD_RE = re.compile(
+    # 负向后视排掉「检查/调查/审查/排查…」这些复合动词 ——
+    # 「检查一下代码」含「查一下」，纯前缀匹配会误判成要联网搜。
+    r"(?<![检调审侦排稽普抽复核盘])"
+    r"(搜一?下|搜搜|搜索|搜一?搜|帮我搜|去搜|查一?下|查查|帮我查|去查|查一?查)"
+    r"|(百度|谷歌|google|bing)\s*一?下"
+    r"|(联网|上网)\s*(搜|查)"
+)
+# 把命令词从查询里剥掉，剩下的才是真正要搜的东西。
+# 整段前缀/后缀一起剥（imagegen 那次逐词剥把「穿条纹衬衫」剥成「穿纹衬衫」，
+# 同一个坑不踩第二次）。
+SEARCH_STRIP_PREFIX = re.compile(
+    r"^\s*(帮我|给我|你|去|快|再)?\s*"
+    r"(搜一?下|搜搜|搜索|搜一?搜|查一?下|查查|查一?查|百度一?下|谷歌一?下|google|bing|联网搜|上网搜|联网查)"
+    r"\s*(一?下|看看|吧|呗|啊|嘛)?\s*[，,：:]?\s*"
+)
+SEARCH_STRIP_TAIL = re.compile(
+    r"\s*(吧|呗|啊|嘛|谢谢|thx|好不好|行不行|可以吗|好吗)?\s*[？?。.！!]*\s*$"
+)
+
+
+def _derive_query(text: str) -> str:
+    """从「搜一下今天有什么新闻」里得到「今天有什么新闻」。"""
+    q = SEARCH_STRIP_PREFIX.sub("", text or "", count=1)
+    q = SEARCH_STRIP_TAIL.sub("", q, count=1)
+    q = q.strip(" 　,，.。!！?？:：、")
+    # 剥完什么都不剩（用户只说了「搜一下」），退回原句让搜索引擎自己判断
+    return q or (text or "").strip()
+
+
+# ---------------------------------------------------------------- 链接收集
+
+
+def _collect_urls(text: str) -> list[str]:
+    urls = []
+    for m in URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(".,;:!?)]}»")
+        if u not in urls:
+            urls.append(u)
+    for m in BARE_RE.finditer(text or ""):
+        u = "https://" + m.group(1).rstrip(".,;:!?)]}»")
+        if u not in urls:
+            urls.append(u)
+    return urls[:MAX_URLS]
+
+
+def _is_bili(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _BILI_HOSTS)
 
 
 # ---------------------------------------------------------------- 插件主体
@@ -703,172 +941,293 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[web] 已加载：%s 抓正文≤%d字 每消息≤%d链接 超时%ds 预算%.0fs 搜索=%s",
-            "开" if ENABLED else "关", MAX_CHARS, MAX_URLS, TIMEOUT, BUDGET,
+            "[web] 已加载：开关=%s 搜索=%s(%s) 单页%d字 最多%d链接 预算%.0fs",
+            ENABLED,
+            "已配置" if ZHIPU_KEY else "未配置",
             SEARCH_ENGINE,
+            MAX_CHARS,
+            MAX_URLS,
+            BUDGET,
         )
 
-    # ------------------------------------------------ 主力：钩子自动抓链接
+    # ------------------------------------------------ 触发 1：自动抓链接
 
     @filter.on_llm_request()
-    async def auto_fetch(self, event: AstrMessageEvent, req) -> None:
+    async def attach_links(self, event: AstrMessageEvent, req) -> None:
+        """群消息里有链接就先抓好，把正文附到这次 LLM 请求上。"""
         if not ENABLED:
             return
         try:
             text = event.message_str or ""
-            urls = _urls(text)
-            if not urls:
-                _stat["no_urls"] += 1
-                return
-            # 只看本群的消息；别在私聊/别的平台瞎抓
-            if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            urls = _collect_urls(text)
+            bare_bv = "" if urls else (_bili_id(text)[1] or "")
+            if not urls and not bare_bv:
                 return
             await asyncio.wait_for(
-                self._run_fetch(req, urls), timeout=BUDGET
+                self._attach(req, urls, bare_bv), timeout=BUDGET
             )
         except asyncio.TimeoutError:
-            logger.warning("[web] 超过 %.0fs 预算，本轮放弃抓取", BUDGET)
+            logger.warning("[web] 超过 %.0fs 预算，本轮放弃网页上下文", BUDGET)
         except BaseException as e:  # noqa: BLE001
             logger.error("[web] 钩子异常：%s", e)
 
-    async def _run_fetch(self, req, urls: list[str]) -> None:
-        parts = []
-        for u in urls:
-            if _is_bili(u):
-                txt, err = await _bili_info(u)
-                flag = "B站"
+    async def _attach(self, req, urls: list[str], bare_bv: str) -> None:
+        blocks: list[str] = []
+
+        if bare_bv:
+            info, err = await _bili_info(bare_bv)
+            blocks.append(info if info else f"（{bare_bv} 查不到：{err}）")
+
+        for url in urls:
+            if _is_bili(url):
+                info, err = await _bili_info(url)
+                if info:
+                    blocks.append(info)
+                    continue
+                logger.info("[web] B 站查询失败(%s)，退回抓网页", err)
+            title, body, err = await _fetch(url)
+            if body and (
+                SENSITIVE_RE.search("%s %s" % (title or "", body))
+                or _GEO_CONFLICT_RE.search("%s %s" % (title or "", body))
+            ):
+                # 同理：时政正文注进去会让整条 completion 被拒
+                blocks.append(
+                    f"链接 {url[:90]} 是时政内容，这类你不聊。"
+                    "用自己的语气说一句「这个我不聊」，别复述里面的内容。"
+                )
+                logger.info("[web] 链接 %s 命中时政，已拦下", url[:60])
+                continue
+            if body:
+                head = f"链接 {url[:90]}"
+                if title:
+                    head += f"，标题《{title[:60]}》"
+                blocks.append(f"{head}\n正文摘录：{body}")
             else:
-                txt, err = await self._lookup_page(u)
-                flag = "网页"
-            if txt:
-                _stat["inject"] += 1
-                parts.append(f"[{flag}] {u}\n{txt}")
-            else:
-                _stat["fail"] += 1
-                logger.warning("[web] 抓取失败 %s：%s", u, err)
-            # 顺序抓，间隔一下，别把对方 CDN 打疼
-            await asyncio.sleep(0.3)
-        if not parts:
-            # 一个都拿不到也要给模型一句实话，不许它编
+                blocks.append(
+                    f"链接 {url[:90]} 打不开或读不到内容（{err}）。"
+                    "不要编造这个链接的内容，就说你打不开。"
+                )
+
+        if not blocks:
+            return
+        req.extra_user_content_parts.append(
+            TextPart(
+                text="<webpage_context>\n"
+                "下面是这条消息里链接的内容（你自己看不了网页，这是插件抓来的）。"
+                "凭它回答，别编。\n" + "\n\n".join(blocks) + "\n</webpage_context>"
+            )
+        )
+        logger.info("[web] 已附加 %d 个链接的内容", len(blocks))
+
+    @filter.on_llm_request()
+    async def attach_search(self, event: AstrMessageEvent, req) -> None:
+        """用户明确要搜时，先搜好再交给模型。
+
+        放在 attach_links 之后：如果消息里已经有链接，那才是他真正想问的
+        东西，别再多搜一遍。
+        """
+        if not ENABLED:
+            return
+        try:
+            text = event.message_str or ""
+            if not SEARCH_CMD_RE.search(text):
+                return
+            # 消息里带链接 —— 链接钩子已经处理，不重复
+            if _collect_urls(text) or _bili_id(text)[1]:
+                return
+            query = _derive_query(text)
+            if len(query) < 2:
+                return
+            res, err = await asyncio.wait_for(_search(query), timeout=BUDGET)
+            if res:
+                res, dropped = _drop_sensitive(res)
+                if dropped:
+                    logger.info(
+                        "[web] 自动搜索「%s」摘掉 %d 条时政结果",
+                        query[:40], dropped,
+                    )
+                if not res:
+                    # 全是时政。给模型一句说明，让它用自己的语气打哈哈，
+                    # 而不是把时政正文塞进去换来一行 content_filter 报错。
+                    req.extra_user_content_parts.append(
+                        TextPart(
+                            text="<search_context>\n"
+                            f"搜「{query}」搜出来的全是时政新闻，这类你不聊。"
+                            "用你自己的语气说一句「这个我不聊」糊过去，"
+                            "别复述任何内容、别列标题。\n</search_context>"
+                        )
+                    )
+                    logger.info("[web] 自动搜索「%s」全为时政，已拦下", query[:40])
+                    return
+            if not res:
+                req.extra_user_content_parts.append(
+                    TextPart(
+                        text="<search_context>\n"
+                        f"你试着搜了「{query}」但没搜到（{err}）。"
+                        "如实告诉用户没查到，别编。\n</search_context>"
+                    )
+                )
+                logger.info("[web] 自动搜索「%s」失败：%s", query[:40], err)
+                return
             req.extra_user_content_parts.append(
                 TextPart(
-                    text=f"<web_note>用户发了链接但插件一个都抓不到（{urls[0]}）。"
-                    "你的回复不要说看了链接内容，就说你这边看不到。"
-                    "</web_note>"
+                    text="<search_context>\n"
+                    "用户要你联网搜，插件已经搜好了，下面是结果。"
+                    "凭它回答，别编没出现的内容；说话还是你平时的语气，"
+                    "别念标题列表、别贴网址。\n"
+                    + _fmt_search(query, res)
+                    + "\n</search_context>"
                 )
             )
-            return
-        block = (
-            "<web_content>\n下面是群消息里链接的内容（插件抓的，可能有截断）：\n"
-            + "\n\n".join(parts)
-            + "\n</web_content>"
-        )
-        req.extra_user_content_parts.append(TextPart(text=block))
-        logger.info("[web] 注入 %d 个链接内容（%d 字）", len(parts), len(block))
+            logger.info("[web] 自动搜索「%s」→ %d 条", query[:40], len(res))
+        except asyncio.TimeoutError:
+            logger.warning("[web] 自动搜索超过 %.0fs 预算，放弃", BUDGET)
+        except BaseException as e:  # noqa: BLE001
+            logger.error("[web] 自动搜索异常 %s：%s", type(e).__name__, e or "(无消息)")
 
-    async def _lookup_page(self, url: str) -> tuple[str, str]:
-        if any(k in url for k in KNOWN_BLOCKED):
-            return "", "该站香港直连抓不了正文"
-        txt, err = await _fetch(url)
-        if txt:
-            return txt, ""
-        # 抓不到正文：拿 URL 里的词去搜索，拿结果当兜底
-        host = urlparse(url).hostname or ""
-        words = host.replace("www.", "").split(".")[0]
-        res, serr = await _search(words)
-        if res:
-            return _fmt_search(words, res), ""
-        return "", f"{err}；搜索兜底也失败：{serr}"
-
-    # ------------------------------------------------ 显式指令
-
-    @filter.command("看网页")
-    async def cmd_read(self, event: AstrMessageEvent):
-        arg = self._arg(event, "看网页")
-        if not arg:
-            yield event.plain_result("用法：/看网页 <url>")
-            return
-        txt, err = await self._lookup_page(arg)
-        if txt:
-            yield event.plain_result(txt[:2000])
-        else:
-            yield event.plain_result(f"看不了：{err}")
-
-    @filter.command("搜")
-    async def cmd_search(self, event: AstrMessageEvent):
-        q = self._arg(event, "搜")
-        if not q:
-            yield event.plain_result("用法：/搜 <关键词>")
-            return
-        res, err = await _search(q)
-        if res:
-            yield event.plain_result(_fmt_search(q, res)[:2000])
-        else:
-            yield event.plain_result(f"搜不到：{err}")
-
-    @filter.command("b站")
-    async def cmd_bili(self, event: AstrMessageEvent):
-        arg = self._arg(event, "b站")
-        if not arg:
-            yield event.plain_result("用法：/b站 <BV号或链接>")
-            return
-        txt, err = await _bili_info(arg)
-        yield event.plain_result(txt if txt else f"查不到：{err}")
-
-    # ------------------------------------------------ LLM 函数工具
+    # ------------------------------------------------ 触发 2：LLM 函数工具
 
     @filter.llm_tool(name="web_search")
-    async def tool_search(self, event: AstrMessageEvent, query: str):
-        """联网搜索关键词，返回带摘要的结果列表。
+    async def web_search(self, event: AstrMessageEvent, query: str):
+        """需要查网上的信息、时事新闻、不确定的事实、某个东西是什么时调用本工具联网搜索。
 
         Args:
-            query(string): 搜索词
+            query(string): 搜索关键词，写成一句简短的查询语句
         """
-        res, err = await _search(query or "")
-        if res:
-            return _fmt_search(query, res)
-        return f"搜索失败：{err}"
+        res, err = await _search(query)
+        if not res:
+            return f"搜索失败：{err}。请告诉用户你没查到，不要编造。"
+        res, dropped = _drop_sensitive(res)
+        if dropped:
+            logger.info("[web] 工具搜索摘掉 %d 条时政结果", dropped)
+        if not res:
+            return (
+                "搜出来的全是时政新闻，这类不聊。"
+                "用你自己的语气说一句「这个我不聊」，别复述内容。"
+            )
+        logger.info("[web] 工具搜索「%s」→ %d 条", query[:40], len(res))
+        return _fmt_search(query, res) + "\n（据此回答用户，别编造没出现的内容）"
 
     @filter.llm_tool(name="read_webpage")
-    async def tool_read(self, event: AstrMessageEvent, url: str):
-        """抓一个网页的正文（自动转纯文本并截断）。
+    async def read_webpage(self, event: AstrMessageEvent, url: str):
+        """需要读取某个网页/文章/链接的具体内容时调用本工具。
 
         Args:
-            url(string): 要看的网页地址
+            url(string): 完整网址，必须以 http:// 或 https:// 开头
         """
-        txt, err = await self._lookup_page(url or "")
-        if txt:
-            return txt[:MAX_CHARS]
-        return f"看不了：{err}"
+        if _is_bili(url):
+            info, err = await _bili_info(url)
+            if info:
+                return info
+        title, body, err = await _fetch(url)
+        if not body:
+            return f"打不开这个网页：{err}。请如实告诉用户你读不了，不要编造内容。"
+        logger.info("[web] 工具读页 %s → %d 字", url[:60], len(body))
+        return f"《{title}》\n{body}"
 
     @filter.llm_tool(name="bilibili_video")
-    async def tool_bili(self, event: AstrMessageEvent, url_or_bvid: str):
-        """查 B 站视频信息（标题/UP主/时长/播放/点赞）。
+    async def bilibili_video(self, event: AstrMessageEvent, video: str):
+        """需要查 B 站（哔哩哔哩）视频的标题、UP 主、播放量等信息时调用本工具。
+        # _BILI_RETRY_PATCHED
 
         Args:
-            url_or_bvid(string): B站链接或BV号
+            video(string): B 站视频链接、BV 号（如 BV1xx411c7mD）或 av 号
         """
-        txt, err = await _bili_info(url_or_bvid or "")
-        return txt if txt else f"查不到：{err}"
+        info, err = await _bili_info(video)
+        if not info:
+            return f"查不到这个视频：{err}。请如实告诉用户，不要编造。"
+        return info
 
-    # ------------------------------------------------ 兜底清理
+    # ------------------------------------------------ 只做清理，不兜底
+    #
+    # 实测「搜一下 deepseek 最新消息」时模型回了
+    #     行，我看看最近有啥动静。\n\nweb_search(query="DeepSeek 最新消息 2026年9月")
+    # 搜索压根没执行，那行调用却原样进了群。
+    #
+    # 这里刻意**不做兜底搜索**：搜索结果要进模型的上下文才有意义，
+    # 而 on_llm_response 已经在模型说完之后，补搜出来的东西只能干巴巴地
+    # 贴在后面，反而更怪。主路径是 on_llm_request 自动注入（链接场景）
+    # 和工具（模型愿意调的时候）。这个钩子只负责把脏东西擦掉。
 
     @filter.on_llm_response()
-    async def clean_leaks(self, event: AstrMessageEvent, response) -> None:
-        """把模型泄漏到回复里的伪工具调用清掉（全部六个工具）。"""
+    async def strip_leaks(self, event: AstrMessageEvent, response) -> None:
         try:
             raw = getattr(response, "completion_text", "") or ""
-            if not raw.strip():
-                return
+            # 参与接力：万一 web 先跑，也要把原文留给后面的插件
             cleaned, _ = _leak_relay(event, raw, None, None)
             if cleaned != raw:
                 try:
                     response.completion_text = cleaned
                 except Exception:  # noqa: BLE001
                     response._completion_text = cleaned
-                logger.warning("[web] 已清理泄漏的伪工具调用标记")
+                logger.warning("[web] 已清理模型泄漏的伪工具调用标记")
         except BaseException as e:  # noqa: BLE001
-            logger.warning("[web] 清理钩子异常：%s", e)
+            logger.error("[web] 清理钩子异常：%s", e)
+
+    # ------------------------------------------------ 触发 3：显式指令
+
+    @filter.command("看网页")
+    async def cmd_read(self, event: AstrMessageEvent):
+        """/看网页 <url> —— 直接抓网页正文。"""
+        arg = self._arg(event, "看网页")
+        if not arg:
+            yield event.plain_result("用法：/看网页 https://example.com")
+            return
+        urls = _collect_urls(arg)
+        if not urls:
+            yield event.plain_result("没认出网址")
+            return
+        if _is_bili(urls[0]):
+            info, err = await _bili_info(urls[0])
+            yield event.plain_result(info or f"查不到：{err}")
+            return
+        title, body, err = await _fetch(urls[0])
+        if not body:
+            yield event.plain_result(f"读不了：{err}")
+            return
+        # 指令结果直接进群、不经过 LLM，不会踩上游 content_filter，
+        # 但机器人自己把时政内容贴进群同样是风险。
+        if SENSITIVE_RE.search("%s %s" % (title or "", body)) or \
+                _GEO_CONFLICT_RE.search("%s %s" % (title or "", body)):
+            yield event.plain_result("这是时政内容，我不聊。")
+            return
+        yield event.plain_result(f"《{title}》\n\n{body[:900]}")
+
+    @filter.command("搜")
+    async def cmd_search(self, event: AstrMessageEvent):
+        """/搜 <关键词> —— 联网搜索。"""
+        arg = self._arg(event, "搜")
+        if not arg:
+            yield event.plain_result("用法：/搜 AstrBot 是什么")
+            return
+        res, err = await _search(arg)
+        if not res:
+            yield event.plain_result(f"搜不到：{err}")
+            return
+        # 指令结果直接进群、不经过 LLM，所以不会踩上游的 content_filter，
+        # 但机器人自己把时政新闻贴进群同样是风险，一并拦掉。
+        res, dropped = _drop_sensitive(res)
+        if not res:
+            yield event.plain_result("搜出来全是时政，这个我不聊。")
+            return
+        lines = [f"「{arg}」搜索结果："]
+        if dropped:
+            lines.append(f"（摘掉 {dropped} 条时政）")
+        for i, r in enumerate(res[:4], 1):
+            lines.append(f"{i}. {r['title'][:52]}")
+            if r["content"]:
+                lines.append(f"   {r['content'][:110]}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("b站")
+    async def cmd_bili(self, event: AstrMessageEvent):
+        """/b站 <链接或BV号> —— 查 B 站视频信息。"""
+        arg = self._arg(event, "b站")
+        if not arg:
+            yield event.plain_result("用法：/b站 BV1xx411c7mD")
+            return
+        info, err = await _bili_info(arg)
+        yield event.plain_result(info or f"查不到：{err}")
 
     @filter.command("联网状态")
     async def cmd_status(self, event: AstrMessageEvent):

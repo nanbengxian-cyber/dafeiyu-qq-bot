@@ -58,8 +58,8 @@
 #   · imagegen_done / voice_done / video_done 三个 extra —— 那三个插件的
 #     **兜底钩子**路径不经过函数工具（模型嘴上答应但没调工具时插件自己动手），
 #     只看工具事件会漏。这三个 extra 本来就是它们防重复用的，顺手复用。
-#   extras 在 clear_result() 里不会被清（源码只置 self._result = None），而
-#   on_tool_end 会调 clear_result —— 所以必须用 extras 而不是往 result 上做记号。
+# extras 在 clear_result() 里不会被清（源码只置 self._result = None），而
+# on_tool_end 会调 clear_result —— 所以必须用 extras 而不是往 result 上做记号。
 #
 # 配套改动：platform_settings.reply_with_mention 必须设为 false，否则框架会
 # 先插一个 At，本插件再判断就变成「双 @」。本插件是唯一的 At 来源。

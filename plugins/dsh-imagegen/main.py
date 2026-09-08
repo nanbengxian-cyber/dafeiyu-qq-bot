@@ -204,7 +204,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
     src = text or ""
     # 带引号：arg="值" / arg='值'
     m = re.search(
-        rf"\b{tool}\s*\([^)]*?\b{arg}\s*=\s*(?P<q>[\"'])(?P<v>.*?)(?<!\\)(?P=q)",
+        rf"\b{tool}\s*\([^)]*?\b{arg}\s*=\s*(?P<q>[\"\'])(?P<v>.*?)(?<!\\)(?P=q)",
         src, re.S,
     )
     if m:
@@ -213,7 +213,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
             return v
     # XML：<parameter name="arg">值</parameter>
     m = re.search(
-        rf"<\s*(?:antml:)?parameter\s+name\s*=\s*[\"']{arg}[\"']\s*>(.*?)"
+        rf"<\s*(?:antml:)?parameter\s+name\s*=\s*[\"\']{arg}[\"\']\s*>(.*?)"
         r"(?:</\s*(?:antml:)?parameter\s*>|$)",
         src, re.S | re.I,
     )
@@ -223,7 +223,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
             return v
     # JSON："arg": "值"
     m = re.search(
-        rf"[\"']{arg}[\"']\s*:\s*[\"'](.+?)[\"']", src, re.S
+        rf"[\"\']{arg}[\"\']\s*:\s*[\"\'](.+?)[\"\']", src, re.S
     )
     if m:
         v = m.group(1).strip()
@@ -270,6 +270,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
     return None
 
 
+
 def _leak_relay(event, raw, tool, arg):
     """清理 + 抠参数，并在插件之间接力原文。
 
@@ -305,6 +306,7 @@ def _leak_relay(event, raw, tool, arg):
             src = raw
     leaked = _extract_arg(src, tool, arg) if tool else None
     return cleaned, leaked
+
 
 
 # ---------------------------------------------------------------- 配置

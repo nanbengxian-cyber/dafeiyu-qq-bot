@@ -239,7 +239,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         src, re.S,
     )
     if m:
-        v = (m.group("v") or "").strip().strip("\"\'")
+        v = (m.group("v") or "").strip().strip("\"'")
         if v:
             return v
     # 裸标签：<send_voice>要念的话</send_voice> —— 标签里包的就是参数值。
@@ -248,7 +248,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         rf"<\s*{tool}\s*>(.*?)(?:</\s*{tool}\s*>|$)", src, re.S | re.I
     )
     if m:
-        v = (m.group(1) or "").strip().strip("\"\'")
+        v = (m.group(1) or "").strip().strip("\"'")
         if v:
             return v
     # 方括号形态：[send_voice:要念的话] —— 冒号后面就是参数值。
@@ -256,7 +256,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         rf"[\[【]\s*{tool}\s*[:：]([^\]】\n]*)[\]】]?", src, re.I
     )
     if m:
-        v = (m.group(1) or "").strip().strip("\"\'")
+        v = (m.group(1) or "").strip().strip("\"'")
         if v:
             return v
     # 中文译名：[生成图片: 一只猫]。实测模型会把工具名翻成中文再套方括号。
@@ -266,7 +266,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
             rf"[\[【]\s*(?:{alias})\s*[:：]([^\]】\n]*)[\]】]?", src
         )
         if m:
-            v = (m.group(1) or "").strip().strip("\"\'")
+            v = (m.group(1) or "").strip().strip("\"'")
             if v:
                 return v
     return None
@@ -807,6 +807,7 @@ class Main(star.Star):
                 except Exception:  # noqa: BLE001
                     response._completion_text = cleaned_reply
                 logger.warning("[voice] 已清理模型泄漏的伪工具调用标记")
+
             if not AUTO_FALLBACK:
                 return
             if event.get_extra("voice_done"):

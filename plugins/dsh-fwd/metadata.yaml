@@ -1,5 +1,5 @@
 name: dsh-fwd
-desc: 让机器人能「点进去」看群里的合并转发消息（聊天记录）。根因是 aiocqhttp 适配器没有 forward 分支，NapCat 内联上报的全部内容在构造 Forward 组件时被丢砕，模型看到的是空消息。本插件在 on_llm_request 时自己读原始上报，三条路取全文（本条自带／引用了转发／回看最近群消息），递归展开嵌套聊天记录，长记录保头保尾，图片优先用 QQ 自带 summary、必要时才交视觉模型转述，视频用 ffmpeg 直接从 URL 抽一帧。全程 fail-open 且有总预算，绝不拖慢回复。提供 /聊天记录状态。
+desc: 让机器人能「点进去」看群里的合并转发消息（聊天记录）。根因是 aiocqhttp 适配器没有 forward 分支，NapCat 内联上报的全部内容在构造 Forward 组件时被丢掉，模型看到的是空消息。本插件在 on_llm_request 时自己读原始上报，三条路取全文（本条自带／引用了转发／回看最近群消息），递归展开嵌套聊天记录，长记录保头保尾，图片优先用 QQ 自带 summary、必要时才交视觉模型转述，视频用 ffmpeg 直接从 URL 抽一帧。全程 fail-open 且有总预算，绝不拖慢回复。提供 /聊天记录状态。
 version: 1.0.0
 author: 大肥鱼
 repo: local

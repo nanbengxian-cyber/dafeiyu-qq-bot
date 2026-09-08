@@ -522,7 +522,7 @@ class Main(star.Star):
             "只说一句短话，接不上就发个表情或语气词。"
             "</proactive_context>"
         ) % ("/".join(hits) if hits else "感兴趣的话题", score,
-             ctx[-500:] or "（没有上下文）", trigger[:100]))
+             ctx[-500:] or "（没有上下文）", trigger[:100])))
         yield req
 
     # ------------------------------------------------------------ 身份
