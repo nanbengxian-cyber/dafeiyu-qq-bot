@@ -1,0 +1,4 @@
+name: dsh-noise
+desc: 换单字/说一半/整句叠词——按低概率给「没人叫、自己接话」的回复注入真人噪点，让接话偶尔走神。被 @ 的正经回答绝不动。旋钮 DSH_NOISE / DSH_NOISE_SWAP_RATE / DSH_NOISE_TRUNC_RATE / DSH_NOISE_DOUBLE_RATE。命令 /噪点状态。
+author: 大肥鱼
+version: 1.0.0
