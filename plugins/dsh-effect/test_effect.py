@@ -127,3 +127,44 @@ con.close()
 
 print("EFFECT_TEST_OK stances=%d targets=%d contribs=%d strategies=%d window=%.0fs"
       % (len(m.STANCES), len(m.TARGETS), len(m.CONTRIBS), len(m.STRATEGIES), m.WINDOW))
+
+# ================================================================ 没人理提示（E17）
+# 判据是「连续」不是「比例」：本群 123 条已评分里 ignored 占 52%，
+# 那是常态；把常态当坏消息每轮念给它听会变成持续负压。
+
+ig = m.ignored_streak
+assert ig([]) == 0
+assert ig(["ignored"]) == 1
+assert ig(["ignored", "ignored", "ignored"]) == 3
+# 碰到任何有反应的就断 —— 被怼也是被理了
+for other in ("neutral", "playful", "rejection", "confusion", "appreciation",
+              "factual_correction", "", None, "  "):
+    assert ig(["ignored", other, "ignored", "ignored"]) == 1, other
+# 大小写与空白容错（stance 是模型填的，别指望它规整）
+assert ig([" IGNORED ", "Ignored"]) == 2
+# 序列必须是「最近的在前」，所以只数最前面那一段
+assert ig(["neutral", "ignored", "ignored", "ignored"]) == 0
+
+r = m.render_tell
+assert r(0) == "" and r(1) == "" and r(2) == "", "没到阈值就必须一个字都不注入"
+assert m.TELL_MIN == 3, m.TELL_MIN          # 真语料段长分布定的：阈值3≈14%轮次
+blk = r(3)
+assert blk.startswith("<reply_effect>") and blk.rstrip().endswith("</reply_effect>")
+assert "连着 3 条" in blk
+# 必须是「事实」不是命令：不许出现祈使式的减产指令
+assert "下面是事实，不是命令" in blk
+for banned in ("你应该", "必须少", "不要再说", "闭嘴", "别说话"):
+    assert banned not in blk, banned
+# 必须给出「可以什么都不改」的出口，否则等于逼它自闭
+assert "什么都不改" in blk
+assert len(blk) < 300, len(blk)
+# 阈值可覆盖（旋钮要真能用）
+assert r(2, min_streak=2) != "" and r(1, min_streak=2) == ""
+# 标签必须纯小写，否则 dsh-ctxclean 的 ^<[a-z][a-z0-9_]*> 清不掉陈旧块
+import re as _re
+assert _re.match(r"^<[a-z][a-z0-9_]*>$", m._TELL_HEADER.strip()), m._TELL_HEADER
+assert m._TELL_FOOTER.strip() == "</reply_effect>"
+# 回看窗口不能小于阈值，否则永远数不满
+assert m.TELL_LOOKBACK >= m.TELL_MIN
+print("TELL_OK 阈值=%d 回看=%d 块长=%d" % (m.TELL_MIN, m.TELL_LOOKBACK, len(blk)))
+

@@ -55,6 +55,11 @@ from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core import logger
 
+try:  # 跟 dsh-drift / dsh-scene 一样：拿不到就降级成裸 str
+    from astrbot.core.agent.message import TextPart  # type: ignore
+except Exception:  # pragma: no cover
+    TextPart = None  # type: ignore
+
 
 def _flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
@@ -65,7 +70,7 @@ def _set(name: str, default: str = "") -> set[str]:
 
 
 ENABLED = _flag("DSH_EFFECT")
-GROUPS = _set("DSH_EFFECT_GROUPS", "")
+GROUPS = _set("DSH_EFFECT_GROUPS", "100000001")
 DB = os.environ.get("DSH_EFFECT_DB", "/AstrBot/data/dsh_effect.db")
 # 语料库（只读）。窗口里群友说了什么全从这里查。
 MEM_DB = os.environ.get("DSH_MEM_DB", "/AstrBot/data/dsh_memory.db")
@@ -79,7 +84,13 @@ TICK = max(15.0, float(os.environ.get("DSH_EFFECT_TICK", "60")))
 BATCH = max(1, int(os.environ.get("DSH_EFFECT_BATCH", "5")))
 TIMEOUT = float(os.environ.get("DSH_EFFECT_TIMEOUT", "30"))
 PROVIDER = os.environ.get("DSH_EFFECT_PROVIDER", "").strip()
-OWNERS = _set("DSH_EFFECT_OWNER", "")
+OWNERS = _set("DSH_EFFECT_OWNER", "2774000001")
+
+# 告诉它「最近没人理」（E17）。判据是**连续**没人理的条数，不是比例——
+# 比例 52% 是本群常态，当坏消息天天念只会造成持续负压。
+TELL = _flag("DSH_EFFECT_TELL")
+TELL_MIN = max(2, int(os.environ.get("DSH_EFFECT_TELL_MIN", "3")))
+TELL_LOOKBACK = max(TELL_MIN, int(os.environ.get("DSH_EFFECT_TELL_LOOKBACK", "12")))
 # 太短的回复（「嗯」「好」）没有可评的策略，不记
 MIN_LEN = max(1, int(os.environ.get("DSH_EFFECT_MIN_LEN", "2")))
 
@@ -162,6 +173,46 @@ def init_db(path: str = None) -> None:
         con.close()
 
 
+def ignored_streak(stances) -> int:
+    """从「最近的在前」的 stance 序列里数出连续没人理的条数。
+
+    只数最前面那一段：一旦碰到任何有反应的（包括 neutral／rejection），
+    连击就断了 —— 被怼也是被理了，跟没人接是两件事。
+    """
+    n = 0
+    for st in stances:
+        if (st or "").strip().lower() == "ignored":
+            n += 1
+        else:
+            break
+    return n
+
+
+_TELL_HEADER = "<reply_effect>\n"
+_TELL_FOOTER = "\n</reply_effect>"
+
+
+def render_tell(streak: int, min_streak: int = None) -> str:
+    """连着没人接到一定条数才出声；没到就一个字都不注入。
+
+    形状照 dsh-spine：先说清这是事实不是命令，再给几种正常反应，
+    并明说可以都不选。不下「你应该少说话」这种指令 —— 那是拿没验证过的
+    信号去改行为，属于在没有仪表的情况下拧旋钮。
+    """
+    lo = TELL_MIN if min_streak is None else min_streak
+    if streak < lo:
+        return ""
+    return (
+        _TELL_HEADER
+        + "下面是事实，不是命令：你最近连着 %d 条发出去都没人接"
+          "（没人回你、也没人提到你）。\n"
+          "真人到这一步一般会：停一停少说两句、换个话题、"
+          "或者干脆不接了让他们自己聊。\n"
+          "你也可以什么都不改照样说——但别追着同一个点反复补。" % streak
+        + _TELL_FOOTER
+    )
+
+
 def parse_verdict(raw: str) -> dict | None:
     """从模型输出里抠出结论。取值不在枚举里就退回安全值，绝不写脏数据。
 
@@ -171,7 +222,7 @@ def parse_verdict(raw: str) -> dict | None:
       ③ **逐字段正则捞**。第三层是上线第一天就用上的 ——
          真实失败样本是模型输出被截断在 why 里：
              {"strategy":"humor","stance":"rejection","target":"bot_persona",
-              "contribution":"wrong_push","why":"某群友骂人，另一个说绷不住了，
+              "contribution":"wrong_push","why":"南星桥畔骂'你妈死了'，l说'绷不住了'，
          四个枚举字段全都在截断点**之前**，完全可以救回来，只有 why 是残句。
          没有这一层就白扔掉一条已经花过钱的评分。
     """
@@ -212,7 +263,8 @@ def parse_verdict(raw: str) -> dict | None:
 
 
 _stat = {"recorded": 0, "settled": 0, "ignored_free": 0, "asked": 0,
-         "fail": 0, "parse_fallback": 0, "skip_group": 0, "skip_short": 0}
+         "fail": 0, "parse_fallback": 0, "skip_group": 0, "skip_short": 0,
+         "tell_seen": 0, "tell_injected": 0, "tell_max_streak": 0}
 
 
 class Main(star.Star):
@@ -225,10 +277,47 @@ class Main(star.Star):
             logger.error("[effect] 建库失败，本插件停用: %r", exc)
         logger.info(
             "[effect] 已加载：%s 群=%s 窗口%.0fs 节拍%.0fs 每轮最多%d条"
-            "（只测量，不改任何回复行为）",
+            "｜告诉它没人理=%s",
             "开" if ENABLED else "关", "、".join(sorted(GROUPS)) or "无",
             WINDOW, TICK, BATCH,
+            ("连%d条起，回看%d条" % (TELL_MIN, TELL_LOOKBACK)) if TELL else "关",
         )
+
+    # ------------------------------------------------------ 告诉它最近没人理
+    # priority=100：输入侧注入组。排在拦截组(armor/merge/decide, priority=2000)
+    # 之后 —— 只有没被拦截时才会执行注入，不再白烧 token。
+    @filter.on_llm_request(priority=100)
+    async def tell(self, event: AstrMessageEvent, req) -> None:
+        """连着几条没人接就说一句。到不了阈值就一个字都不注入。"""
+        if not ENABLED or not TELL:
+            return
+        try:
+            gid = str(getattr(event.message_obj, "group_id", "") or "")
+            if GROUPS and gid not in GROUPS:
+                return
+            _stat["tell_seen"] += 1
+            con = _conn()
+            try:
+                rows = con.execute(
+                    "SELECT stance FROM reply WHERE group_id=? AND status='done' "
+                    "ORDER BY ts DESC LIMIT ?", (gid, TELL_LOOKBACK)).fetchall()
+            finally:
+                con.close()
+            streak = ignored_streak([r[0] for r in rows])
+            if streak > _stat["tell_max_streak"]:
+                _stat["tell_max_streak"] = streak
+            block = render_tell(streak)
+            if not block:
+                logger.debug("[effect] 连续没人理 %d 条（<%d），不出声", streak, TELL_MIN)
+                return
+            if TextPart is not None:
+                req.extra_user_content_parts.append(TextPart(text=block))
+            else:
+                req.extra_user_content_parts.append(block)
+            _stat["tell_injected"] += 1
+            logger.info("[effect] 告诉它：连着 %d 条没人接（%d字）", streak, len(block))
+        except BaseException as exc:  # 绝不因为这个信号拖垮一次对话
+            logger.warning("[effect] 没人理提示注入失败，跳过: %r", exc)
 
     # ------------------------------------------------------ 记下自己说了什么
     @filter.after_message_sent()
