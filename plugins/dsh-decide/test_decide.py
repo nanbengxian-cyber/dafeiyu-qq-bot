@@ -60,8 +60,26 @@ def verdict(f):
 def F(**kw):
     d={k:False for k in _BOOLS}; d.update({k:"" for k in _STRS}); d.update(kw); return d
 
+print("A0. PROMPT 模板可 format（guard 在这里栽过一次：裸 { 让每次判定都失败）")
+import os as _os
+_mp = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "main.py")
+if _os.path.exists(_mp):
+    _src = open(_mp, encoding="utf-8").read()
+    _i = _src.index('PROMPT = """'); _j = _src.index('"""', _i + 12) + 3
+    _ns = {}; exec(_src[_i:_j], {}, _ns)
+    try:
+        _out = _ns["PROMPT"].format(transcript="阿强：草")
+        check("A0a PROMPT.format 不抛异常", True, True)
+        check("A0b 占位符被替换", "阿强：草" in _out, True)
+        check("A0c JSON 示例的花括号活下来", '{"arrange"' in _out, True)
+        check("A0d 没有残留占位符", bool(re.search(r"\{transcript\}", _out)), False)
+    except BaseException as _e:
+        check("A0a PROMPT.format 不抛异常  <<%s: %s>>" % (type(_e).__name__, _e), False, True)
+else:
+    print("  SKIP A0（同目录没有 main.py）")
+
 print("A. 解析健壮性")
-GOOD='{"arrange":false,"venting":false,"stop":false,"ack":false,"banter":true,"open":false,"about_bot":false,"topic":"白猫来历","to":"群友A对群友C","tone":"轻松","avoid":"别太认真"}'
+GOOD='{"arrange":false,"venting":false,"stop":false,"ack":false,"banter":true,"open":false,"about_bot":false,"topic":"白猫来历","to":"群友A对群友D","tone":"轻松","avoid":"别太认真"}'
 check("A1 标准 JSON", _parse(GOOD)["banter"], True)
 check("A1b 字符串字段", _parse(GOOD)["topic"], "白猫来历")
 check("A2 ```json 包裹", _parse("```json\n"+GOOD+"\n```")["banter"], True)
@@ -121,7 +139,7 @@ check("C8 谈正事时多一句提醒", "别接管话题" in _render(F(arrange=T
 
 print("D. 明确要东西的白名单（这些绝不能被路由拦掉）")
 # 全部取自真群 archive 里的真实句子 + 两轮实测校准出的边界
-for s in ["谁给我画一张某个群友","发个语音说群主是懒猪","来张图","画个鱼",
+for s in ["谁给我画一张懒人群主","发个语音说群主是懒猪","来张图","画个鱼",
           "生成一个视频","搜索这个页面","查一下这个","帮我搜搜",
           "语音说句话","整张壁纸","做个表情","唱首歌",
           "你能参考这个，再画几张吗",          # 量词在动词后：画几张

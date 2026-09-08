@@ -77,6 +77,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import sqlite3
 import time
@@ -92,6 +93,11 @@ DB = os.environ.get("DSH_MEM_DB", "/AstrBot/data/dsh_memory.db")
 ENABLED = os.environ.get("DSH_DECIDE", "1") != "0"
 # 影子模式：照样判断、照样打日志，但**不**真的拦。想只看数据不改行为时开。
 SHADOW = os.environ.get("DSH_DECIDE_SHADOW", "0") != "0"
+# 静音群：这些群里机器人完全不说话（连被 @ 也不回），但消息照常进管道、
+# 语料照常收集——只在这里把「说不说话」的出口掐掉。逗号分隔的群号列表。
+MUTE_GROUPS = {
+    g.strip() for g in os.environ.get("DSH_MUTE_GROUPS", "").split(",") if g.strip()
+}
 # 判断用哪个 provider。空 = 用当前会话的主 provider
 PROVIDER = os.environ.get("DSH_DECIDE_PROVIDER", "").strip()
 # 给判断多少秒。
@@ -124,6 +130,67 @@ MIN_GAP = float(os.environ.get("DSH_DECIDE_MIN_GAP", "60"))
 # 8s 是照 segmented_reply 的实际节奏定的：分段间隔 1.2~2.8s，一条回复最多几段，
 # 所以 8s 内到达的消息基本不可能是「人看完了才回」。
 GAP_HARD = float(os.environ.get("DSH_DECIDE_GAP_HARD", "8"))
+
+# ---- 动态潜水（用户钦定：'潜水率可以做成动态的，没有什么可以接的对话就可以潜水'）
+#
+# verdict 判定「回话」后，再按「这轮有多值得接」掷一次骰子决定潜不潜水：
+#   在回你（replying_to_bot）→ 几乎必回（潜水率最低）
+#   提到你（about_bot）      → 可以回（很低潜水）
+#   有现成话头（open）       → 多数回（低-中潜水）
+#   纯闲聊玩梗（banter）     → 一半一半
+#   无否决也无话头（fallback）→ 高潜水：没什么可接，潜水就是真人样
+# 被 @ / 被回复 / 点名要能力 都在上面直接放行了，走不到这里 ——
+# 这里只对「没人叫、纯看情况插话」的场景缩放，不会挡必回。
+# DSH_DECIDE_DIVE=0 可整体关掉（回到旧的全开口行为）。
+DIVE = os.environ.get("DSH_DECIDE_DIVE", "1") != "0"
+DIVE_RATE_REPLY = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_REPLY", "0.02"))))
+DIVE_RATE_ABOUT = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_ABOUT", "0.15"))))
+DIVE_RATE_OPEN = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_OPEN", "0.35"))))
+DIVE_RATE_BANTER = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_BANTER", "0.55"))))
+DIVE_RATE_NONE = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_NONE", "0.80"))))
+
+# ---- 作息：睡觉时段不主动插话（《回答.md》D14/D15）
+#
+# 旋钮跟 dsh-scene 共用同一批 env，别在两处各写一份时段，否则一定会漂。
+#   DSH_SLEEP=0        整个作息关掉
+#   DSH_SLEEP_FROM=3   含
+#   DSH_SLEEP_TO=9     不含
+# 时段是拿本群 2137 条真语料按小时切出来的：03:00~08:59 只有 13 条（0.6%），
+# 而 21:00~01:59 占全天 54%。老蓝图那句「夜间降低活跃度」在本群是反的。
+SLEEP_ON = os.environ.get("DSH_SLEEP", "1") != "0"
+try:
+    SLEEP_FROM = int(os.environ.get("DSH_SLEEP_FROM", "3"))
+except Exception:
+    SLEEP_FROM = 3
+try:
+    SLEEP_TO = int(os.environ.get("DSH_SLEEP_TO", "9"))
+except Exception:
+    SLEEP_TO = 9
+SLEEP_TZ = os.environ.get("DSH_SCENE_TZ", "Asia/Shanghai")
+
+
+def _sleep_hour(ts=None):
+    """本群时区的小时。容器已设 TZ=Asia/Shanghai，拿不到 zoneinfo 就退本地时间。"""
+    t = time.time() if ts is None else ts
+    try:
+        import datetime as _dt
+        import zoneinfo as _zi
+
+        return _dt.datetime.fromtimestamp(t, _zi.ZoneInfo(SLEEP_TZ)).hour
+    except Exception:
+        return time.localtime(t).tm_hour
+
+
+def _in_sleep(hour):
+    """睡觉时段？跨午夜的写法（22~6）也成立；FROM==TO 视为不启用。"""
+    if not SLEEP_ON:
+        return False
+    a, b = SLEEP_FROM % 24, SLEEP_TO % 24
+    if a == b:
+        return False
+    if a < b:
+        return a <= hour < b
+    return hour >= a or hour < b
 # 连续判沉默这么多次后强制放行一次。防止判断模型某天开始无脑输出沉默
 # 把机器人变成哑巴 —— 任何单点判断都要有「卡住了怎么办」的兜底。
 MAX_STREAK = max(1, int(os.environ.get("DSH_DECIDE_MAX_SILENCE_STREAK", "6")))
@@ -174,6 +241,29 @@ _CAP_RE = re.compile(
 #     漏放行大（白跳过判断 = 该沉默时也开口），所以加一条否决：
 #     句中出现「好像|大概|应该|是不是|吧？|要时间|不了|不能」等推测/否定标记时，
 #     不当成请求。这与 dsh-imagegen 的教训一致：宾语过滤用排除法。
+#
+# ---------------------------------------------------------------------------
+# 「有人在跟**别的** AI 说话」就别抢话
+#
+# 真人不会去接别人对着另一个助手说的话。参考 MaiBot 的
+# src/maisaka/reply_necessity.py:OTHER_ASSISTANT_ADDRESSEE_PATTERN。
+#
+# 判据必须是结构而不是词表 —— 本群成天在聊模型，只按「句里出现过模型名」判
+# 会满屏假命中。拿 1897 条真语料回测校准过两处：
+#   * 分隔符不收空格：收了空格，「gpt progpt plus」「gpt pro的缓存差不多
+#     95%左右」这两条纯话题句会被误伤。只认标点后归零。
+#   * 名字不收 `GPT`/`ds` 这种太短太泛的写法：群里 `ds` 本身就是话题词
+#     （「ds后训练后甲上来了」「掺ds了」）。宁可漏判，不可误闭嘴 ——
+#     用户的原始抱怨就是「回复太少」，误判沉默是往反方向走。
+# 收紧后真语料 0 假命中，而「DeepSeek，帮我写个正则」「豆包：这题怎么解」
+# 「claude！你在吗」照样抓得到。
+OTHER_AI = os.environ.get("DSH_DECIDE_OTHER_AI", "1") != "0"
+_OTHER_AI_RE = re.compile(
+    r"^\s*(?:DeepSeek|ChatGPT|Grok|Claude|Gemini|Kimi|Qwen|Copilot"
+    r"|豆包|千问|通义|元宝|文心|智谱|讯飞|星火|文小言)\s*[，,、：:!！?？]",
+    re.IGNORECASE,
+)
+
 _ASK_RE = re.compile(
     r"(画|生成|做|发|来|整|录|唱)(一|几|多)?(张|个|段|条|首|遍|次)?"
     r"(图|照|壁纸|表情|视频|语音|音频|歌)"
@@ -200,7 +290,7 @@ _stat = {
     "asked": 0, "silence": 0, "speak": 0,
     "parse_fallback": 0, "fail": 0, "timeout": 0, "breaker": 0,
     "streak_release": 0, "avoid_dropped": 0, "ms_total": 0.0,
-    "span_dropped": 0,
+    "span_dropped": 0, "muted_out": 0,
 }
 _fail_run = 0
 _breaker_until = 0.0
@@ -384,6 +474,27 @@ def verdict(f: dict) -> tuple[str, str]:
     return "回话", "可接（%s）" % (",".join(pos) if pos else "无否决信号")
 
 
+def dive_rate(f: dict) -> float:
+    """这轮「可接但没什么好接的」时潜水的概率（0~1），按信号强度分级。
+
+    纯函数、无副作用，好单测。信号越「有得接」潜水率越低：
+      · 在回你    → 几乎必回（0.02，留一丝随机性）
+      · 提到你    → 很低潜水（0.15）
+      · 有现成话头 → 多数回（0.35）
+      · 纯闲聊    → 一半一半（0.55）
+      · 什么都不可接 → 高潜水（0.80）—— 没人叫、没话头，潜水才是真人样
+    """
+    if f.get("replying_to_bot") and not f.get("ack"):
+        return DIVE_RATE_REPLY
+    if f.get("about_bot"):
+        return DIVE_RATE_ABOUT
+    if f.get("open"):
+        return DIVE_RATE_OPEN
+    if f.get("banter"):
+        return DIVE_RATE_BANTER
+    return DIVE_RATE_NONE
+
+
 def _render(f: dict) -> str:
     """把感知结果包成注入块。只给意图，不给成句台词。
 
@@ -418,11 +529,15 @@ class Main(star.Star):
         self.context = context
         logger.info(
             "[decide] 已加载：%s%s 超时%.0fs 回看%d条/%.0f分钟内 "
-            "刚说过%.0fs内只回接话/%.0fs内全闭嘴 自己的话记%d条 熔断%d次/%.0fs",
+            "刚说过%.0fs内只回接话/%.0fs内全闭嘴 自己的话记%d条 熔断%d次/%.0fs "
+            "静音群=%s 别的AI在被喊时闭嘴=%s 睡觉时段=%s",
             "开" if ENABLED else "关",
             "（影子模式，只看不拦）" if SHADOW else "",
             TIMEOUT, LOOKBACK, SPAN / 60.0, MIN_GAP, GAP_HARD, OWN_MAX,
             FAIL_MAX, COOLDOWN,
+            "、".join(sorted(MUTE_GROUPS)) if MUTE_GROUPS else "无",
+            "开" if OTHER_AI else "关",
+            ("%d~%d点不主动插话" % (SLEEP_FROM, SLEEP_TO)) if SLEEP_ON else "关",
         )
 
     # ---------------------------------------------------------- 记自己何时说过
@@ -486,7 +601,10 @@ class Main(star.Star):
             raw = (getattr(resp, "reasoning_content", "") or "").strip()
         return _parse(raw)
 
-    @filter.on_llm_request()
+    # priority=2000：输入侧拦截组，同 armor/merge。静音时 stop_event 令同批
+    # 后续 handler 全跳过，挡住 effect/emotion 白烧 token；未静音时它自己
+    # 注入潜水判断，与其余注入可并存。
+    @filter.on_llm_request(priority=2000)
     async def decide(self, event: AstrMessageEvent, req) -> None:
         global _fail_run, _breaker_until
         if not ENABLED:
@@ -505,11 +623,27 @@ class Main(star.Star):
                 _stat["skip_initiate"] = _stat.get("skip_initiate", 0) + 1
                 logger.info("[decide] 主动开口事件，让路不判")
                 return
+            # dsh-proactive 造的「兴趣探头」合成事件：同样让路。
+            # 它的触发凭据是纯正则兴趣分（代码判的，在 collect 里已经过了
+            # 低价值/服务请求/冷却/额度四道闸），不是掷骰子也不是小模型
+            # 判断 —— 拿「要不要插话」的尺子重判会把它掐死（判据形状不同）。
+            if event.get_extra("dsh_proactive"):
+                _stat["skip_proactive"] = _stat.get("skip_proactive", 0) + 1
+                logger.info("[decide] 兴趣探头事件，让路不判")
+                return
             gid = str(event.get_group_id() or "")
             if not gid:
                 _stat["skip_nogid"] += 1
                 return
             _stat["seen"] += 1
+
+            # 静音群：完全沉默，连被 @ 也不回。判断放在最前面，
+            # 必须在「被点名就直接放行」之前，否则 @ 会绕过静音。
+            if MUTE_GROUPS and gid in MUTE_GROUPS:
+                _stat["muted"] = _stat.get("muted", 0) + 1
+                logger.info("[decide] 群 %s 在静音名单，不说话（语料收集模式）", gid)
+                event.stop_event()
+                return
 
             # 被点名就没有「要不要回」的自由，也不该为此多等两秒
             if bool(getattr(event, "is_at_or_wake_command", False)):
@@ -521,12 +655,46 @@ class Main(star.Star):
                 _stat["skip_cmd"] += 1
                 return
 
+            # 有人在跟别的 AI 说话（「豆包：这题怎么解」），别抢话。
+            # 位置有讲究，两边都是必须的：
+            #   * 必须在「被 @ 就放行」**之后** —— 真被喊了就该答，
+            #     哪怕他这句话里带着别的模型名。
+            #   * 必须在下面 _ASK_RE「点名要东西就放行」**之前** ——
+            #     「豆包，画张图」会命中 _ASK_RE，放行了就抢了豆包的活。
+            if OTHER_AI and _OTHER_AI_RE.search(msg):
+                _stat["skip_other_ai"] = _stat.get("skip_other_ai", 0) + 1
+                brief = "在跟别的 AI 说话，不抢话：%s" % msg[:30]
+                _last.append(time.strftime("%H:%M:%S ") + brief)
+                del _last[:-12]
+                if SHADOW:
+                    logger.info("[decide] 影子模式：%s（放行）", brief)
+                    return
+                logger.info("[decide] %s", brief)
+                event.stop_event()
+                return
+
             # 明确点名要能力 -> 绝不沉默，直接放行（省一次请求、省 2 秒）。
             # v5 唯一的错例就是把「发个语音说群主是懒猪」判成谈正事而闭嘴。
             # 用户明确要的东西被路由否决，是最不能接受的一类错。
             if _ASK_RE.search(msg) and not _NOT_ASK_RE.search(msg):
                 _stat["skip_ask"] += 1
                 logger.info("[decide] 有人明确点名要东西，直接放行：%s", msg[:40])
+                return
+
+            # 睡觉时段不主动插话（《回答.md》D14/D15 群主选的 ④「只被@才回」）。
+            # 走到这里的**只剩随机插话** —— 被@、指令、别的AI、明确点名要能力
+            # 在上面全处理完了，所以这道门碰不到那几类。犯困的语气和「回得慢」
+            # 由 dsh-scene 负责，这里只管「别主动开口」。
+            if _in_sleep(_sleep_hour()):
+                _stat["sleep_silence"] = _stat.get("sleep_silence", 0) + 1
+                brief = "睡觉时段（%d~%d点），不主动插话" % (SLEEP_FROM, SLEEP_TO)
+                _last.append(time.strftime("%H:%M:%S ") + brief)
+                del _last[:-12]
+                if SHADOW:
+                    logger.info("[decide] 影子模式：%s（放行）", brief)
+                    return
+                logger.info("[decide] %s", brief)
+                event.stop_event()
                 return
 
             # 刚说过话就先闭嘴。压发言占比最直接、且完全不花钱的一根杠杆。
@@ -599,6 +767,14 @@ class Main(star.Star):
                 _stat["gap_soft_silence"] = _stat.get("gap_soft_silence", 0) + 1
                 act = "沉默"
                 why = "刚说过 %.0fs（<%.0fs）且不是在回你" % (gap, MIN_GAP)
+            # 动态潜水：verdict 判「回话」，但按信号强度掷骰子，
+            # 没什么可接的对话（没人叫、没话头）就潜水 —— 用户钦定。
+            if DIVE and act == "回话":
+                rate = dive_rate(f)
+                if random.random() < rate:
+                    _stat["dive"] = _stat.get("dive", 0) + 1
+                    act = "沉默"
+                    why = "潜水（可接但没什么好接，骰中 %.0f%%）" % (rate * 100)
             flags = "".join(k[0].upper() if f[k] else "." for k in _BOOLS)
             brief = "%s [%s] %s topic=%s tone=%s avoid=%s %.0fms" % (
                 act, flags, why, f.get("topic") or "-", f.get("tone") or "-",
@@ -632,6 +808,52 @@ class Main(star.Star):
             # 决策步自己出问题，绝不能连累正常对话
             logger.warning("[decide] 整体失败，照旧说话: %s", e)
 
+    # ------------------------------------------------------------ 静音兜底
+    #
+    # 上面那道静音闸门挂在 on_llm_request 上，只掐得住**主模型**这一条出口。
+    # 但指令回复（/权限 /我的档案 /上下文状态 …）根本不问模型，走的是
+    # ResultDecorateStage → RespondStage，压根不经过 on_llm_request ——
+    # 静音群里任何人敲一条公开指令，机器人照样会出声。
+    # 这不是假想：dsh-guard 的警告是 event.send 直发，同样绕过那道闸门，
+    # 已经真的在 1048435041 说过一句「群里不聊这个，收着点」。
+    #
+    # 所以这里补一道**出口级**兜底：结果装好、还没发出去时，
+    # 群在静音名单里就把整个 result 清掉。clear_result() 是框架自己的 API，
+    # ResultDecorateStage 每跑完一个钩子都查 `result is None or not result.chain`，
+    # RespondStage 开头也是 `if result is None: return`，所以清掉等于不发，
+    # 不会报错、也不会留半条消息。
+    #
+    # 为什么不放在 dsh-acl 那个 priority=1000 的门卫里：那个 handler 在
+    # StarRequestSubStage，stop_event 会让**同批**后面的 handler 全部 break，
+    # 而 dsh-memory 的语料采集正挂在同一批里 —— 那样会把「只收语料」这件事
+    # 本身弄坏。出口级清结果发生在采集之后，动不到语料。
+    #
+    # 仍然管不到的：不产生 result、直接 event.send() 的插件
+    # （dsh-poke / dsh-welcome / dsh-guard）。它们只能靠各自的群白名单，
+    # 现已逐个钉死在 100000001。这条边界写在这里，免得下次再查一遍。
+    @filter.on_decorating_result()
+    async def mute_out(self, event: AstrMessageEvent) -> None:
+        if not MUTE_GROUPS:
+            return
+        try:
+            gid = str(event.get_group_id() or "")
+            if not gid or gid not in MUTE_GROUPS:
+                return
+            result = event.get_result()
+            if result is None or not result.chain:
+                return
+            outline = "".join(
+                (getattr(c, "text", None) or "[%s]" % getattr(c, "type", "?"))
+                for c in result.chain
+            )[:60]
+            event.clear_result()
+            _stat["muted_out"] += 1
+            logger.info("[decide] 静音群 %s 出口拦下一条回复：%s", gid, outline)
+            event.stop_event()
+        except BaseException as exc:
+            # 兜底自己出问题就什么都不做（退回原行为），别连累正常群
+            logger.warning("[decide] 静音出口拦截失败: %r", exc)
+
     @filter.command("插话判断")
     async def cmd_status(self, event: AstrMessageEvent):
         s = _stat
@@ -642,11 +864,21 @@ class Main(star.Star):
         lines = [
             "插话判断：%s%s" % ("开" if ENABLED else "关",
                               "（影子模式，只看不拦）" if SHADOW else ""),
+            "静音群（只收语料不说话）：%s｜模型出口拦下 %d 条、指令等出口拦下 %d 条"
+            % ("、".join(sorted(MUTE_GROUPS)) if MUTE_GROUPS else "无",
+               s.get("muted", 0), s.get("muted_out", 0)),
             "看到群消息 %d 次" % s["seen"],
             "  不判断：被喊 %d｜指令 %d｜明确要东西 %d｜内容太少 %d｜熔断 %d"
             % (s["skip_addressed"], s["skip_cmd"], s["skip_ask"],
                s["skip_thin"], s["breaker"]),
+            "  在跟别的 AI 说话（%s）不抢话 %d 次"
+            % ("开" if OTHER_AI else "关", s.get("skip_other_ai", 0)),
             "  刚说过%.0fs内直接闭嘴 %d 次" % (MIN_GAP, s["gap_silence"]),
+            "  动态潜水（没得接就潜）%d 次｜潜水率 在回你%.0f%% 提到你%.0f%% 有话头%.0f%% 闲聊%.0f%% 无可接%.0f%%"
+            % (s.get("dive", 0), DIVE_RATE_REPLY * 100, DIVE_RATE_ABOUT * 100,
+               DIVE_RATE_OPEN * 100, DIVE_RATE_BANTER * 100, DIVE_RATE_NONE * 100),
+            "  睡觉时段不插话 %d 次" % s.get("sleep_silence", 0),
+            "  睡觉时段不插话 %d 次" % s.get("sleep_silence", 0),
             "  窗口砍掉超过%.0f分钟的旧话 %d 条（防拿上个话题的语气判这句）"
             % (SPAN / 60.0, s["span_dropped"]),
             "真问模型 %d 次，平均 %.0fms（正则兜底解析 %d 次）"
