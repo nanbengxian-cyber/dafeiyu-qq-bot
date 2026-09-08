@@ -74,6 +74,27 @@ WINDOW = max(1, int(os.environ.get("DSH_STICKER_WINDOW", "2")))
 MAX_IN_WINDOW = max(1, int(os.environ.get("DSH_STICKER_MAX_IN_WINDOW", "1")))
 # 一条回复最多发几张（人格也是这么写的）
 MAX_PER_REPLY = max(1, int(os.environ.get("DSH_STICKER_MAX_PER_REPLY", "1")))
+# [patch:dedup-v2 同一张贴纸的冷却]
+# 同一张贴纸的冷却。只记「上一张真发出去的贴纸名」+「距那次过了几拍放行」，
+# 同名且不满 COOLDOWN 拍就不发。实测群记录里连着 5 张「假装没伤心」，
+# 观感是同一个表情刷屏。
+#
+# 精确语义（计时在判定**之前**加一拍，所以有个 -1）：
+#   COOLDOWN=N ⇒ 同名会被连续跳过 N-1 次，第 N 拍放行。
+#   因此 **COOLDOWN<=1 等于关闭**（第 1 拍就满足 since>=1，压根不挡）；
+#   最小有意义的值是 2。这条别写错，否则以为调了旋钮其实没生效。
+#
+# ★为什么不是「最近 N 张里去重」：那样当 N ≥ 模型实际使用的贴纸种类数时会
+# 永久饥饿（实测模型只用 思考/嘲笑/假装没伤心 三种，窗口 3 从第 4 张起全挡，
+# 后半程一张都发不出来）。只记「上一张」的容量恒为 1，不随种类数增长，
+# 所以天然无饥饿：哪怕模型只用一种贴纸，也只是退化成 发/挡/挡/发，频率降低而已。
+#
+# 取 3 的依据（真实序列回放，配额串联后实际发出的图）：
+#   冷却 0/1（等于关闭）→ 11 张，最长连发 3
+#   冷却 2             →  9 张，最长连发 2
+#   冷却 3             →  8 张，最长连发 1   ← 取这个
+# 设 0 关闭冷却。
+DEDUP_COOLDOWN = max(0, int(os.environ.get("DSH_STICKER_DEDUP_COOLDOWN", "3")))
 
 # 这一轮已经出过慢媒体，就别再叠贴纸
 MEDIA_FLAGS = ("imagegen_done", "voice_done", "video_done")
@@ -84,9 +105,12 @@ STEP_FLAG = "dsh_sticker_step_done"
 _LAST_USED: dict[str, list[str]] = {}
 # gid -> deque[bool]，最近 WINDOW 次带标记回复里哪几次真发了
 _attempts: dict[str, deque] = {}
+# gid -> (上一张真发出去的贴纸名, 距今过了几次放行)。见 patch:dedup-v2。
+# 只在真发出去时更新：被配额挡掉的那次群里根本没看见，不算「间隔拉开了」。
+_last_tag: dict[str, tuple] = {}
 # 统计：/贴纸状态 用
 _stat = {"attempt": 0, "sent": 0, "quota_drop": 0, "media_drop": 0, "unknown": 0,
-         "inter_step": 0}
+         "inter_step": 0, "dedup_drop": 0}
 
 
 def _resolve_sticker(tag: str):
@@ -131,6 +155,34 @@ def _quota_allows(gid: str) -> bool:
     return ok
 
 
+def _cooldown_allows(gid: str, tag: str) -> bool:
+    """同名贴纸的冷却判定。只判定，不记账（记账在真发成之后）。
+
+    为什么不换成别的贴纸：随便换一张会答非所问（把「假装没伤心」换成「送花」
+    更怪）。少一张图没人察觉，错一张图很明显。
+    """
+    if DEDUP_COOLDOWN <= 0:
+        return True
+    last, since = _last_tag.get(gid, (None, 10 ** 9))
+    return not (tag.strip() == last and since < DEDUP_COOLDOWN)
+
+
+def _cooldown_remember(gid: str, tag: str) -> None:
+    """记下这次**真发出去的**贴纸，并把计时归零。"""
+    if DEDUP_COOLDOWN <= 0:
+        return
+    _last_tag[gid] = (tag.strip(), 0)
+
+
+def _cooldown_tick(gid: str) -> None:
+    """一次「放行」记一拍。放行才计数——被配额挡掉的不算间隔。"""
+    if DEDUP_COOLDOWN <= 0:
+        return
+    last, since = _last_tag.get(gid, (None, 10 ** 9))
+    if last is not None:
+        _last_tag[gid] = (last, since + 1)
+
+
 async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
     """剥标记 + 按配额发贴纸。返回清理后的文字（无标记时返回 None）。
 
@@ -163,14 +215,26 @@ async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
         )
         return cleaned
 
+    # 走到这里说明配额已放行，记一拍冷却计时（patch:dedup-v2）
+    _cooldown_tick(gid)
+
     sent = 0
     for tag in markers:
         if sent >= MAX_PER_REPLY:
             logger.info(f"[贴纸] 超出单条上限 {MAX_PER_REPLY}，丢弃剩余: {tag!r}")
             break
+        # 同名冷却：实测群里连着 5 张「假装没伤心」。
+        if not _cooldown_allows(gid, tag):
+            _stat["dedup_drop"] += 1
+            last, since = _last_tag.get(gid, (None, -1))
+            logger.info(
+                f"[贴纸] 不发(同名冷却 {since}/{DEDUP_COOLDOWN}) tag={tag!r} gid={gid}"
+            )
+            continue
         path = _resolve_sticker(tag)
         if path:
             await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
+            _cooldown_remember(gid, tag)
             sent += 1
         else:
             _stat["unknown"] += 1
