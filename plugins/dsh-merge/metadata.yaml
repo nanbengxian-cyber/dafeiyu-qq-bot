@@ -1,0 +1,5 @@
+name: dsh-merge
+desc: 艾特风暴聚合回复 —— 短时间内被@太多次时，把这一波内容整合成一条统一回复（不点名不@），而不是逐条回刷屏。
+version: 1.1.0
+author: 大肥鱼
+repo: https://example.com/dsh-merge
