@@ -1,0 +1,5 @@
+name: dsh-homophone
+desc: 同音字/谐音识别 —— 谐音称呼当被喊 + 谐音梗本意注入
+version: 1.0.0
+author: 大肥鱼
+repo: local
