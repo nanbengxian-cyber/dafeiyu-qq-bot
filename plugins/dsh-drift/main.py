@@ -63,13 +63,13 @@ def _set(name: str, default: str = "") -> set[str]:
 
 ENABLED = _flag("DSH_DRIFT")
 # 只在主群。两个语料群只收不说，任何新插件都不该改变它们的行为。
-GROUPS = _set("DSH_DRIFT_GROUPS", "")
+GROUPS = _set("DSH_DRIFT_GROUPS", "100000001")
 # 触发概率。不设成 1 是因为「每轮都联想」本身就是新的机器规律。
 RATE = min(1.0, max(0.0, float(os.environ.get("DSH_DRIFT_RATE", "0.35"))))
 LEVEL = os.environ.get("DSH_DRIFT_LEVEL", "subtle").strip().lower()
 # 太短的消息没有可漂移的信息量（「典」「666」），塞了也白塞。
 MIN_LEN = max(1, int(os.environ.get("DSH_DRIFT_MIN_LEN", "6")))
-OWNERS = _set("DSH_DRIFT_OWNER", "")
+OWNERS = _set("DSH_DRIFT_OWNER", "2774000001")
 
 # 提问判据：问号、疑问词、句末疑问助词。宁可多认几句是提问（漏漂移无害），
 # 也不要把真提问当成可以联想的闲聊（那就是答非所问）。
