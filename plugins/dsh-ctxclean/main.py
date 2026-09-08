@@ -5,12 +5,12 @@
 # 症状：机器人答非所问。有人问 A，它回的是群里另一个人刚才说的 B。
 #
 # 最干净的一个证据（真实记录，2026-09-02 09:5x）：
-#   群友说：「@羽玲 听见没有？人家都叫你帮忙升级一下眼睛了」
-#   它回的：「**富人？那必须的！**羽玲大佬出马，一个顶俩。」
+#   群友说：「@群友E听见没有？人家都叫你帮忙升级一下眼睛了」
+#   它回的：「**富人？那必须的！**群友E大佬出马，一个顶俩。」
 # 「富人」这个词根本不在那句话里 —— 它在**上一条别人说的话**里。
 # 也就是说它抓错了「当前该回哪一句」。
 #
-# 根因不在人格提示词，在会话历史的形状。量出来的现状（真实群 <群号>）：
+# 根因不在人格提示词，在会话历史的形状。量出来的现状（真实群 100000001）：
 #
 #   历史 293 轮 / 588 条消息 / 25.7 万字 / token_usage 5.2 万
 #   其中「陈旧注入块」487 个：
@@ -116,6 +116,17 @@ _INITIATED = (
     "<reply_context>没人在跟你说话，群里这会儿是静着的，是你自己决定开个口。"
     "所以：别回答什么、别应答、别问「大家在吗」这种废话；"
     "就像人翻到一个冷掉的群随口丢一句那样，说一句你真想说的短话。</reply_context>"
+)
+# 第四档：dsh-proactive 的兴趣探头。群里**正在聊**，聊到了你感兴趣的内容，
+# 所以和 _SPONTANEOUS（自己插话）更像，但触发原因更强：不是「顺口接一句」，
+# 而是「聊到我馋的东西/我老本行/点名我了」。和 _INITIATED 的区别：
+# 那一档群里是静的，这一档群里正热闹。
+_PROACTIVE = (
+    "<reply_context>群里正在聊，有人聊到了你很感兴趣的东西（白米饭、吃的、"
+    "深海小鲸鱼、DeepSeek/AI、或者点名大肥鱼）。是你自己决定探头接一句的："
+    "别假装有人@了你，别解释你在主动说话，别应答式回复；"
+    "像真人听到感兴趣的话题时自然插一句那样，只看最戳你的那一处，短话接上；"
+    "接不上就发个表情或语气词带过，别硬编内容。</reply_context>"
 )
 
 # 注入块的形状：整段以 <小写标签> 开头。用结构判断而不是枚举插件名，
@@ -257,7 +268,7 @@ def _keep_recent_turns(msgs: list, turns: int) -> list:
     cut = 0
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
-        if isinstance(m, dict) and m.get("role") == "user":
+        if isinstance(m, dict) and m.get(ole") == "user":
             seen += 1
             if seen == turns:
                 cut = i
@@ -332,6 +343,8 @@ class Main(star.Star):
                 return
             if event.get_extra("dsh_initiate"):
                 kind, block = "主动开口", _INITIATED
+            elif event.get_extra("dsh_proactive"):
+                kind, block = "兴趣探头", _PROACTIVE
             elif bool(getattr(event, "is_at_or_wake_command", False)):
                 kind, block = "被喊的", _ADDRESSED
             else:
@@ -365,5 +378,8 @@ class Main(star.Star):
                    "开" if MARK_ADDRESSED else "关",
                    n, raw / 10000)
             )
-        except BaseException as e:
+        # 不用 BaseException：CancelledError/GeneratorExit 属于「这轮被放弃了」，
+        # 吞掉它等于骗框架说自己正常跑完，可能留下半截状态或
+        # `async generator ignored GeneratorExit`。真正的异常仍然全部兜住。
+        except Exception as e:
             yield event.plain_result("查不到：%s" % e)

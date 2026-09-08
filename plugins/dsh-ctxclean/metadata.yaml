@@ -2,4 +2,4 @@ name: dsh-ctxclean
 desc: 清理会话历史里的「陈旧注入块」。框架把每轮的群聊上下文/时间提醒/群友档案/搜索结果原样存进了历史，而 max_context_length=-1 表示不截断，于是每次请求都会重发上百份互相矛盾的「最新群聊」，模型因此抓错「当前该回哪句」而答非所问。本插件在 on_llm_request 里只清历史（不动当轮新鲜注入），并保留最近 N 轮。提供 /上下文状态。
 version: 1.0.0
 author: 大肥鱼
-repo: https://github.com/nanbengxian-cyber/dafeiyu-qq-bot
+repo: local
