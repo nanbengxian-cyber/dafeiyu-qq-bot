@@ -204,7 +204,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
     src = text or ""
     # 带引号：arg="值" / arg='值'
     m = re.search(
-        rf"\b{tool}\s*\([^)]*?\b{arg}\s*=\s*(?P<q>[\"\'])(?P<v>.*?)(?<!\\)(?P=q)",
+        rf"\b{tool}\s*\([^)]*?\b{arg}\s*=\s*(?P<q>[\"'])(?P<v>.*?)(?<!\\)(?P=q)",
         src, re.S,
     )
     if m:
@@ -213,7 +213,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
             return v
     # XML：<parameter name="arg">值</parameter>
     m = re.search(
-        rf"<\s*(?:antml:)?parameter\s+name\s*=\s*[\"\']{arg}[\"\']\s*>(.*?)"
+        rf"<\s*(?:antml:)?parameter\s+name\s*=\s*[\"']{arg}[\"']\s*>(.*?)"
         r"(?:</\s*(?:antml:)?parameter\s*>|$)",
         src, re.S | re.I,
     )
@@ -223,7 +223,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
             return v
     # JSON："arg": "值"
     m = re.search(
-        rf"[\"\']{arg}[\"\']\s*:\s*[\"\'](.+?)[\"\']", src, re.S
+        rf"[\"']{arg}[\"']\s*:\s*[\"'](.+?)[\"']", src, re.S
     )
     if m:
         v = m.group(1).strip()
@@ -270,7 +270,6 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
     return None
 
 
-
 def _leak_relay(event, raw, tool, arg):
     """清理 + 抠参数，并在插件之间接力原文。
 
@@ -308,7 +307,6 @@ def _leak_relay(event, raw, tool, arg):
     return cleaned, leaked
 
 
-
 # ---------------------------------------------------------------- 配置
 
 API_BASE = os.environ.get("DSH_IMG_API_BASE", "https://apihub.agnes-ai.com/v1")
@@ -325,6 +323,15 @@ FALLBACK_MODELS = [
     if m.strip()
 ]
 SAVE_DIR = os.environ.get("DSH_IMG_SAVE_DIR", "/AstrBot/data/imagegen")
+# 生成图保留多久（秒）。0=不清理。
+# 为什么要加：本插件原来只写不删 —— 实测 4 天攒了 76 张 / 42M（约 10M/天），
+# 机器只有 40G，这是条无声增长。dsh-voice 早就有同样的清理（半小时窗口），生图漏了。
+# 默认给到 30 天而不是半小时，有两个原因：
+#   ① 发送是异步的，群友也可能过一会儿才点开看，删太快会把正在发的图删掉；
+#   ② 现在目录里最旧的也才 4 天，30 天窗口意味着**今天一张都不会被删** ——
+#      只封住无限增长，不动已有的东西。要更省空间就把 DSH_IMG_KEEP 调小。
+KEEP_SECONDS = max(0.0, float(os.environ.get("DSH_IMG_KEEP", "2592000")))
+_last_sweep = 0.0
 # 默认画风：二次元可爱简笔画。无论 prompt 来自模型还是 /画图 指令，都会追加，
 # 保证群里出图风格统一。想临时换风格改这个环境变量即可。
 STYLE_SUFFIX = os.environ.get(
@@ -379,12 +386,17 @@ DRAW_INTENT_RE = re.compile(
     r"(画|绘|生成|做|整|来|搞|弄|发|给|甩|扔|放|晒|p|P)\s*(?:一)?\s*(?:张|个|幅|副|下|点)?\s*"
     r"[^。！？\n]{0,12}?(图|图片|照|照片|画|画像|壁纸|头像|表情包|自拍|插画|海报|封面|立绘|简笔画)"
     r"|画画|画个|画一|画张|画只|画条|画头|画只|自拍|拍一张|拍张|拍个|拍照"
-    r"|生成图|出图|作图|画图|来点图|上图|看看你|长什么样|长啥样|什么样子"
+    # 裸「看看你」曾把「我看看你的品味怎么样」当成要图（真实语料命中）。
+    # 它本意是覆盖「看看你长什么样」，而那句已经由同一行的「长什么样」独立覆盖，
+    # 所以裸词纯属冗余、只带来误伤。改成必须紧跟外观类名词。
+    r"|生成图|出图|作图|画图|来点图|上图"
+    r"|看看你(?:的)?(?:长相|样子|模样|真容|尊容|颜值|脸|头像)"
+    r"|长什么样|长啥样|什么样子"
 )
 
 # 弱信号：动词 + 量词，但宾语是具体事物而不是「图」这个字。
 #
-# 实测群里最常见的要图说法恰恰属于这一类：「给我生成某个群友」「帮我生成一个懒羊羊」
+# 实测群里最常见的要图说法恰恰属于这一类：「给我生成懒人群主」「帮我生成一个懒羊羊」
 # 「去给我画点」「弄个猫娘」——句子里根本没有「图/照/壁纸」这些名词，
 # 于是强信号正则全部落空，哪怕模型已经明确答应「行，等着」也不出图。
 # 这是「有时候不生图」的主因。
@@ -397,11 +409,66 @@ WEAK_DRAW_RE = re.compile(
     r"|画点|画些|生成点|生成些"
 )
 WEAK_LOOSE_RE = re.compile(r"(做|整|搞|弄)\s*(?:一)?\s*(?:张|个|幅|副|只|条|头|位)")
+# [patch:intent-v3 趋向补语与「来个X」]
+# 动词 + 趋向补语。中文里「画出来」「绘上来」和「画一张」一样是明确的作画请求，
+# 但补语不是量词，旧的 WEAK_DRAW_RE（要求动词紧跟量词）整类漏掉。
+# 实测漏例：「你可以把你的理想型画出来吗？」→ 回了一句嘴上的描述，一张图都没有。
+# 只收画图类动词；「找出来」不收（那是要信息，归 dsh-web），
+# 「做/整/搞/弄 + 出来」也不收（太泛，"整出来一份报表"不该出图）。
+WEAK_DIRECTIONAL_RE = re.compile(
+    r"(画|绘|生成|p图|P图)\s*(?:出|上|起)\s*来"
+    r"|(画|绘|生成)\s*(?:得|的)?\s*出来"
+)
+# 「来/上 + 量词 + 具体名词」：群里最省字的要图说法。
+# 实测漏例：「来个菲比」→ 回「菲比谁啊，没图我不认」，既没画也没查。
+# 「来」本身太泛（来个人、来碗饭），所以**必须**靠 NON_VISUAL_RE 黑名单兜底，
+# 这也是它只能放在弱信号通道的原因。量词后面要求至少一个非标点字符，
+# 避免把光秃秃的「来一个」（没说要什么）也算进来。
+# [patch:fp-v1 裸「来/上」「看看你」与画X复合名词]
+# 「来/上」必须处在**祈使位置**（句首 / 标点后 / 少量祈使前缀之后）。
+#
+# 真实事故（13:17）：「现在打算把你整体优化好，然后加上一个主动回复机制」
+# 被这条正则命中 '上一个主' 而白出了一张图。原因是裸「上」在中文里绝大多数
+# 时候是**趋向补语**（加上、算上、带上、装上、补上、贴上、说上），
+# 只有少数时候是祈使动词（上个猫娘）。不看位置就必然误伤 ——
+# 这与前两轮那个裸「群」是同一族的坑。
+#
+# 加了位置约束后：「来个菲比」「那，来个猫娘」「画完了再来一张图」仍然命中；
+# 「加上一个…」「算上一份…」「记得带上一个…」「他补上一句」全部落空，
+# 因为它们的「上」前面紧贴着另一个动词。
+WEAK_BRING_RE = re.compile(
+    r"(?:^|[\s，,。.!！?？、；;：:~…]|给我|帮我|替我|麻烦|快点|快|再|也|那)"
+    r"\s*(?:来|上)\s*(?:一)?\s*(?:张|个|只|条|头|位|幅|副|份)\s*[^\s，,。.!！?？、]"
+)
+# [patch:nonvisual-v1 裸「群」收窄 + 动词裸名词]
+# 动词 + 裸名词（不带量词）。MEMORY 记的目标案例「给我生成懒人群主」正属于这一类，
+# 但 WEAK_DRAW_RE 要求动词紧跟量词，所以那条修复实际没覆盖它：
+#     生成懒人群主 / 画懒羊羊  → 无量词 → weak=False → 不出图
+# 宾语要求至少两个汉字；排除集挡掉功能字与趋向补语，因此
+# 「你画得真好」「我画画很烂」「生成好了吗」「画出来」都不会误命中
+# （「画出来」归 WEAK_DIRECTIONAL_RE 管，两条各负责一种形状）。
+WEAK_BARE_RE = re.compile(
+    r"(?:画|绘|生成)"
+    r"(?![的了着得过是在不没有很吗么呢吧啊出上起完好画绘成])"
+    # 排除「画X/生成X」构成的**名词**与成语：画风/画质/画面/画家/生成器/生成速度/
+    # 生成对抗网络/画蛇添足/绘声绘色。它们不是「画一个X」的宾语。
+    # 实测：这 10 类里有 9 类 NON_VISUAL_RE 一条都不拦，会直接白出图；
+    # 而这个群本来就在聊 AI（语料里有「模型」「算力」「token」），
+    # 「画质」「生成速度」出现只是时间问题。
+    r"(?!风|质|面|家|师|板|笔|室|展|廊|册|布|框|式|器|速度|对抗|声|蛇)"
+    r"\s*[\u4e00-\u9fff]{2,}"
+)
+
+
 # 明显不是画面的东西。「弄个猫娘」该出图，「弄个表格」不该——差别在宾语。
 # 与其枚举画得出来的东西（无穷），不如排除明显画不出的（有限且稳定）。
 NON_VISUAL_RE = re.compile(
     r"(表格|表单|投票|问卷|文件|文档|链接|账号|名单|统计|报表|总结|摘要|方案|计划|"
-    r"清单|群|机器人|脚本|代码|程序|插件|饭|菜|外卖|奶茶|咖啡|安排|时间|日程|提醒|"
+    # 「群」不能裸着拦：QQ 群里「群主/群友/群里/群员」天天被提到，全是可画的主体。
+    # 实测裸「群」把「给我生成懒人群主」整类否决掉了（见 patch:nonvisual-v1）。
+    # 允许集只收 6 个字：聊/名/单 不能放进来，否则「建个群聊」「发个群名单」会漏拦。
+    # 「饭」「菜」保持裸字：本群真的在聊做鱼做菜，放宽会误触发出图。
+    r"清单|群(?![主友里员众们])|机器人|脚本|代码|程序|插件|饭|菜|外卖|奶茶|咖啡|安排|时间|日程|提醒|"
     r"教程|攻略|规则|公告|通知|记录|笔记|翻译|数据|报告|建议|主意|办法)"
 )
 
@@ -423,7 +490,7 @@ EXPLICIT_IMG_RE = re.compile(
     r"画画|画图|出图|作图|画一张|画张|画个)"
 )
 # 模型自己的回复里提到在画什么 —— 这是最可靠的旁证：
-# 用户说「给我生成某个群友」，模型回「画个某个群友是吧？行，等着」，
+# 用户说「给我生成懒人群主」，模型回「画个懒人群主是吧？行，等着」，
 # 模型已经把请求理解成画图了，插件没理由再怀疑。
 # 也要认「画给你看」「画来了」这种不带量词的说法。
 ASSIST_DRAW_RE = re.compile(
@@ -465,6 +532,74 @@ BARE_PIC_RE = re.compile(
     r"长什么样|长啥样|什么样子|样子)"
 )
 
+# [patch:owned-v1 你的X 不再一律画成自画像]
+# 「你的X」里的 X 才是要画的东西。原来只要句里有「你的」就直接画自画像，
+# 于是「把你的理想型画出来」「画你的女朋友」「画你的房间」全画成了它自己。
+#
+# 判据用排除法：只列「X 就是指它本身」的少数词（有限、稳定），其余一律当成
+# 独立宾语去画。枚举「可以画的东西」是无穷的，这条教训在 NON_VISUAL_RE 上
+# 已经吃过一次。
+OWNED_RE = re.compile(r"你的\s*([^，。！？\n、]{1,12})")
+SELF_PIC_RE = re.compile(
+    r"^(照片|相片|图|图片|自拍|头像|样子|模样|长相|形象|真容|尊容|"
+    r"本人|自己|全身|半身|正脸|侧脸)$"
+)
+# 趋向补语 + 语气词的尾巴。intent-v3 收了「画出来」这种句型，
+# 「把你的理想型画出来吗？」抠出来是「理想型出」，单次 sub 剥不净，要循环剥。
+OWNED_TAIL_RE = re.compile(r"(出来|上来|起来|出|来|吗|吧|呢|啊|呀|么|看看|试试)+$")
+
+
+def _strip_tail(s: str) -> str:
+    """反复剥尾巴直到不再变化（单次 sub 剥不掉「理想型出来吗」这种叠加）。"""
+    for _ in range(3):
+        t = OWNED_TAIL_RE.sub("", s).strip(" ，,。.!！?？~、")
+        if t == s:
+            break
+        s = t
+    return s
+
+
+def _owned_subject(req: str):
+    """从「你的X」里取出 X。
+
+    Returns:
+        None —— 句里没有「你的」这个形状（交回原来的判定链）
+        ""   —— X 指代机器人本身（你的照片/样子/自拍）⇒ 该画自画像
+        其它 —— 真正要画的宾语（理想型 / 女朋友 / 房间）
+    """
+    m = OWNED_RE.search(req or "")
+    if m is None:
+        return None
+    x = _strip_tail(m.group(1).strip())
+    # 顺序要紧：先判图片类词，再剥祈使词。
+    # STRIP_WORDS_RE 含「拍」，先剥会把「自拍」啃成「自」，判定就失效了。
+    if SELF_PIC_RE.match(x):
+        return ""
+    z = _strip_tail(STRIP_WORDS_RE.sub("", x).strip(" ，,。.!！?？~、的"))
+    if not z or SELF_PIC_RE.match(z):
+        return ""
+    return z
+
+
+# [patch:barepic-v1 先挖图片词再剥祈使词]
+def _wants_bare_picture(req: str) -> bool:
+    """整句除了「要一张图」之外没别的内容 ⇒ 用户没指定画什么。
+
+    顺序是关键：**先**挖掉图片类词，**再**剥祈使词。
+    反过来的话 STRIP_WORDS_RE 里的单字「么」会把 BARE_PIC_RE 的多字短语
+    「长什么样」打散成「长什样」，判定就失效了——实测「你长什么样」正是被拿着
+    「长什样」三个字去生图的。
+    源码里同一条坑已经记过一次（「画个头像」被切成「像」），当时只把 BARE_PIC
+    判定挪到剥量词之前，剥祈使词仍在它前面，所以这一半一直没修上。
+    """
+    # 必须**真的出现过**图片名词。否则「画点」「画一下」这类剥完也为空的句子
+    # 会被误判成「只是要图」，抢在「从模型回复里找描述」之前 —— 实测回归过一次。
+    if not BARE_PIC_RE.search(req or ""):
+        return False
+    residue = BARE_PIC_RE.sub("", req or "")
+    residue = STRIP_WORDS_RE.sub("", residue)
+    return not residue.strip(" ，,。.!！?？~、的")
+
 
 def _clean_leaked_markup(text: str, event=None) -> tuple[str, str | None]:
     """清掉模型泄漏的伪工具调用标记。
@@ -487,11 +622,17 @@ def _derive_prompt(user_text: str, assistant_text: str) -> str:
     req = (user_text or "").strip()
     # 自称类请求：画你自己 / 自拍
     if SELF_REF_RE.search(req):
-        if re.search(r"(自拍|你的|你自己|你本人)", req):
+        # 「你的X」先看 X 是什么：指它自己就画自画像，是别的东西就画那个东西。
+        # 见 patch:owned-v1（原来只要有「你的」就一律自画像，把「你的理想型」
+        # 「你的女朋友」「你的房间」全画成了它本人）。
+        owned = _owned_subject(req)
+        if owned:
+            return owned
+        if owned == "" or re.search(r"(自拍|你自己|你本人)", req):
             return SELF_PORTRAIT
 
         # 「大肥鱼」既可能是在叫人，也可能就是要画的东西：
-        #   「大肥鱼给我生成某个群友」-> 叫人，主体是某个群友
+        #   「大肥鱼给我生成懒人群主」-> 叫人，主体是懒人群主
         #   「给我生成一条大肥鱼」    -> 主体就是大肥鱼本人
         # 判据是把名字和祈使词、量词都剥掉之后还剩不剩内容。
         stripped = re.sub(r"(大肥鱼|小鲸鱼)", "", req)
@@ -502,8 +643,16 @@ def _derive_prompt(user_text: str, assistant_text: str) -> str:
             return SELF_PORTRAIT
         req = stripped
 
+    # 前置判定（patch:barepic-v1）：整句只是在跟它要一张图（「你长什么样」
+    # 「发个照片」），那就画它自己。必须在剥祈使词**之前**判，否则多字短语
+    # 「长什么样」会被 STRIP_WORDS_RE 的单字「么」打散成「长什样」。
+    if _wants_bare_picture(req):
+        return SELF_PORTRAIT
+
     subject = STRIP_WORDS_RE.sub("", req).strip(" ，,。.!！?？~、")
 
+    # 第二道防线，保留：剥完祈使词后再判一次（「画个头像」这类仍靠它兜）。
+    # 两条独立防线不能塌成一条 —— dsh-sticker 那次的教训。
     # 顺序要紧：**先**判断整句是不是只剩「图/照片/头像」这类词，说明用户没指定
     # 画什么，是在跟机器人本人要照片 —— 画小鲸鱼自己最贴切。
     # 判据是「剥完一个字都不剩」而不是「不足两个字」：「猫」只有一个字，
@@ -514,7 +663,11 @@ def _derive_prompt(user_text: str, assistant_text: str) -> str:
         return SELF_PORTRAIT
 
     # 剥掉开头残留的量词：「画只猫」剥掉「画」后剩「只猫」，主体其实是「猫」。
-    subject = re.sub(r"^[一二三两四五六七八九十]?\s*(只|条|头|位|群|窝|堆|把|件)", "", subject)
+    # 「群」要负向前视：「群主的表情包」不能被啃成「主的表情包」
+    # （与 NON_VISUAL_RE 里的裸「群」同一族的坑）。
+    subject = re.sub(
+        r"^[一二三两四五六七八九十]?\s*(只|条|头|位|群(?![主友里员众们])|窝|堆|把|件)",
+        "", subject)
     subject = subject.strip(" ，,。.!！?？~、")
 
     # 剥完量词又可能露出图片类词（「画个头照」之类），再判一次。
@@ -524,7 +677,7 @@ def _derive_prompt(user_text: str, assistant_text: str) -> str:
         return subject
 
     # 用户原话里挖不出主体（例如只说了「画点」），退而从模型回复里找：
-    # 模型常会复述「画个某个群友是吧？」，那个宾语正是要画的东西。
+    # 模型常会复述「画个懒人群主是吧？」，那个宾语正是要画的东西。
     m = re.search(
         r"(?:画|绘|生成)\s*(?:一)?\s*(?:张|个|幅|副|下|点|只|条|头|位)?\s*"
         r"([^，。！？\n、的是吧呢啊呀吗么]{2,20})",
@@ -567,6 +720,7 @@ async def _request_once(session: aiohttp.ClientSession, model: str, prompt: str)
 
     item = items[0]
     os.makedirs(SAVE_DIR, exist_ok=True)
+    _sweep_old_images()
     stamp = f"{int(time.time() * 1000)}"
     path = os.path.join(SAVE_DIR, f"img_{stamp}.png")
 
@@ -587,6 +741,43 @@ async def _request_once(session: aiohttp.ClientSession, model: str, prompt: str)
         with open(path, "wb") as f:
             f.write(await r2.read())
     return path, None
+
+
+def _sweep_old_images() -> int:
+    """删掉过期的生成图，返回删了几张。
+
+    只删自己产的 `img_*.png`，手工放进来的（如 `_style_test.png`）一律不碰。
+    同步实现且每小时最多扫一次：目录只有几十个文件，扫一遍不值得开后台任务
+    （dsh-voice 那个裸 `create_task` 被 GC 掉、清理无声消失的坑就是这么来的）。
+    """
+    global _last_sweep
+    if KEEP_SECONDS <= 0:
+        return 0
+    now = time.time()
+    if now - _last_sweep < 3600:
+        return 0
+    _last_sweep = now
+    try:
+        names = os.listdir(SAVE_DIR)
+    except OSError:
+        return 0
+    gone = 0
+    for name in names:
+        if not (name.startswith("img_") and name.endswith(".png")):
+            continue
+        p = os.path.join(SAVE_DIR, name)
+        try:
+            if os.path.isfile(p) and now - os.path.getmtime(p) > KEEP_SECONDS:
+                os.remove(p)
+                gone += 1
+        except OSError:
+            pass
+    # 清了多少必须留痕，不然以后「图怎么没了」又只能靠猜
+    logger.info(
+        "[imagegen] 清理旧图：删掉 %d 张（保留 %.0f 天，目录里还剩 %d 个文件）",
+        gone, KEEP_SECONDS / 86400.0, max(0, len(names) - gone),
+    )
+    return gone
 
 
 async def _generate(prompt: str):
@@ -663,7 +854,7 @@ class Main(star.Star):
 
         await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
         # 图片已经单独发出，返回值只用于让模型说一句话，别再描述图片内容
-        return "图片已经生成并发送给用户了。请只用一句简短的话回应，不要描述图片细节。"
+        return "图片已经生成并自动发送到群里了。如果这一轮已经回复过当前问题，就一个字都不要再发；实在要补，只能说一句跟当前问题有关的最短的话，不许艾特任何人，不许替别的群友补话。"
 
     # ------------------------------------------------ 路径 2：兜底钩子
 
@@ -707,16 +898,49 @@ class Main(star.Star):
             asked_back = bool(ASK_BACK_RE.search(cleaned))
             # 模型回复里自己说在画什么，是理解成画图请求的可靠旁证
             assist_draw = bool(ASSIST_DRAW_RE.search(cleaned))
-            # 弱信号：「生成某个群友」「弄个猫娘」这类没有「图」字的说法。
+            # 弱信号：「生成懒人群主」「弄个猫娘」这类没有「图」字的说法。
             #
             # 取舍：与其枚举「画得出来的东西」（无穷），不如排除「明显画不出的」
             # （表格/投票/报表/饭…，有限且稳定）。宾语不在黑名单里就认作要图。
             # 代价是遇到没列举的非画面宾语会误发一张图；但漏检更恼人——用户
             # 明确要图却毫无反应，比多发一张图糟糕得多。黑名单可随时补。
             non_visual = bool(NON_VISUAL_RE.search(user_text))
+            # [patch:whichsig-v1 出图时记下是哪条信号命中的]
+            # 记下**具体是哪条**信号命中、命中的是哪几个字。
+            #
+            # 13:17 误出图那次，日志只写了「弱信号」，而弱信号有五条，
+            # 我必须另写脚本把八个正则抠出来逐条重跑才找到真凶
+            # （WEAK_BRING_RE 命中 '上一个主'）。而「不触发」那条日志早就
+            # 把六个布尔全打出来了 —— 观测能力是单边的：漏检查得清、
+            # 误触发查不清。这里补上另一半。
+            #
+            # 命中的字面比信号名更有用：「上一个主」四个字一眼就能看出
+            # 是趋向补语被误认成了「上+量词+名词」。
+            _sig_hits = []
+            _m = DRAW_INTENT_RE.search(user_text)
+            if _m:
+                _sig_hits.append("强:%s" % _m.group(0))
+            if not non_visual:
+                for _name, _re in (
+                    ("弱动词量词", WEAK_DRAW_RE),
+                    ("弱泛动词", WEAK_LOOSE_RE),
+                    ("弱趋向补语", WEAK_DIRECTIONAL_RE),
+                    ("弱来个X", WEAK_BRING_RE),
+                    ("弱裸名词", WEAK_BARE_RE),
+                ):
+                    _m = _re.search(user_text)
+                    if _m:
+                        _sig_hits.append("%s:%s" % (_name, _m.group(0)))
+            sig_detail = "｜".join(_sig_hits) if _sig_hits else "无"
+
             weak = not non_visual and (
                 bool(WEAK_DRAW_RE.search(user_text))
                 or bool(WEAK_LOOSE_RE.search(user_text))
+                # 趋向补语（画出来）与「来个X」——见 patch:intent-v3 的实测漏例
+                or bool(WEAK_DIRECTIONAL_RE.search(user_text))
+                or bool(WEAK_BRING_RE.search(user_text))
+                # 动词+裸名词（生成懒人群主）——见 patch:nonvisual-v1
+                or bool(WEAK_BARE_RE.search(user_text))
             )
             has_intent = strong or weak
 
@@ -771,7 +995,10 @@ class Main(star.Star):
             # 于是「模型嘴上答应、插件自己动手」这条最常见的路径反而 @ 不上。
             event.set_extra("imagegen_done", True)
 
-            logger.info("[imagegen] 兜底出图（%s）: %s", reason, prompt[:120])
+            logger.info(
+                "[imagegen] 兜底出图（%s）: %s ｜命中=%s ｜用户=%.60s",
+                reason, prompt[:120], sig_detail, user_text,
+            )
             path, err = await _generate(prompt)
             if not path:
                 _last_call[sid] = 0.0
