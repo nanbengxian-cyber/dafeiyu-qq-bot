@@ -70,7 +70,7 @@ assert terms("神经，一言不合就乐子") == ["乐子"], terms("神经，�
 # ------------------------------------------------- 假命中防回归（v1 回测抓到的）
 assert terms("大肥鱼经典产生幻觉") == [], terms("大肥鱼经典产生幻觉")
 assert terms("糖醋鲤鱼好吃是对的😋经典鲁菜") == []
-assert terms("https://tokenhub.example.com/account/account") == []
+assert terms("https://tokenrhythm.studio/account/account") == []
 assert terms("肝脏不好少喝酒") == []
 assert terms("猪肝面好吃") == []
 assert terms("这套连招是三连击") == []
@@ -80,7 +80,11 @@ assert terms("我给了五星好评") == []
 # --------------------------------- 假命中防回归（v2 回测淘汰掉的候选词，原句）
 # 这些句子是候选词表在真语料里的**全部**命中处，逐条看都不是梗义，故不入表。
 assert terms("更新后领鱼竿，钓鱼去了") == []          # 钓鱼：游戏里真钓鱼
-assert terms("长弓钓鱼真好玩") == []
+# 「长弓钓鱼真好玩」以前整句零命中，现在 2026-09-05 加了三角洲地图，
+# 「长弓」＝长弓溪谷是**真命中**，不是回归。这条断言改成守住它原本的目的：
+# 「钓鱼」不许进表。
+assert "钓鱼" not in {t for e in module.GLOSSARY for t in e.terms}
+assert terms("长弓钓鱼真好玩") == ["长弓溪谷"], terms("长弓钓鱼真好玩")
 assert terms("AK,你被我开除了") == []                  # AK：群友的名字
 assert terms("昨天到现在被蹲了15次") == []             # 15：次数
 assert terms("总1500刀") == []
@@ -110,7 +114,7 @@ assert terms("ds 后训练后甲上来了") == ["ds"]
 # 666 走同一条边界规则：夹在别的数字里不算
 assert terms("1666") == []
 assert terms("66678") == []
-assert terms("QQ 2774066000") == []
+assert terms("QQ 2774066612") == []
 # 666 的金额用法由 avoid 挡
 assert terms("这套要666元") == []
 assert terms("充了666块") == []
