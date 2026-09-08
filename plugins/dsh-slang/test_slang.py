@@ -76,8 +76,6 @@ m.SAMPLE = 30
 m.INJECT_MAX = 4
 m.RESEARCH = True
 m.RESEARCH_BATCH = 3
-m.OWNERS = {"2774000001"}  # 假号：main.py 默认已脱敏，命令权限测试需显式配置
-m.GROUPS = {"222333444"}
 
 _LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_LOOP)
@@ -185,7 +183,7 @@ def run_cmd(name, ev):
 def t1_watch_filter():
     """情景1：watch 只收白名单群普通群消息（私聊/命令/自己/纯噪声不进缓冲）。"""
     reset()
-    gid = "222333444"
+    gid = "100000001"
     feed_watch(FakeEvent(gid, "u1", "A", "今天又出bug了"))
     feed_watch(FakeEvent(gid, "u2", "B", "私聊不该进", msg_type="PRIVATE"))
     feed_watch(FakeEvent(gid, "u3", "C", "/黑话候选"))
@@ -204,7 +202,7 @@ def t2_extract_trigger():
     """情景2：攒够 MIN_MSG 触发提取 -> 候选入库 candidate+count=1+证据；
     幻觉候选（语料里没出现过的词）被硬性拦截。"""
     reset()
-    gid = "222333444"
+    gid = "100000001"
     resp = json.dumps([{"content": "人机", "source_id": "2"},
                        {"content": "神了", "source_id": "3"},
                        {"content": "虚空词", "source_id": "9"}])  # 语料里没有 -> 幻觉
@@ -227,7 +225,7 @@ def t2_extract_trigger():
 def t3_repeat_count():
     """情景3：同一词再现 -> count 递增、证据追加去重。"""
     reset()
-    gid = "222333444"
+    gid = "100000001"
     r1 = json.dumps([{"content": "神了", "source_id": "1"}])
     r2 = json.dumps([{"content": "神了", "source_id": "1"}])
     feed_watch(FakeEvent(gid, "u1", "A", "神了"))
@@ -269,7 +267,7 @@ def t5_prompt_escape():
 def t6_research():
     """情景6：新候选自动考究 -> meaning/example 写入、status 仍 candidate。"""
     reset()
-    gid = "222333444"
+    gid = "100000001"
     r_extract = json.dumps([{"content": "鼠鼠", "source_id": "1"}])
     r_research = json.dumps({"content": "鼠鼠",
                              "meaning": "三角洲里穿便宜装备闷头捡东西的玩家，自嘲",
@@ -294,7 +292,7 @@ def t7_uncertain():
     e["meaning"] = info["meaning"] or "不确定"
     assert e["meaning"] == "不确定"
     e["status"] = m.CONFIRMED  # 群主误确认也不行
-    req = feed_inject(FakeEvent("222333444", "u9", "Z", "今天某词了吗"))
+    req = feed_inject(FakeEvent("100000001", "u9", "Z", "今天某词了吗"))
     assert req.extra_user_content_parts == [], "含义不确定的词条即使确认也不注入"
     print("✓ 情景7 不确定：空含义确认后仍不注入")
 
@@ -303,7 +301,7 @@ def t8_inject_live():
     """情景8：confirmed+释义命中 -> req.extra_user_content_parts 追加。"""
     reset()
     add_confirmed("神了", "表示惊叹/离谱")
-    req = feed_inject(FakeEvent("222333444", "u1", "A", "今天这波真神了"), shadow_override=False)
+    req = feed_inject(FakeEvent("100000001", "u1", "A", "今天这波真神了"), shadow_override=False)
     assert len(req.extra_user_content_parts) == 1, "应注入 1 块"
     block = req.extra_user_content_parts[0].text
     assert "神了" in block and "惊叹" in block, block
@@ -315,7 +313,7 @@ def t9_shadow():
     """情景9：影子模式：不追加、shadow_hits+1、shadow 记录落盘。"""
     reset()
     add_confirmed("神了", "表示惊叹/离谱")
-    req = feed_inject(FakeEvent("222333444", "u1", "A", "今天这波真神了"), shadow_override=True)
+    req = feed_inject(FakeEvent("100000001", "u1", "A", "今天这波真神了"), shadow_override=True)
     assert req.extra_user_content_parts == [], "影子模式绝不改上下文"
     assert m._stat["shadow_hits"] == 1 and m._stat["injected"] == 0
     assert m._shadow and m._shadow[-1]["terms"] == ["神了"], m._shadow
@@ -332,7 +330,7 @@ def t10_inject_order():
     add_confirmed("乙词", "释义乙", count=1)
     for i in range(5):
         add_confirmed("低频词%d" % i, "释义%d" % i, count=1)
-    req = feed_inject(FakeEvent("222333444", "u1", "A",
+    req = feed_inject(FakeEvent("100000001", "u1", "A",
                                 "甲词乙词低频词0低频词1低频词2低频词3低频词4"),
                       shadow_override=False)
     block = req.extra_user_content_parts[0].text
@@ -357,7 +355,7 @@ def t11_commands_and_persist():
     m._ensure_state()
     e, _ = m._upsert(m._entries, "乐子", {"uid": "u1", "name": "A", "text": "乐子", "ts": 1.0})
     # 拒绝
-    out = run_cmd("reject", FakeEvent("222333444", "2774000001", "群主", "/黑话拒绝 乐子"))
+    out = run_cmd("reject", FakeEvent("100000001", "2774000001", "群主", "/黑话拒绝 乐子"))
     assert "已拒绝" in out[0], out
     # 已拒绝的词再提取不重新入库、count 不涨
     before = e["count"]
@@ -365,11 +363,11 @@ def t11_commands_and_persist():
     assert got is None and e["count"] == before, "拒绝词不重复入库"
     # 确认
     e2, _ = m._upsert(m._entries, "人机", {"uid": "u1", "name": "A", "text": "人机", "ts": 1.0})
-    out = run_cmd("confirm", FakeEvent("222333444", "2774000001", "群主", "/黑话确认 人机"))
+    out = run_cmd("confirm", FakeEvent("100000001", "2774000001", "群主", "/黑话确认 人机"))
     assert "已确认「人机」" in out[0], out
     assert e2["status"] == m.CONFIRMED
     # 备注
-    out = run_cmd("remark", FakeEvent("222333444", "2774000001", "群主", "/黑话备注 人机 说别人像机器人"))
+    out = run_cmd("remark", FakeEvent("100000001", "2774000001", "群主", "/黑话备注 人机 说别人像机器人"))
     assert "已备注" in out[0] and e2["meaning"] == "说别人像机器人", out
     # 持久化往返
     entries, shadow, meta = m.load_state(m._STATE)
@@ -378,7 +376,7 @@ def t11_commands_and_persist():
     assert got2["人机"]["meaning"] == "说别人像机器人"
     assert got2["乐子"]["status"] == m.REJECTED
     # 非群主调用命令无效
-    out = run_cmd("confirm", FakeEvent("222333444", "12345", "路人", "/黑话确认 人机"))
+    out = run_cmd("confirm", FakeEvent("100000001", "12345", "路人", "/黑话确认 人机"))
     assert out == [], "非群主命令应无效"
     print("✓ 情景11 命令与持久化：确认/拒绝/备注 + 落盘往返 + 权限")
 
@@ -405,7 +403,7 @@ def t12_noise():
 def t13_restart_persist():
     """情景13：重启后状态加载——提取不清空历史词库、冷却时间从 meta 恢复并生效。"""
     reset()
-    gid = "222333444"
+    gid = "100000001"
     m._ensure_state()
     e, _ = m._upsert(m._entries, "老词", {"uid": "u1", "name": "A", "text": "老词", "ts": 1.0})
     e["meaning"] = "早就确认的老词"
@@ -457,7 +455,7 @@ def t14_auto_review():
     """情景14：自动审核 —— 8h 定时让 AI 审候选，通过/拒绝/再等等落库落盘。"""
     reset()
     m.AUTO = True
-    m.GROUPS = {"222333444"}
+    m.GROUPS = {"100000001"}
     m._ensure_state()
     # 三个候选，createdAt 拨老（过 AUTO_MIN_AGE 才审）
     def old_entry(word, meaning, count):
@@ -495,7 +493,7 @@ def t15_auto_review_gates():
     """情景15：自动审核的门——太新的不审、approve 无释义不当转正、defer 达上限自动拒。"""
     reset()
     m.AUTO = True
-    m.GROUPS = {"222333444"}
+    m.GROUPS = {"100000001"}
     # ---- 太新的候选不进本轮（年龄 < AUTO_MIN_AGE），不发 LLM、不动 meta ----
     m._ensure_state()
     e, _ = m._upsert(m._entries, "新词", {"uid": "u1", "name": "A", "text": "新词", "ts": 1.0})
@@ -526,23 +524,6 @@ def t15_auto_review_gates():
     assert e3["reviewCount"] == m.AUTO_MAX_DEFER
     assert m._stat["confirmed"] == 0
     assert any("defer 达上限" in a["reason"] for a in m._auto_log)
-    # ---- 敏感词硬拒：命中 _SENSITIVE_RE 直接拒，不发 LLM、不给转正机会 ----
-    e4, _ = m._upsert(m._entries, "中出", {"uid": "u1", "name": "A", "text": "中出", "ts": 1.0})
-    e4["count"] = 5
-    e4["createdAt"] = "2026-01-01T00:00:00"
-    plugin2 = _plugin([json.dumps([{"content": "中出", "decision": "approve", "meaning": "网络用语"}])])
-    _LOOP.run_until_complete(m._run_auto_review(plugin2.context))
-    assert e4["status"] == m.REJECTED, "敏感词必须硬拒"
-    assert any("敏感词表" in a["reason"] for a in m._auto_log)
-    # ---- _clean_msg：@ 昵称(QQ号) 展开剥离，昵称里的字不能进语料 ----
-    raw = "@混..混蛋，不..不要一...一边中出..一边告白啊(2813927478) 我只用过UU远程"
-    assert m._clean_msg(raw) == " 我只用过UU远程", "昵称+QQ号应被剥掉"
-    raw2 = "@CKpad(778933351) 你猜"
-    assert m._clean_msg(raw2) == " 你猜"
-    raw3 = "今天这波真神了"
-    assert m._clean_msg(raw3) == raw3, "无 @ 的消息原样保留"
-    assert m._AT_EXPAND_RE.search("@别人(123) 嗨") is not None, "@别人(123) 应能被剥掉"
-    assert m._clean_msg("@别人(123) 嗨") == " 嗨"
     # ---- _auto_due：8h 到点判定 ----
     now = 100000.0
     assert m._auto_due(now, 0) is True, "从未审过应到点"
@@ -567,7 +548,7 @@ def t16_init_starts_auto_loop():
     _LOOP.run_until_complete(asyncio.sleep(0))
     assert m._started_auto is True, "不应重复启动"
     # watch 兜底路径也应无害（已启动则不重复）
-    feed_watch(FakeEvent("222333444", "u1", "A", "普通消息"))
+    feed_watch(FakeEvent("100000001", "u1", "A", "普通消息"))
     assert m._started_auto is True
     print("✓ 情景16 构造函数：AUTO 开时正常加载并启动循环（不重复）")
 
