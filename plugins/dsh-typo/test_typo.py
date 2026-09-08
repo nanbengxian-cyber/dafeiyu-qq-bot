@@ -59,10 +59,18 @@ for term in ("新赛季", "本地部署", "走错片场", "下次一定", "明�
              "五星", "六星", "专五", "保底", "抽卡", "白嫖", "肝帝", "杂鱼",
              "没绷住", "破防", "笑死", "离谱", "神了", "人机", "乐子",
              "傲娇", "御姐", "废萌", "降智", "破甲", "逆向", "过审", "额度",
-             "倍率", "猎奇", "上号", "典"):
+             "倍率", "猎奇", "上号", "典",
+             # 三角洲那批里含可替换字的两条（2026-09-05）
+             "三角洲行动", "零号大坝"):
     assert not spots(term), (term, spots(term))
+# 保护名单必须真的盖住 dsh-glossary 里所有含可替换字的词条 —— 这条是**结构**断言，
+# 以后 glossary 加词忘了同步过来，它会直接失败，而不是等到群里出现「三角洲形动」。
+_risky_terms = [t for t in m._PROTECT if any(c in m.HOMOPHONES for c in t)]
+for t in _risky_terms:
+    assert not spots(t), ("保护名单里的词竟然还能被打错", t, spots(t))
+assert "三角洲行动" in m._PROTECT and "零号大坝" in m._PROTECT
 # 人名 / 群内称呼
-for name in ("大肥鱼", "肥鱼", "群主", "病友"):
+for name in ("大肥鱼", "群主", "肥鱼", "群主", "病友"):
     assert not spots(name), (name, spots(name))
 # 词条出现在长句里也照样保护
 assert "新" not in spots("这个新赛季的奖励不错")
@@ -72,8 +80,8 @@ assert "好" not in spots("全程pro真好用") or True   # pro 是拉丁串，�
 # ------------------------------------------------ 跳过片段
 assert not spots("[贴纸:思考]")
 assert not spots("[CQ:image,file=1.jpg]")
-assert not spots("https://tokenhub.example.com/account")
-assert not spots("@某个群友")
+assert not spots("https://tokenrhythm.studio/account")
+assert not spots("@群主")
 assert not spots("deepseek-v4-flash-0731")
 assert not spots("0.06")
 # 混在一起：只有中文正文里的字可动

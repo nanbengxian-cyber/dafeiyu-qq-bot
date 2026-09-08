@@ -33,7 +33,7 @@ MaiBot 用 pypinyin + jieba 字频动态生成，`error_rate=0.3`（每字 30%�
 
 MaiBot 的 30%/字 是它自己的口味，放到这里等于满屏错字。
 拿主群 1967 条真语料找过人类的同音错别字，能确认的极少
-（「作者要饿似了」＝饿死了，是唯一一条明确的；另一条把某成员昵称改成谐音是故意玩梗
+（「作者要饿似了」＝饿死了，是唯一一条明确的；「难胃炎」是故意谐音玩梗
 不算打错）。所以真人的错字率其实很低。
 
 定成 **每条消息 6% 概率、且一条最多错一个字**。按机器人的发言量大约
@@ -73,14 +73,14 @@ def _set(name: str, default: str = "") -> set[str]:
 
 
 ENABLED = _flag("DSH_TYPO")
-GROUPS = _set("DSH_TYPO_GROUPS", "")
+GROUPS = _set("DSH_TYPO_GROUPS", "100000001")
 # 每条消息打错一个字的概率。真人错字率很低，别调高。
 RATE = min(1.0, max(0.0, float(os.environ.get("DSH_TYPO_RATE", "0.06"))))
 # 打错之后补一条「*很好」的概率（在已经打错的前提下）
 FIX_RATE = min(1.0, max(0.0, float(os.environ.get("DSH_TYPO_FIX_RATE", "0.35"))))
 # 太短的消息错一个字就面目全非（「好」→「号」），不碰
 MIN_LEN = max(2, int(os.environ.get("DSH_TYPO_MIN_LEN", "5")))
-OWNERS = _set("DSH_TYPO_OWNER", "")
+OWNERS = _set("DSH_TYPO_OWNER", "2774000001")
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +159,7 @@ HOMOPHONES: dict[str, tuple[str, ...]] = {
 # 人名和群名改错了更糟。
 _PROTECT: tuple[str, ...] = (
     # 人 / 群
-    # 换群时把**你自己群里的人名和自称**填到这一行，名字被打错字最难看
-    "大肥鱼", "肥鱼", "群主", "病友",
+    "大肥鱼", "群主", "肥鱼", "群主", "病友",
     # 含可替换字的黑话词条（与 dsh-glossary 对齐，那边加词时这里要同步）
     "新赛季", "本地部署", "走错片场", "下次一定", "明日方舟", "元气骑士",
     "车轱辘废话", "蚌埠住了", "何意味", "带带我", "全程pro", "全程Pro",
@@ -168,6 +167,11 @@ _PROTECT: tuple[str, ...] = (
     "肝帝", "杂鱼", "没绷住", "绷不住", "破防", "笑死", "离谱", "神了",
     "人机", "乐子", "傲娇", "御姐", "废萌", "降智", "破甲", "逆向",
     "过审", "额度", "倍率", "猎奇", "上号", "三连", "典",
+    # 三角洲那批（2026-09-05）。整批 11 条词条里只有这两条含可替换字：
+    # 「三角洲行动」的行、「零号大坝」的号。其余（长弓/航天/大红/三角券/
+    # 狙击精英/鼠鼠/钢枪/白给/满改/干员/烽火地带）一个可替换字都不含，
+    # 是脚本比对同音表算出来的，不是眼看的。
+    "三角洲行动", "零号大坝",
 )
 
 # 这些片段整段跳过：贴纸标记、CQ 码、链接、@、数字/拉丁串
@@ -268,7 +272,9 @@ class Main(star.Star):
                 logger.warning("[typo] 读不到分段回复配置，不补纠正: %s", exc)
             return False
 
-    @filter.on_decorating_result()
+    # priority=200：统一去AI味管线第三步 —— 打同音错别字。
+    # 固定排在 humanizer(300) 之后、noise(100) 之前（错字在拆句/剥词之后、噪点之前）。
+    @filter.on_decorating_result(priority=200)
     async def maybe_typo(self, event: AstrMessageEvent) -> None:
         if not ENABLED:
             return
