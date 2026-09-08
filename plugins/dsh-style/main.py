@@ -61,7 +61,8 @@ N_SAMPLES = max(1, int(os.environ.get("DSH_STYLE_N", "6")))
 # 样本长度窗口：太长的没有示范价值（我们要教「短」）。
 # 下限是 1 而不是 2：群里最典型的真人回复恰恰是「草」「嗯」「啊」这种单字，
 # 它们是长度示范价值最高的样本，砍掉就等于把最好的例子扔了。
-# 但单个拉丁字母/数字（"a"、"6"）是噪音，由 _usable 里的单字必须是汉字挡掉。
+# 单个拉丁字母/数字默认当噪音挡掉，但**被群里多人反复用过的除外**（见 _idioms）：
+# 实测「6」8 次来自 4 个人、「？」19 次来自 13 个人，是本群最高频的两条真人消息。
 MIN_LEN = max(1, int(os.environ.get("DSH_STYLE_MIN_LEN", "1")))
 MAX_LEN = max(4, int(os.environ.get("DSH_STYLE_MAX_LEN", "18")))
 # 只看最近多少条 buffer（越小越跟得上当下群风）
@@ -72,6 +73,10 @@ PER_PERSON = max(1, int(os.environ.get("DSH_STYLE_PER_PERSON", "2")))
 BUDGET = max(120, int(os.environ.get("DSH_STYLE_BUDGET", "600")))
 # 顺便把量出来的中位数写进块里当锚点。0=不写
 TELL_MEDIAN = os.environ.get("DSH_STYLE_TELL_MEDIAN", "1") != "0"
+# 「群内通用短语」判定：至少多少个**不同的人**整条发过同样的内容。
+# 见 _idioms 的注释：这是用结构（多人复用）而不是字表来放行「？」「6」。
+IDIOM_MIN_SPEAKERS = max(2, int(os.environ.get("DSH_STYLE_IDIOM_SPEAKERS", "2")))
+IDIOM_TTL = max(30, int(os.environ.get("DSH_STYLE_IDIOM_TTL", "300")))
 
 # --- 样本过滤：这些行不适合当「怎么说话」的范例 ---
 # 指令、@、链接、图片/表情占位、纯符号
@@ -100,8 +105,51 @@ _NO_CJK_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 # 单字样本必须是汉字：「草」「嗯」有示范价值，「a」「6」是噪音
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
-_stat = {"inject": 0, "skip_no_gid": 0, "skip_empty": 0, "rows": 0, "chars": 0}
+_stat = {"inject": 0, "skip_no_gid": 0, "skip_empty": 0, "rows": 0, "chars": 0, "idiom": 0}
 _last: dict[str, list[str]] = {}
+# gid -> (算出来的时刻, 通用短语集合)
+_idiom_cache: dict[str, tuple[float, frozenset]] = {}
+
+
+def _idioms(con, gid: str) -> frozenset:
+    """本群「公认的短说法」：至少 IDIOM_MIN_SPEAKERS 个不同的人整条发过它。
+
+    为什么要这个：原来的 _usable 有两条噪音过滤 ——「整条没有汉字/字母/数字」和
+    「单字必须是汉字」—— 本意是挡掉纯标点和误发的「a」，但实测一量，被它挡掉的
+    恰好是本群**最高频**的两条真人消息：
+
+        「？」19 次 / 13 个不同的人   ← 被「纯标点」那条挡掉
+        「6」  8 次 /  4 个不同的人   ← 被「单字必须是汉字」那条挡掉
+
+    这俩不是噪音，是本群最典型的真人回复，也是「短」的最佳示范；教模型说话有多短
+    却把最短的两个例子扔掉，是把这个插件的目的做反了。
+
+    但也不能干脆放开：真正的噪音（某人手滑发的「a」、一串「。」）确实该挡。
+    区分噪音和群内通用语的结构性判据是**有多少不同的人复用它** —— 手滑只会出现
+    一次一个人，通用语一定被多人反复使用。所以不枚举「哪些符号算词」（那又是一张
+    永远补不全的字表，dsh-imagegen 上已经栽过三次），而是当场从语料里数出来。
+    """
+    now = time.time()
+    hit = _idiom_cache.get(gid)
+    if hit and now - hit[0] < IDIOM_TTL:
+        return hit[1]
+    got: frozenset = frozenset()
+    try:
+        rows = con.execute(
+            "SELECT t, COUNT(DISTINCT u) FROM ("
+            " SELECT text AS t, user_id AS u FROM buffer WHERE group_id=?"
+            " UNION ALL"
+            " SELECT text AS t, user_id AS u FROM archive WHERE group_id=?"
+            ") WHERE t IS NOT NULL AND length(t)<=4"
+            " GROUP BY t HAVING COUNT(DISTINCT u)>=?",
+            (gid, gid, IDIOM_MIN_SPEAKERS),
+        ).fetchall()
+        got = frozenset(str(r[0]).strip() for r in rows if str(r[0] or "").strip())
+    except BaseException as e:
+        # archive 表可能还不存在（新装）；数不出来就退回纯噪音过滤，不影响对话
+        logger.debug("[style] 统计群内通用短语失败: %s", e)
+    _idiom_cache[gid] = (now, got)
+    return got
 
 
 def _median(xs: list[int]) -> int:
@@ -112,15 +160,17 @@ def _median(xs: list[int]) -> int:
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) // 2
 
 
-def _usable(text: str) -> bool:
+def _usable(text: str, idioms: frozenset = frozenset()) -> bool:
     """这一行能不能当范例。宁可漏掉好句子，也不要放进坏句子。"""
     t = (text or "").strip()
     if not (MIN_LEN <= len(t) <= MAX_LEN):
         return False
-    if not _NO_CJK_RE.search(t):     # 纯 emoji/标点
-        return False
-    if len(t) == 1 and not _CJK_RE.match(t):   # 单个字母/数字是噪音
-        return False
+    if t not in idioms:
+        # 噪音过滤只对「没被多人复用」的内容生效
+        if not _NO_CJK_RE.search(t):     # 纯 emoji/标点
+            return False
+        if len(t) == 1 and not _CJK_RE.match(t):   # 单个字母/数字是噪音
+            return False
     if _SKIP_RE.search(t):
         return False
     if _DOM_RE.search(t):
@@ -146,6 +196,7 @@ def _pick(gid: str, exclude_text: str) -> tuple[list[tuple[str, str]], int]:
             "ORDER BY ts DESC LIMIT ?",
             (gid, LOOKBACK),
         ).fetchall()
+        idioms = _idioms(con, gid)
     except BaseException as e:
         logger.debug("[style] 查 buffer 失败: %s", e)
         return [], 0
@@ -171,8 +222,10 @@ def _pick(gid: str, exclude_text: str) -> tuple[list[tuple[str, str]], int]:
             continue
         if per.get(uid, 0) >= PER_PERSON:
             continue
-        if not _usable(t):
+        if not _usable(t, idioms):
             continue
+        if t in idioms and not _NO_CJK_RE.search(t):
+            _stat["idiom"] += 1        # 记一笔：这条是靠「多人复用」放行的
         seen.add(t)
         per[uid] = per.get(uid, 0) + 1
         out.append(((name or uid).strip(), t))
@@ -197,9 +250,18 @@ def _render(samples: list[tuple[str, str]], median: int) -> str:
     body = "\n".join("%s：%s" % (n, t) for n, t in samples)
     tail = "\n"
     if median and TELL_MEDIAN:
+        # [patch:stale-v1 去掉写死的「你现在平均20字」]
+        # 原来这里写死「你现在平均 20 字上下，明显偏长」——那是插件刚上线时的
+        # 实测值，早就不成立了：拿真实群记录量，机器人中位 9 字、均值 10.2，
+        # 与真人的 9 字完全对齐。也就是每一轮都在对模型断言一件关于它自己的
+        # 假事实，并要求它继续压一个已经达到的目标。
+        # 块里其他每句都是可验证为真的（样本是真人原话、中位数当场算），
+        # 掺一句假的会把整块可信度一起拉低 —— 模型分不清哪句可信。
+        # 这与 dsh-web / dsh-imgctx 的「读不到就说读不到，一个字都别编」同源。
+        # 现在只陈述当场量出来的事实，不做自我诊断。
         tail += (
-            "（他们的中位长度是 %d 个字。你现在平均 20 字上下，明显偏长，"
-            "往 %d 字这个量级压。）\n" % (median, max(1, median))
+            "（他们的中位长度是 %d 个字，你保持在这个量级就对了。）\n"
+            % median
         )
     tail += "</style_samples>"
     block = head + body + tail
@@ -261,4 +323,11 @@ class Main(star.Star):
             "旋钮：条数 %d、长度 %d~%d 字、回看 %d 条、同人最多 %d 条"
             % (N_SAMPLES, MIN_LEN, MAX_LEN, LOOKBACK, PER_PERSON)
         )
+        idioms = _idiom_cache.get(gid, (0.0, frozenset()))[1]
+        if idioms:
+            short = sorted((x for x in idioms if len(x) <= 2), key=len)[:12]
+            lines.append(
+                "群内通用短语 %d 条（≥%d 人用过才算，靠它放行「？」「6」这类）：%s"
+                % (len(idioms), IDIOM_MIN_SPEAKERS, " ".join(short))
+            )
         yield event.plain_result("\n".join(lines))
