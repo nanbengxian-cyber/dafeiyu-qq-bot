@@ -268,7 +268,7 @@ def _keep_recent_turns(msgs: list, turns: int) -> list:
     cut = 0
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
-        if isinstance(m, dict) and m.get(ole") == "user":
+        if isinstance(m, dict) and m.get("role") == "user":
             seen += 1
             if seen == turns:
                 cut = i
