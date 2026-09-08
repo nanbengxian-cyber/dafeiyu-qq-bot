@@ -1,0 +1,5 @@
+name: dsh-factguard
+desc: 记忆看门狗 —— 群友询问/断言机器人自身属性时，只按事实表（性别=女、生日=DeepSeek 首个模型发布日 2023-11-02）回答；记忆无依据的断言直接否认纠正，防乱承认与性别摇摆。
+version: 1.0.0
+author: 大肥鱼
+repo: local
