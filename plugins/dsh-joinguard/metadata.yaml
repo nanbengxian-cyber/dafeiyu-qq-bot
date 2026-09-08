@@ -1,0 +1,5 @@
+name: dsh-joinguard
+desc: 入群 AI 审核 —— 收到加群申请时，拿「入群问题 + 申请者答案」问 AI 判 approve/reject/review 并真批/真拒；群主可用 /入群问题 改审核用的问题、/入群审核模式 auto|suggest 切换直批或仅建议。
+version: 1.0.0
+author: 大肥鱼
+repo: local
