@@ -239,7 +239,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         src, re.S,
     )
     if m:
-        v = (m.group("v") or "").strip().strip("\"'")
+        v = (m.group("v") or "").strip().strip("\"\'")
         if v:
             return v
     # 裸标签：<send_voice>要念的话</send_voice> —— 标签里包的就是参数值。
@@ -248,7 +248,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         rf"<\s*{tool}\s*>(.*?)(?:</\s*{tool}\s*>|$)", src, re.S | re.I
     )
     if m:
-        v = (m.group(1) or "").strip().strip("\"'")
+        v = (m.group(1) or "").strip().strip("\"\'")
         if v:
             return v
     # 方括号形态：[send_voice:要念的话] —— 冒号后面就是参数值。
@@ -256,7 +256,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
         rf"[\[【]\s*{tool}\s*[:：]([^\]】\n]*)[\]】]?", src, re.I
     )
     if m:
-        v = (m.group(1) or "").strip().strip("\"'")
+        v = (m.group(1) or "").strip().strip("\"\'")
         if v:
             return v
     # 中文译名：[生成图片: 一只猫]。实测模型会把工具名翻成中文再套方括号。
@@ -266,7 +266,7 @@ def _extract_arg(text: str, tool: str, arg: str) -> str | None:
             rf"[\[【]\s*(?:{alias})\s*[:：]([^\]】\n]*)[\]】]?", src
         )
         if m:
-            v = (m.group(1) or "").strip().strip("\"'")
+            v = (m.group(1) or "").strip().strip("\"\'")
             if v:
                 return v
     return None
@@ -379,6 +379,24 @@ TMP_DIR = os.environ.get("DSH_VID_TMP", "/AstrBot/data/video")
 MAX_SEND_B64 = int(os.environ.get("DSH_VID_MAX_SEND", str(24 * 1024 * 1024)))
 
 # 框架留下的视频附件标记
+def _raw_has_video(event) -> bool:
+    """这条消息的 OneBot 原始段里到底有没有视频。
+
+    用来区分两种「没识别到视频」：
+      · 群里本来就没视频 —— 正常，不用出声
+      · 群里有视频但框架没转成 [Video Attachment] —— 功能坏了，必须出声
+    实测后者是常态（适配器忽略 video 段），前者才是少数。
+    """
+    try:
+        raw = getattr(event.message_obj, "raw_message", None)
+        msg = raw.get("message") if isinstance(raw, dict) else getattr(raw, "message", None)
+        if not isinstance(msg, list):
+            return False
+        return any(str((seg or {}).get("type", "")) == "video" for seg in msg)
+    except BaseException:
+        return False
+
+
 ATTACH_RE = re.compile(
     r"\[Video Attachment(?: in quoted message)?:\s*name\s+([^,\]]+),\s*path\s+([^\]]+)\]"
 )
@@ -406,11 +424,42 @@ VIDEO_INTENT_RE = re.compile(
     r"(视频|动画|短片|影片|片子|动图片段|小电影|录像)"
 )
 # 要「做」而不是「看」。「这视频啥意思」不该触发生成。
+# 「给我/帮我/替我」是**受益者标记**，不是创建动词 —— 必须另有真动词。
+# 原来它们跟「做/生成」并列，于是「给我…视频」不管中间是什么动词都命中：
+# 实测「去给我找一个玉足视频」（找＝搜已有的）、「帮我查看这个视频」都误触发过。
 VIDEO_MAKE_RE = re.compile(
-    r"(做|生成|整|搞|弄|来|画|拍|出|制作|给我|帮我)\s*(?:一)?\s*"
+    r"(?:给我|帮我|替我)?\s*(做|生成|整|搞|弄|来|画|拍|出|制作)\s*(?:一)?\s*"
     r"(?:个|段|条|部|支|下|点)?\s*"
-    r"(?:.{0,6}?)(视频|动画|短片|影片|片子|小电影)"
+    # 宾语长度不设上限，只要求不跨标点。掐字数会漏掉
+    # 「做个小鲸鱼甩尾巴的动画」这种正常说法（实测宾语 7 字就漏）。
+    r"(?:[^，,。.！!？?；;\n]{0,16}?)(视频|动画|短片|影片|片子|小电影)"
     r"|(视频|动画|短片)\s*(?:做|生成|整|搞|弄|来)"
+)
+# 用户在要求「理解一段已有的视频」，不是要做新的。
+#
+# 为什么必须单独一条而不是去精修 VIDEO_MAKE_RE：动词表里有「帮我/给我」，
+# 加上中间的 .{0,6}? 通配，「帮我查看这个视频」会整串命中「做视频」。
+# 实测 2026-09-03 09:13 真群就这么误触发过一次，白烧了一次出片额度，
+# 而且模型没真看视频就凭链接瞎编了内容。
+#
+# 「做」和「看」是两个独立意图，各自单独识别 —— 指望一条正则同时管好
+# 两件事，就会一直在动词表上打补丁（dsh-imagegen 已经踩过三次）。
+#
+# 命中后让路给：本插件的 attach_video 钩子（群里直接发的视频文件）、
+# dsh-web 的 bilibili_video / read_webpage 工具（视频链接）。
+VIDEO_WATCH_RE = re.compile(
+    # 理解类动词 + 视频词。「看」单独成词太泛（「看我做的视频」是要做），
+    # 所以只收明确表示「理解/转述」的说法。
+    r"(查看|看看|看一下|看下|看看这|帮我看|给我看|瞧瞧|识别|辨认"
+    r"|总结|概括|讲讲|说说|讲一下|说一下|介绍|解说|解读|分析|翻译)"
+    r"[^\n]{0,8}?(视频|动画|短片|影片|片子|录像|b23|BV)"
+    # 「这视频讲了啥」「视频里说了什么」—— 视频词在前，疑问在后
+    r"|(视频|动画|短片|影片|片子|录像)\s*(里|中|内容)?\s*"
+    r"(讲|说|是|演|放)[^\n]{0,6}?(什么|啥|内容|意思|谁)"
+    r"|(视频|动画|短片|影片|片子)\s*(啥|什么)\s*(意思|内容)"
+    # 视频平台链接：话里带这个就是让它去看，不可能是让它凭空做
+    r"|b23\.tv|bilibili\.com|BV[0-9A-Za-z]{8,}|youtu\.be|youtube\.com/watch"
+    r"|douyin\.com|v\.qq\.com|iqiyi\.com"
 )
 # 明确的图片名词。用户说「做个视频封面」「画个动画风格的壁纸」，要的是**图**，
 # 视频/动画只是修饰语 —— 这时让路给 dsh-imagegen。
@@ -495,7 +544,7 @@ def _clean_leaked_call(text: str, event=None) -> tuple[str, str | None]:
     leaked = None
     m = LEAK_CALL_RE.search(text or "")
     if m:
-        leaked = (m.group("v") or "").strip().strip("\"'）) ")
+        leaked = (m.group("v") or "").strip().strip("\"\'）) ")
     if not leaked:
         block = LEAK_XML_RE.search(text or "")
         if block:
@@ -516,6 +565,36 @@ def _clean_leaked_call(text: str, event=None) -> tuple[str, str | None]:
     if not leaked:
         leaked = _extract_arg(text or "", "generate_video", "prompt")
     return cleaned, (leaked or None)
+
+
+# 三层否决的总开关。关掉就退回旧行为（只看 VIDEO_MAKE_RE）。
+STRICT_MAKE = os.environ.get("DSH_VID_STRICT_MAKE", "1") not in ("0", "false", "False")
+# 推出来的画面描述最少几个字才认（中文两个字就能是一个画面）
+MIN_PROMPT = int(os.environ.get("DSH_VID_MIN_PROMPT", "2"))
+
+# 推测/议论开头的「画面描述」不是画面描述。
+# 实测「生成视频好像要时间吧」推出来的 prompt 是「好像要时间」——
+# 他在议论出片要多久，不是在点菜。
+COMMENT_HEAD_RE = re.compile(
+    r"^\s*(好像|应该|大概|可能|似乎|估计|貌似|说不定|恐怕|反正|其实|不过|但是"
+    r"|感觉|觉得|听说|据说|是不是|要不要|能不能|可不可以)"
+)
+
+
+def _imperative_gain(user_text: str, prompt: str) -> int:
+    """祈使前缀到底剥掉了几个字。
+
+    这是兜底出片最硬的一道闸：`_derive_prompt` 的活儿就是把
+    「给我做个视频」这种祈使前缀整块剥掉。**一个字都没剥掉**，
+    说明这句话根本不是「动词+量词+视频」开头的祈使句，
+    那它就不是在叫机器人做视频，而是在聊视频这件事。
+
+    事故原文「唉，要是再来几次这种视频，那我的群也不用那么冷了」
+    剥完还是它自己 —— 而且那一整句被当成画面描述送去出片了。
+    """
+    a = re.sub(r"\s+", "", user_text or "")
+    b = re.sub(r"\s+", "", prompt or "")
+    return len(a) - len(b)
 
 
 def _derive_prompt(user_text: str) -> str:
@@ -907,6 +986,22 @@ class Main(star.Star):
                 for m in ATTACH_RE.finditer(text):
                     hits.append((i, m.group(1).strip(), m.group(2).strip()))
             if not hits:
+                # ★ 这里必须出声：看视频功能实测从上线起一次都没成功过 ★
+                # 2026-09-03 真群有人发视频，本插件全程零日志；24h 内
+                # 「[video] 识别」出现 0 次。根因是框架适配器的洞：
+                #   OneBot 段类型 "video" 不在 ComponentTypes 里
+                #   → 适配器第 408 行直接 `continue` 忽略，不造 Video 组件
+                #   → 框架的 _append_video_attachment 只在 isinstance(comp, Video)
+                #     时才跑，于是永远不产生 [Video Attachment] 标记
+                #   → 本插件的 ATTACH_RE 永远 0 命中
+                # 插件层要修得从 raw_message 直接读 OneBot 段，那是下一步。
+                # 现在至少让日志说清「群里明明有视频，但我拿不到它」——
+                # 静默失败最糟的地方是没人知道它坏了。
+                if _raw_has_video(event):
+                    logger.warning(
+                        "[video] 群里发了视频，但框架没给出 [Video Attachment] 标记，"
+                        "这一轮看不了（已知：aiocqhttp 适配器忽略 video 段）"
+                    )
                 return
             await asyncio.wait_for(
                 self._run_understand(req, hits), timeout=UNDERSTAND_BUDGET
@@ -964,6 +1059,10 @@ class Main(star.Star):
 
     # ------------------------------------------------ 生成视频（工具）
 
+    # 注：generate_video 工具本身不加 WATCH 否决。
+    # 模型主动发起这个调用时，判断责任在模型；插件在这里拦会把
+    # 「看完这个视频，再做个类似的」这种合理请求也一起毁掉。
+    # 兜底路径（on_llm_response）才是误判高发区，否决只加在那里。
     @filter.llm_tool(name="generate_video")
     async def generate_video(self, event: AstrMessageEvent, prompt: str):
         """生成一段视频（动画/短片）时调用本工具。注意很慢，要等好几分钟。
@@ -1128,6 +1227,15 @@ class Main(star.Star):
             if not leaked:
                 if not VIDEO_MAKE_RE.search(user_text):
                     return
+                # 用户要的是「看懂一段已有的视频」，不是做新的。
+                # leaked 不受这条否决：模型真的发起了 generate_video 调用，
+                # 那是它自己要出片的铁证（「帮我看这视频，顺便做个类似的」）。
+                if VIDEO_WATCH_RE.search(user_text):
+                    logger.info(
+                        "[video] 让路：用户要的是看视频而不是做视频 | 用户=%.60s",
+                        user_text,
+                    )
+                    return
                 if IMG_NOUN_RE.search(user_text):
                     # 「做个视频封面」这种，图才是他要的东西
                     logger.info(
@@ -1144,9 +1252,28 @@ class Main(star.Star):
                 return
 
             prompt = leaked or _derive_prompt(user_text)
-            if len(prompt) < 3:
+            # 2 字就够：中文画面词大量是两个字（下雨/日落/海浪/猫娘）。
+            # 原来卡 3 字，「给我整段下雨的短片」剥出「下雨」会被误拦。
+            # 真正把关的是下面两层（祈使前缀必须剥掉过、推出来不能是议论）。
+            if len(prompt) < MIN_PROMPT:
                 logger.info("[video] 未触发出片：推不出画面描述 | 用户=%.40s", user_text)
                 return
+            # leaked 不受下面两条约束：模型自己发起了 generate_video 调用，
+            # 那是它要出片的铁证，prompt 也是它自己写的。
+            if STRICT_MAKE and not leaked:
+                gain = _imperative_gain(user_text, prompt)
+                if gain < 2:
+                    logger.info(
+                        "[video] 未触发出片：这句话不是祈使句（祈使前缀一个字都没剥掉，"
+                        "剥掉%d字）| 用户=%.60s", gain, user_text,
+                    )
+                    return
+                if COMMENT_HEAD_RE.search(prompt):
+                    logger.info(
+                        "[video] 未触发出片：推出来的是议论不是画面（%.20s）| 用户=%.40s",
+                        prompt, user_text,
+                    )
+                    return
 
             sid = event.unified_msg_origin or "global"
             left = GEN_COOLDOWN - (time.time() - _gen_last_session.get(sid, 0.0))
