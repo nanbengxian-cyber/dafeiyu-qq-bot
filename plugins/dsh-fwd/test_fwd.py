@@ -46,7 +46,7 @@ def seg(t, **d):
 def ev(who, uid, ts, segs, card=""):
     """内联在 forward.data.content 里的形状：完整消息事件。"""
     return {
-        "self_id": 100000009, "user_id": uid, "time": ts,
+        "self_id": 100000002, "user_id": uid, "time": ts,
         "message_id": 1, "message_seq": 1, "real_id": 1, "real_seq": "1",
         "message_type": "group", "post_type": "message", "message_format": "array",
         "sender": {"user_id": uid, "nickname": who, "card": card},
@@ -56,8 +56,8 @@ def ev(who, uid, ts, segs, card=""):
 
 print("== A 节点形状归一 ==")
 check("A1 内联事件取昵称",
-      M.node_view(ev("羽玲", 111, 1788449587, [seg("text", text="在吗")]))[:3],
-      ("羽玲", "111", 1788449587))
+      M.node_view(ev("群友E", 111, 1788449587, [seg("text", text="在吗")]))[:3],
+      ("群友E", "111", 1788449587))
 check("A2 群名片优先于昵称",
       M.node_view(ev("原昵称", 111, 0, [], card="群里的名"))[0], "群里的名")
 check("A3 OneBot node 段",
