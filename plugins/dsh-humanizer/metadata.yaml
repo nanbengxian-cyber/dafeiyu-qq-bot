@@ -1,0 +1,5 @@
+name: dsh-humanizer
+desc: 去AI味出口闸门：发出去之前用一组具体的 AI 痕迹特征扫回复正文（照抄 blader/humanizer 的 25 条检测里跟 QQ 群语境对齐的部分），强信号命中就剥（strip）/整条拦（block）/只记日志（shadow）。给人格【AI 味黑名单】补一道 leakguard 式的硬兜底——leakguard 只兜人格标题，这道兜整句/整段AI味。按群聊风险分 strong / weak 两档防误伤，weak 只记日志绝不剥。读不到、任何异常都放行，绝不挡正常回复。命令 /人味状态 /人味模式。
+version: 1.0.0
+author: 大肥鱼
+repo: local
