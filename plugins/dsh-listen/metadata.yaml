@@ -1,0 +1,5 @@
+name: dsh-listen
+desc: 听语音插件。on_llm_request 钩子把群里的语音条（含引用消息里的语音，即对话记录）和视频里的音轨交给 AssemblyAI 转写成文字，以 <voice_context> 注入上下文，机器人就能听懂语音内容。/听语音状态 查看配置。
+author: 大肥鱼
+version: 1.0.0
+repo: local
