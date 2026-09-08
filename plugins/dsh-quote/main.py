@@ -12,7 +12,7 @@
 这块东西有三个致命的缺失，实测已经造成真群里的误判：
 
 1. **没说这句话是不是机器人自己说的。** 机器人在群里的群名片就是「大肥鱼」，
-   而群里还有一个**真人**（另一个 QQ 号）也把名字改成了「大肥鱼」。
+   而群里还有一个**真人**（QQ 1493202695）也把名字改成了「大肥鱼」。
    于是 `(大肥鱼): 念啥` 到底是「你自己刚说的」还是「另一个人说的」，
    模型没有任何依据可以分辨 —— 这正是「看不懂别人引用的聊天、错以为是自己」
    的根因。凭昵称认人在这个群里本来就是错的，必须用 QQ 号。
@@ -60,7 +60,7 @@ def _strip_at_prefix(text: str) -> str:
 
     **必须保守**：只在 @ 后面跟着 `(QQ号)` 或空白时才切。
     NapCat 上报的 message_str 里 At 和正文常常没有空格（真实样本
-    `@难谓言对`，正文只有「对」一个字），此时昵称边界无法确定，
+    `@群主对`，正文只有「对」一个字），此时昵称边界无法确定，
     贪婪切会把正文一起吃掉、退化成「（空消息）」——那比不切更糟。
     这种情况交给 `_chain_text` 从组件链里精确剥离。
     """
@@ -212,12 +212,15 @@ class Main(star.Star):
                 "替换" if replaced else "追加", quoted_uid or "未知",
                 quoted_uid == str(event.get_self_id() or ""), ",".join(u for u in at_uids if u) or "无",
             )
-        except BaseException as exc:  # 绝不能让引用处理挡住回复
+        # 不用 BaseException：CancelledError/GeneratorExit 属于「这轮被放弃了」，
+        # 吞掉它等于骗框架说自己正常跑完，可能留下半截状态或
+        # `async generator ignored GeneratorExit`。真正的异常仍然全部兜住。
+        except Exception as exc:  # 绝不能让引用处理挡住回复
             logger.error("[quote] 改写失败，保持原样: %s", exc)
 
     @filter.command("引用状态")
     async def cmd_status(self, event: AstrMessageEvent):
-        if str(event.get_sender_id()) != os.environ.get("DSH_QUOTE_OWNER", ""):
+        if str(event.get_sender_id()) != os.environ.get("DSH_QUOTE_OWNER", "2774000001"):
             return
         quote = _quote_of(event)
         yield event.plain_result(

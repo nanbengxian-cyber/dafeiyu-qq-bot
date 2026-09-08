@@ -2,4 +2,4 @@ name: dsh-quote
 desc: 把框架的 <Quoted Message> 块改写成机器人真能读懂的关系说明：谁在说、引用的是谁的哪句话、那句是不是自己说的、这次 @ 的是谁。只认 QQ 号不认昵称（群里有真人改名和机器人同名，导致它把别人的话当成自己修好的东西）。失败一律原样放过。指令 /引用状态。
 version: 1.0.0
 author: 大肥鱼
-repo: https://github.com/nanbengxian-cyber/dafeiyu-qq-bot
+repo: local
