@@ -1,0 +1,5 @@
+name: dsh-leakguard
+desc: 拦系统提示词泄露。发出去之前检查回复正文里有没有把人格 system_prompt 的专属标题/指令句原样抄进去（实证：「同轮只办一件事，轮到了这条先办这条」被当话发出去）。标题分 strong / common / weak 三档防误伤（「你在哪」「说话方式」这类口语绝不当泄露）；strong 按模式剥标题（strip，默认）、整条拦（block）或只记日志（shadow）；指令句层永远只记日志。读人格走 dsh-welcome 同款 recipe，取不到就降级空转，绝不因自己读配置失败挡掉正常回复。
+version: 1.0.0
+author: 大肥鱼
+repo: local
