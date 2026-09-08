@@ -7,7 +7,7 @@
 #   provider_settings.default_image_caption_provider_id  (astr_main_agent.py:1032)
 # 它是个字符串，不是列表 —— 没有「主用挂了换备用」这回事。
 #
-# 而这条线路必须有备用，不是可选项。实测 relay-b 站（Cloudflare 后面）
+# 而这条线路必须有备用，不是可选项。实测 justwoker 站（Cloudflare 后面）
 # 带图请求稳定约 20% 概率被边缘节点弹回 403 code 1010：
 #   claude-opus-5           成功 8/10
 #   claude-opus-5-thinking  成功 7/10
@@ -74,12 +74,41 @@ ENABLED = os.environ.get("DSH_VIS_CHAIN_ENABLE", "1") not in ("0", "false", "Fal
 # 所以按 id 定期核对身份，发现被换过就地重建。
 WATCH_INTERVAL = float(os.environ.get("DSH_VIS_WATCH", "30"))
 
+# 一档被判「没通道」后多久内直接跳过。0=不缓存。
+DEAD_TTL = float(os.environ.get("DSH_VIS_DEAD_TTL", "600"))
+
 # 瞬时错误特征。403/1010 是 Cloudflare 指纹弹回，429 是限流，
 # 都属于「同一档再试一次就可能成」。
 _TRANSIENT = ("403", "1010", "429", "timeout", "timed out", "connection", "502", "503", "504")
+# [patch:perm-v1 503 不等于瞬时]
+# 永久错误：同一档再试一百次也不会变，重试只是白拖时间。
+#
+# 实测事故：一小时内 101 次上游重试，全是同一句
+#   `503 - model_not_found: No available channel for model claude-opus-5-thinking`
+# ——「这个模型在渠道里根本没有通道」是**配置**问题，不是抖动。但 503 在
+# _TRANSIENT 里，于是每张图都要：2 档 × (1+RETRY) 次 × 各自约 2.4s ≈ 14 秒
+# 全花在必然失败的两档上，才轮到真正能用的第三档。
+#
+# 教训与 dsh-imagegen 那条同源：**状态码是模糊的，响应体才说清了是什么**。
+# 光看 503 分不出「服务在抖」和「模型不存在」，必须看 body 里的 code。
+# 所以永久特征优先于瞬时特征。
+_PERMANENT = (
+    "model_not_found", "no available channel", "does not exist",
+    "invalid_api_key", "invalid api key", "insufficient_quota",
+    "unsupported", "code: 401", "error code: 404",
+)
+# pid -> 判定为「没通道」的时刻。只影响跳过顺序，不影响 fail-open。
+_dead: dict[str, float] = {}
+
+
+def _permanent(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(k in s for k in _PERMANENT)
 
 
 def _transient(e: Exception) -> bool:
+    if _permanent(e):
+        return False
     s = str(e).lower()
     return any(k in s for k in _TRANSIENT) or isinstance(e, asyncio.TimeoutError)
 
@@ -136,9 +165,38 @@ class ChainProvider(Provider):
         return self.links[0].text_chat_stream(*a, **kw)
 
     # ---------------------------------------------------------------- 链条
+    def _order(self) -> list:
+        """把最近判定「没通道」的档排到最后，而不是删掉。
+
+        删掉就等于自己给自己造了个单点：渠道恢复了也永远试不到。
+        排后面则是「先试可能通的，仍然全试一遍」—— fail-open。
+        """
+        if DEAD_TTL <= 0:
+            return list(self.links)
+        now = time.time()
+        alive, dead = [], []
+        for lk in self.links:
+            pid = lk.provider_config.get("id", "?")
+            t = _dead.get(pid, 0.0)
+            if t and now - t < DEAD_TTL:
+                dead.append(lk)
+            else:
+                if t:
+                    _dead.pop(pid, None)   # 过期了，恢复正常顺序
+                alive.append(lk)
+        if dead:
+            # 必须留痕：不打日志的话，下次「识图怎么换档了」又只能靠猜。
+            logger.info(
+                "[vischain] 本轮先跳过 %s（%.0f 分钟内判定为无通道，仍会兜底再试）",
+                ",".join(lk.provider_config.get("id", "?") for lk in dead),
+                DEAD_TTL / 60.0,
+            )
+        return alive + dead
+
     async def text_chat(self, *args, **kwargs):
         last = None
-        for lk in self.links:
+        links = self._order()
+        for lk in links:
             pid = lk.provider_config.get("id", "?")
             st = self.stat.setdefault(pid, {"ok": 0, "fail": 0, "sec": 0.0})
             for attempt in range(RETRY + 1):
@@ -151,13 +209,18 @@ class ChainProvider(Provider):
                     dt = time.time() - t0
                     st["fail"] += 1
                     last = e
+                    perm = _permanent(e)
                     tr = _transient(e)
+                    if perm:
+                        _dead[pid] = time.time()
                     logger.warning(
                         "[vischain] %s 第%d次失败(%.1fs, %s): %s",
                         pid,
                         attempt + 1,
                         dt,
-                        "瞬时可重试" if tr else "非瞬时，直接换下一档",
+                        "没通道／永久错误，直接换下一档并记 %.0f 分钟"
+                        % (DEAD_TTL / 60.0) if perm
+                        else ("瞬时可重试" if tr else "非瞬时，直接换下一档"),
                         str(e)[:120],
                     )
                     if not tr:
@@ -166,6 +229,7 @@ class ChainProvider(Provider):
                 dt = time.time() - t0
                 st["ok"] += 1
                 st["sec"] += dt
+                _dead.pop(pid, None)     # 成功一次就洗掉黑名单
                 # 不触发/降级路径也要留痕：走到第几档、试了几次，
                 # 否则以后排查「识图怎么慢了」只能靠猜。
                 if lk is self.links[0] and attempt == 0:
@@ -303,8 +367,11 @@ class Main(star.Star):
             s = self.chain.stat.get(pid, {})
             ok, fail = s.get("ok", 0), s.get("fail", 0)
             avg = (s.get("sec", 0.0) / ok) if ok else 0.0
+            t = _dead.get(pid, 0.0)
+            left = (DEAD_TTL - (time.time() - t)) if t else 0.0
             lines.append(
-                "%d. %s 成功%d/失败%d%s"
-                % (i, pid, ok, fail, ("，平均%.1fs" % avg) if ok else "")
+                "%d. %s 成功%d/失败%d%s%s"
+                % (i, pid, ok, fail, ("，平均%.1fs" % avg) if ok else "",
+                   ("，判定无通道还剩%.0f分钟" % (left / 60.0)) if left > 0 else "")
             )
         yield event.plain_result("\n".join(lines))
