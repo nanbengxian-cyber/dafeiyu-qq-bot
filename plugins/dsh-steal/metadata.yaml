@@ -1,0 +1,4 @@
+name: dsh-steal
+desc: 偷表情包——识图理解含义，只偷「群友反复发、能看懂意思」的表情包存库，/表情包 或「来张表情包」时随机发出。旋钮 DSH_STEAL / DSH_STEAL_MIN_COUNT / DSH_STEAL_MAX_STORED / DSH_STEAL_PROVIDER等。
+author: 大肥鱼
+version: 1.0.0
