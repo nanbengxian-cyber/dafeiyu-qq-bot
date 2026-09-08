@@ -2,4 +2,4 @@ name: dsh-emotion
 desc: 单一主情绪系统。一条外部消息最多触发一种情绪，词表配排除项与「针对谁」的结构证据；清零走道歉/连续中性/被回答/TTL 四条路。默认影子模式，只写审计日志，不改状态也不注入回复。指令 /情绪状态。
 version: 1.1.0
 author: 大肥鱼
-repo: https://github.com/nanbengxian-cyber/dafeiyu-qq-bot
+repo: local

@@ -49,11 +49,13 @@ try:  # 注入块必须和 dsh-ctxclean 认的形状一致（小写标签），�
 except ImportError:  # 老版本没有 TextPart，就退回纯字符串
     TextPart = None
 
-EMOTIONS = ("calm", "happy", "sad", "angry", "curious", "awkward")
-# 仲裁顺序：清零 > 攻击 > 低落 > 提问 > 高兴 > 尴尬。
+EMOTIONS = ("calm", "happy", "sad", "angry", "curious", "awkward",
+            "excited", "surprised", "proud", "worried")
+# 仲裁顺序：清零 > 攻击 > 低落 > 担心 > 提问 > 震惊 > 兴奋 > 高兴 > 得意 > 尴尬。
 # 「先清零」保证道歉永远压过同一句里的其他信号；
 # 「攻击优先于高兴」保证「牛逼，你谁都想对着干呗」这种夹阴阳不被当成开心。
-_CANDIDATE_ORDER = ("angry", "sad", "curious", "happy", "awkward")
+_CANDIDATE_ORDER = ("angry", "sad", "worried", "curious", "surprised",
+                    "excited", "happy", "proud", "awkward")
 
 ENABLED = os.environ.get("DSH_EMOTION", "1").lower() not in {"0", "false", "off"}
 SHADOW = os.environ.get("DSH_EMOTION_SHADOW", "1").lower() not in {"0", "false", "off"}
@@ -61,10 +63,25 @@ STATE_PATH = Path(os.environ.get("DSH_EMOTION_STATE", "/AstrBot/data/dsh_emotion
 LOG_PATH = Path(os.environ.get("DSH_EMOTION_LOG", "/AstrBot/data/dsh_emotion_events.jsonl"))
 MEMORY_DB = os.environ.get("DSH_EMOTION_MEMORY_DB", "/AstrBot/data/dsh_memory.db")
 TZ = os.environ.get("DSH_EMOTION_TZ", "Asia/Shanghai")
-OWNER = os.environ.get("DSH_EMOTION_OWNER", os.environ.get("DSH_INITIATE_OWNER", "")).strip()
+OWNER = os.environ.get("DSH_EMOTION_OWNER", os.environ.get("DSH_INITIATE_OWNER", "2774000001")).strip()
 BOT_NAMES = tuple(x.strip() for x in os.environ.get("DSH_EMOTION_NAMES", "大肥鱼,小鲸鱼,肥鱼").split(",") if x.strip())
 # 连续几条「没有情绪信号」的真人消息就把负面情绪放掉
-NEUTRAL_RUN = max(1, int(os.environ.get("DSH_EMOTION_NEUTRAL_RUN", "2")))
+NEUTRAL_RUN = max(1, int(os.environ.get("DSH_EMOTION_NEUTRAL_RUN", "4")))
+# 环境氛围（没指向机器人的纯聊天）的情绪强度。1=有一点，2=比较。
+# 默认 2：纯调高敏感度后，群聊氛围也能明显影响机器人状态（原 1 太淡，
+# 表现为「情绪插件没在运行」）。
+ENV_INTENSITY = max(1, min(3, int(os.environ.get("DSH_EMOTION_ENV_INTENSITY", "2"))))
+# 心跳：每评估多少条真人消息打一行汇总。0=关。
+# 为什么需要：离开影子模式后本插件只在「有候选或状态变化」时才打日志，于是
+# 实测出现过连续 21 小时一行不打的情况 —— 那时根本没法区分「真没触发」和
+# 「钩子已经不跑了」，只能进容器翻 dsh_emotion_events.jsonl 才敢下结论。
+# 这与 dsh-imagegen 那条「不触发也要打日志」是同一条教训。
+HEARTBEAT_EVERY = max(0, int(os.environ.get("DSH_EMOTION_HEARTBEAT", "50")))
+# 审计文件多大就轮转一代（字节）。默认 4MB。
+AUDIT_MAX_BYTES = max(65536, int(os.environ.get("DSH_EMOTION_AUDIT_MAX", str(4 * 1048576))))
+# 「好奇」是否用结构判据（指向机器人 + 有疑问结构）触发，而不是只认 _WORDS 里
+# 那 6 个词。0 = 退回旧行为，出问题不用改代码、改这个环境变量就能回滚。
+CURIOUS_BY_STRUCT = os.environ.get("DSH_EMOTION_CURIOUS_STRUCT", "1") != "0"
 # 每种情绪自己的存活时长（秒）。生气/低落留久一点，好奇最短。
 TTL_BY_EMOTION = {
     "angry": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_ANGRY", "1800"))),
@@ -72,6 +89,10 @@ TTL_BY_EMOTION = {
     "happy": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_HAPPY", "900"))),
     "curious": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_CURIOUS", "600"))),
     "awkward": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_AWKWARD", "600"))),
+    "excited": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_EXCITED", "600"))),
+    "surprised": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_SURPRISED", "600"))),
+    "proud": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_PROUD", "900"))),
+    "worried": max(60.0, float(os.environ.get("DSH_EMOTION_TTL_WORRIED", "900"))),
 }
 
 # ---------------------------------------------------------------- 结构化信号
@@ -80,7 +101,8 @@ _NAME_RE = re.compile("|".join(re.escape(n) for n in BOT_NAMES)) if BOT_NAMES el
 _SECOND_PERSON_RE = re.compile(r"你(?!们)")
 # 第三方叙述：主语是别人，且情绪词紧跟其后 —— 这种不改机器人情绪。
 _THIRD_PARTY_RE = re.compile(r"(?:他|她|它|他们|她们|别人|有人|群主|作者)[^。！？!?]{0,10}"
-                             r"(?:滚|闭嘴|傻逼|废物|垃圾|有病|难过|伤心|崩溃|失望|委屈|开心|厉害)")
+                             r"(?:滚|闭嘴|傻逼|废物|垃圾|有病|难过|伤心|崩溃|失望|委屈|开心|厉害"
+                             r"|慌|害怕|完蛋|得意|炫耀|激动|卧槽|离谱|无语|社死)")
 # 整句被引号包住 = 在引用别人的话
 _QUOTED_RE = re.compile(r"^[\s\"'“‘「『【(（].*[\"'”’」』】)）]$")
 # 词表命中后还要过这一层：出现这些词说明命中的是别的意思（余额/额度…）
@@ -90,14 +112,45 @@ _EXCLUDE = {
     "sad": ("失望值", ),
     "happy": (),
     "curious": (),
+    "excited": ("马斯克", ),   # 星舰/火箭「起飞」是新闻不是群里兴奋
+    "surprised": (),
+    "proud": ("骄傲自满", ),
+    "worried": (),
 }
 _WORDS = {
-    "angry": ("滚开", "滚吧", "闭嘴", "傻逼", "废物", "垃圾", "有病", "别烦", "神经病"),
-    "sad": ("难过", "伤心", "崩溃", "失望", "委屈", "好累", "心累"),
-    "happy": ("太好了", "开心", "牛逼", "厉害", "谢谢你", "干得好", "太强了"),
+    "angry": ("滚开", "滚吧", "闭嘴", "傻逼", "废物", "垃圾", "有病", "别烦", "神经病",
+              "别理我", "走开", "气死", "烦死", "恼火", "混蛋", "找死", "滚蛋"),
+    "sad": ("难过", "伤心", "崩溃", "失望", "委屈", "好累", "心累", "emo", "破防",
+            "绷不住", "想哭", "哭了", "难受", "孤单", "没人陪", "心酸", "泪目"),
+    "happy": ("太好了", "开心", "牛逼", "厉害", "谢谢你", "干得好", "太强了", "笑死",
+              "绝了", "太棒了", "爽了", "好耶", "耶", "真棒", "给力", "牛批"),
     "curious": ("为什么", "怎么回事", "真的吗", "何意味", "能不能解释", "怎么做到"),
-    "awkward": ("尴尬", "冷场", "没人理", "无语了"),
+    "awkward": ("尴尬", "冷场", "没人理", "无语了", "社死", "脚趾抠地", "汗", "窒息",
+                "沉默了"),
+    "excited": ("起飞", "芜湖", "冲冲冲", "太期待了", "激动", "热血", "爽死", "爽爆",
+                "啊啊啊", "冲了", "开冲", "燥起来"),
+    "surprised": ("卧槽", "不会吧", "离谱", "惊了", "吓一跳", "还能这样", "真的假的",
+                  "什么鬼", "恐怖如斯", "神了"),
+    "proud": ("得意", "炫耀", "牛不牛", "夸我", "我厉害吧", "服不服", "我强吧"),
+    "worried": ("好慌", "害怕", "怎么办啊", "完蛋", "要凉", "慌得一批", "心里没底",
+                "紧张", "怕怕", "凉了"),
 }
+# 纯 emoji 情绪（整条消息没有文字，或文字只是标点/语气）：群里大量情绪靠表情
+# 表达（😭😭😭、😡😡😡），词表只认汉字会整类漏掉。优先级跟随 _CANDIDATE_ORDER。
+_EMOJI_TABLE = {
+    "angry": ("😠", "😡", "🤬", "💢", "👿"),
+    "sad": ("😭", "😢", "😞", "😔", "😩", "😫", "💔", "😿"),
+    "worried": ("😨", "😰", "😥", "🥺", "😖"),
+    "curious": ("🤨", "🧐", "🤔"),
+    "surprised": ("😳", "😱", "🤯", "🙀", "😲"),
+    "excited": ("🤩", "🤪", "🥳", "🎉", "🎊", "🔥"),
+    "happy": ("😂", "🤣", "😄", "😁", "😆", "😊", "😃", "😝"),
+    "proud": ("😎", "😏", "😌"),
+    "awkward": ("😅", "🙃", "😬", "😶"),
+}
+_EMOJI_CHARS = "".join("".join(v) for v in _EMOJI_TABLE.values())
+_EMOJI_ONLY_RE = re.compile(r"^[\s" + _EMOJI_CHARS + r"~。.!！~？?…、,.]+$")
+_EMOJI_ANY_RE = re.compile("[" + _EMOJI_CHARS + "]")
 # 语气词只在整条消息就是它本身（可重复）时才算尴尬：「额」「呃呃」算，「余额」不算。
 _FILLER_ONLY_RE = re.compile(r"^[额呃啊哦]{1,4}[。.!！~]?$")
 _LAUGH_RE = re.compile(r"^(?:哈{2,}|嘿{2,}|哈哈+[。.!！~]*)$")
@@ -107,6 +160,10 @@ _RESET_RE = re.compile(r"对不起|抱歉|我说错了|我错了|误会了|是�
 # 只用 ^ 锚定会漏掉「那你为什么没有」这种最常见的追问 —— 回放里 curious
 # 因此从 14 次直接掉到 0 次，是漏判不是修好。
 _QUESTION_RE = re.compile(r"[？?]|为什么|为啥|怎么(?:回事|会|办|做)|难道|是不是|能不能|真的吗|[吗呢]$")
+
+
+# 心跳计数：只用于日志，不参与任何判定
+_beat = {"n": 0, "cand": 0}
 
 
 def default_state() -> dict:
@@ -157,6 +214,20 @@ def is_directed(text: str, at_bot: bool = False) -> bool:
     return bool(_SECOND_PERSON_RE.search(text))
 
 
+def _match_emoji(text: str) -> str | None:
+    """整条消息就是表情（可带标点/语气词）时，按表情表映射情绪。
+
+    只认「纯 emoji 消息」：混了文字的走词表，避免「😂😂😂这也能行」这类
+    双信号抢闸。优先级跟随 _CANDIDATE_ORDER（angry 的 😡 压过 happy 的 😂）。
+    """
+    if not _EMOJI_ONLY_RE.fullmatch(text):
+        return None
+    for emotion in _CANDIDATE_ORDER:
+        if any(ch in text for ch in _EMOJI_TABLE[emotion]):
+            return emotion
+    return None
+
+
 def _match_emotion(text: str) -> str | None:
     for emotion in _CANDIDATE_ORDER:
         if any(bad in text for bad in _EXCLUDE.get(emotion, ())):
@@ -186,12 +257,34 @@ def extract_candidate(text: str, at_bot: bool = False) -> dict | None:
     if _THIRD_PARTY_RE.search(text) and not at_bot:
         return None  # 在讲别人的事
 
+    # 纯 emoji 消息（😭😭😭 / 😡😡😡）：不要求指向——咆哮表达的是情绪本身。
+    emoji_emotion = _match_emoji(text)
+    if emoji_emotion is not None:
+        if emoji_emotion == "angry":
+            # 纯😡怒喷：无明确指向时按环境氛围档，避免把群友之间互怼
+            # 当真在骂机器人；有指向（@/喊名/带「你」）的 😡 才按攻击最高档。
+            intensity = 2 if not directed else 3
+        elif directed:
+            intensity = 2
+        else:
+            intensity = ENV_INTENSITY
+        return {"emotion": emoji_emotion, "intensity": intensity, "kind": "trigger",
+                "directed": directed, "evidence": text[:100]}
+
     emotion = _match_emotion(text)
     if emotion is None:
         if _LAUGH_RE.fullmatch(text):
             emotion = "happy"
         elif _FILLER_ONLY_RE.fullmatch(text):
             emotion = "awkward"
+        elif CURIOUS_BY_STRUCT and directed and _QUESTION_RE.search(text):
+            # 「指向机器人 + 有疑问结构」就是好奇，不再依赖 _WORDS["curious"]
+            # 那 6 个词。原来 _QUESTION_RE 只被当作附加门槛，从不当触发器，
+            # 于是「昨天有发生什么大新闻吗？」这种 @ 着机器人问的问题一次都不
+            # 触发 —— 本群 1701 条真人语料里，指向机器人的问句有 124 条，
+            # 其中 123 条判 None，整类漏掉。命中率 1.2% -> 7.6% 就是补这一类。
+            # 这也是本项目反复否掉的「枚举词表」反模式的又一次现形。
+            emotion = "curious"
         else:
             return None
 
@@ -207,7 +300,7 @@ def extract_candidate(text: str, at_bot: bool = False) -> dict | None:
     elif directed:
         intensity = 2
     else:
-        intensity = 1  # 环境氛围，只在没有更强情绪时才生效
+        intensity = ENV_INTENSITY  # 环境氛围（无指向），敏感度旋钮
     return {"emotion": emotion, "intensity": intensity, "kind": "trigger",
             "directed": directed, "evidence": text[:100]}
 
@@ -216,8 +309,17 @@ def _ttl(emotion: str) -> float:
     return TTL_BY_EMOTION.get(emotion, 1800.0)
 
 
-def transition(previous: dict, candidate: dict | None, now: float) -> tuple[dict, str]:
-    """纯函数状态转移。返回 (新状态, 原因)，原因直接进审计日志。"""
+def transition(previous: dict, candidate: dict | None, now: float,
+               count_neutral: bool = True) -> tuple[dict, str]:
+    """纯函数状态转移。返回 (新状态, 原因)，原因直接进审计日志。
+
+    count_neutral=False 表示「这次只是过一遍 TTL，不是又来了一条中性消息」。
+    必须区分：inject() 在发请求前也要调本函数，防止把过期情绪塞给模型；但
+    observe() 对同一条消息已经把 neutral_run 加过一次了，inject() 再加一次，
+    NEUTRAL_RUN=2 就实际变成「一条中性消息就清零」—— 情绪寿命凭空少一半，
+    而且只在「机器人这轮回了话」时少（inject 只在有 LLM 请求时跑），
+    表现成时快时慢，是最难查的那种。
+    """
     old = normalize_state(previous)
 
     # ① TTL 到期先落地，保证「过期的旧情绪」不会参与后面的强度比较
@@ -231,6 +333,8 @@ def transition(previous: dict, candidate: dict | None, now: float) -> tuple[dict
     if candidate is None:
         if old["emotion"] == "calm":
             return old, "ttl_expired" if expired else "unchanged"
+        if not count_neutral:      # 只过 TTL，不动 neutral_run
+            return old, "unchanged"
         # ② 连续中性消息把情绪放掉：不是所有清零都该等 TTL
         run = old["neutral_run"] + 1
         if run >= NEUTRAL_RUN:
@@ -283,7 +387,9 @@ def transition(previous: dict, candidate: dict | None, now: float) -> tuple[dict
 def render_context(state: dict) -> str:
     """给模型的注入块。只给情绪，不给台词；小写标签便于 ctxclean 清理。"""
     level = {1: "有一点", 2: "比较", 3: "非常"}.get(int(state.get("intensity", 1)), "有一点")
-    mood = {"happy": "开心", "sad": "低落", "angry": "生气", "curious": "好奇", "awkward": "尴尬"}
+    mood = {"happy": "开心", "sad": "低落", "angry": "生气", "curious": "好奇",
+             "awkward": "尴尬", "excited": "兴奋", "surprised": "震惊",
+             "proud": "得意", "worried": "担心"}
     name = mood.get(state.get("emotion"), "")
     if not name:
         return ""
@@ -312,6 +418,16 @@ def _save(states: dict) -> None:
 def _audit(record: dict) -> None:
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # 审计文件只进不出：实测 192 条就 150KB（每条约 800 字节），按本群
+        # 每天 370 条算是 300KB/天、100MB/年，机器只有 40G，必须封口。
+        # 只留两代（当前 + .1），够回溯几天的判定过程，也不会无限涨。
+        try:
+            if LOG_PATH.stat().st_size > AUDIT_MAX_BYTES:
+                LOG_PATH.replace(LOG_PATH.with_suffix(LOG_PATH.suffix + ".1"))
+                logger.info("[emotion] 审计日志超过 %.1fMB，已轮转一代",
+                            AUDIT_MAX_BYTES / 1048576.0)
+        except FileNotFoundError:
+            pass
         with LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
@@ -349,9 +465,11 @@ class Main(star.Star):
         self.states = _load()
         self._lock = asyncio.Lock()
         logger.info(
-            "[emotion] 已加载：%s 影子=%s 连续中性清零=%d条 TTL(生气/低落/开心/好奇/尴尬)=%.0f/%.0f/%.0f/%.0f/%.0fs",
-            "开" if ENABLED else "关", SHADOW, NEUTRAL_RUN,
-            _ttl("angry"), _ttl("sad"), _ttl("happy"), _ttl("curious"), _ttl("awkward"),
+            "[emotion] 已加载：%s 影子=%s 连续中性清零=%d条 中性地带强度=%d TTL(生气/低落/担心/好奇/震惊/兴奋/开心/得意/尴尬)=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0fs",
+            "开" if ENABLED else "关", SHADOW, NEUTRAL_RUN, ENV_INTENSITY,
+            _ttl("angry"), _ttl("sad"), _ttl("worried"), _ttl("curious"),
+            _ttl("surprised"), _ttl("excited"), _ttl("happy"), _ttl("proud"),
+            _ttl("awkward"),
         )
 
     # ---- 路径 1：每条真人群消息都更新（影子模式下只预测）情绪状态
@@ -373,6 +491,9 @@ class Main(star.Star):
                 return
             at_bot = bool(getattr(event, "is_at_or_wake_command", False))
             candidate = extract_candidate(text, at_bot)
+            _beat["n"] += 1
+            if candidate:
+                _beat["cand"] += 1
             now = time.time()
             async with self._lock:
                 previous = normalize_state(self.states.get(gid))
@@ -393,11 +514,22 @@ class Main(star.Star):
                     gid, SHADOW, previous["emotion"], previous["intensity"],
                     predicted["emotion"], predicted["intensity"], reason, at_bot or bool(candidate and candidate.get("directed")),
                 )
+            elif HEARTBEAT_EVERY and _beat["n"] % HEARTBEAT_EVERY == 0:
+                # 没触发也要留痕，否则「一行不打」到底是没触发还是没在跑分不清
+                logger.info(
+                    "[emotion] 心跳：已评估 %d 条真人消息，其中 %d 条给出情绪候选"
+                    "（%.1f%%），当前 gid=%s 状态 %s(%d)",
+                    _beat["n"], _beat["cand"],
+                    100.0 * _beat["cand"] / max(1, _beat["n"]),
+                    gid, predicted["emotion"], predicted["intensity"],
+                )
         except BaseException as exc:  # 情绪系统永远不该影响群聊
             logger.debug("[emotion] 观察失败：%s", exc)
 
     # ---- 路径 2：请求 LLM 前注入情绪（影子模式下**不注入**）
-    @filter.on_llm_request()
+    # priority=100：输入侧注入组。排在拦截组(armor/merge/decide, priority=2000)
+    # 之后 —— 只有没被拦截时才注入情绪，不再白烧 token。
+    @filter.on_llm_request(priority=100)
     async def inject(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         if not ENABLED or SHADOW:
             return
@@ -409,17 +541,30 @@ class Main(star.Star):
                 return
             async with self._lock:
                 state = normalize_state(self.states.get(gid))
-                # 注入前也要过一次 TTL，别把过期情绪塞给模型
-                state, reason = transition(state, None, time.time())
-                if reason in ("ttl_expired", "neutral_run"):
+                # 注入前也要过一次 TTL，别把过期情绪塞给模型。
+                # count_neutral=False：observe() 对这条消息已经算过中性计数了，
+                # 这里再算一次会把 NEUTRAL_RUN 实际砍半（见 transition 的注释）。
+                state, reason = transition(state, None, time.time(),
+                                           count_neutral=False)
+                if reason == "ttl_expired":
                     self.states[gid] = state
                     _save(self.states)
             block = render_context(state)
             if not block:
                 return
-            req.extra_user_content_parts.append(TextPart(text=block) if TextPart else block)
+            if TextPart is None:
+                # 本文件 46-47 行自己记过这个坑：静默降级最难查。
+                # TextPart 导入不到时往 extra_user_content_parts 里塞裸 str，
+                # 框架那边要么忽略要么报错，而这里什么都不说。
+                # 宁可不注入，也要留一条能看见的日志。
+                if not getattr(self, "_textpart_warned", False):
+                    self._textpart_warned = True
+                    logger.warning(
+                        "[emotion] 拿不到 TextPart，本插件不注入情绪（避免塞裸字符串）")
+                return
+            req.extra_user_content_parts.append(TextPart(text=block))
             logger.info("[emotion] gid=%s 注入情绪=%s(%d)", gid, state["emotion"], state["intensity"])
-        except BaseException as exc:
+        except Exception as exc:
             logger.debug("[emotion] 注入失败：%s", exc)
 
     @filter.command("情绪状态")
