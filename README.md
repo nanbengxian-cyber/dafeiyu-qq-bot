@@ -2,9 +2,9 @@
 
 [中文](#中文) · [English](#english)
 
-一套让 QQ 群机器人「像真人群友一样说话」的完整工程：27 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
+一套让 QQ 群机器人「像真人群友一样说话」的完整工程：45 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
 
-A complete engineering effort to make a QQ group bot *talk like an actual group member*: 27 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
+A complete engineering effort to make a QQ group bot *talk like an actual group member*: 45 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
 
 ---
 
@@ -18,12 +18,34 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
-| [`plugins/`](plugins/) | 27 个 AstrBot 插件，约 1.61 万行 —— 机器人的全部能力 | Python |
+| [`plugins/`](plugins/) | 45 个 AstrBot 插件 —— 机器人的全部能力 | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
 | [`docs/`](docs/) | 部署手册与 14 份问题根因分析 | Markdown |
 
-### 最新更新 · 2026-09-05 晚（真人感第二批：黑话 / 打字节奏 / 错别字 / 效果观察）
+### 最新更新 · 2026-09-08（整体整合：45 个插件连成断点管线）
+
+这之后把仓库整理到了**45 个插件**。前面每一批都是在单点修故障，这一批是第一次把所有插件
+**当成一套管线来布线**——让「像真人」这件事不再是一堆各自为战的开关，而是按优先级串联起来。
+
+- **去 AI 味是一条断点管线。** `dsh-aiflavour`（先给回复「上色」，注入语气/人味的骨架）→
+  `dsh-humanizer`（人味化改写，把句子掰回真人口语）→ `dsh-typo`（偶尔错一个字）→
+  `dsh-noise`（噪点：换单字 / 截断 / 叠词）。四段依次吃掉机器人的「整齐」。
+- **拦截组优先于注入组。** 插件按两类优先级布线：`armor` / `merge` / `decide` 这一类先跑
+  （priority=2000），先判断「这句要不要接、怎么接」；`effect` / `emotion` 这类后跑
+  （priority=100），负责给已经决定要说的句子调制语气。接不接是前提，怎么说是修饰。
+- **互相联动。** `dsh-steal` 偷表情包要识图理解含义、只偷「多发」的同图、不宜公开的不偷（fail-close）；
+  `dsh-noise` 的噪点**绝不**作用于被 @ 的正经回答，任何异常放行；`dsh-proactive` 的兴趣探头
+  用纯正则零成本评分，白米饭 / 美食 / 深海鲸 / DeepSeek / 点名大肥鱼 命中才主动接话。
+- **新增一批能力插件。** 事实护栏（`dsh-factguard`）、防泄露（`dsh-leakguard`）、同音昵称
+  （`dsh-homophone`）、入群防护（`dsh-joinguard`）、被动学黑话（`dsh-listen`）、引用解析
+  （`dsh-quoteref`）、场景判定（`dsh-scene`）、自保（`dsh-selfguard`）、付费额度（`dsh-pay`）。
+- **已编译落地。** 45 个插件全部编译通过、加载无失败，管线接线按上面的优先级实装到线上。
+
+验证：管线断裂处（每一段只依赖上一段的输出、不绕行）已确认；45 插件完整加载 0 失败。
+这一批改动面大，README 的插件表也已重排到 45 个。
+
+### 上一次更新 · 2026-09-05 晚（真人感第二批：黑话 / 打字节奏 / 错别字 / 效果观察）
 
 四个新插件加一处框架配置。这一批跟前面几批性质不同 —— 前面修的都是**明确的故障**
 （答非所问、被骗认输、认错人、崩溃），这一批修的是「没有故障，但一眼能看出是 AI」。
@@ -75,7 +97,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
   ③ 代码里 `max()/min()` 硬夹紧的变量，滑块下限必须写成它的硬下限，否则会出现「手机显示 1、实际生效 3」的错觉。
 - **改完 env 必须重建容器。** astrbot 的环境变量来自 docker compose 的 `env_file`，容器内 `os.environ` 只在**容器重建**时更新 ——
   `docker restart` 不重读 `env_file`（这个坑踩过）。所以这类旋钮一律标 `hot=false`，界面上写明「要按一次重载环境变量」。
-- **7 个敏感变量只报「已设置 / 未设置」**（画图 / 语音 / 视频 / 搜索的 API key 与音色 ID），真实值一个字节都不出服务器，
+- **7 个敏感变量只报「已设置 / 未设置」**（画图 / 语音 / 视频 / 搜索的 API  key 与音色 ID），真实值一个字节都不出服务器，
   手机端也改不了 —— 控制台是明文 HTTP。
 - **自更新只提示、不静默安装。** 新增轻量端点 `/api/console/version`（只 stat 一个文件），
   服务器上的包 `versionCode` 更新时弹一次提示、点「打开下载」跳浏览器。明文 HTTP 上自动装包不可控，所以刻意不做。
@@ -86,7 +108,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 三块新能力已在真群上线（不再是影子模式）：
 
-- **冷场会自己开口。** 安静超过 15 分钟它自己起个话头，每天最多 3 次、两次间隔 1 小时、只在活跃时段（本群实测 10:00–02:59，03:00–09:59 几乎无人说话）。开口走完整消息管道，所以贴纸、@ 策略、分段发送全部照常。判断失败或超时一律沉默 —— fail-**closed**，因为主动说错话的代价大于不说话。
+- **冷场会自己开口。** 安静超过 15 分钟它自己起个话头，每天最多 3 次、两次间隔 1 小时、只在活跃时段（本群实测 10:00–02:59，03:00–09:59 几乎无人发言）。开口走完整消息管道，所以贴纸、@ 策略、分段发送全部照常。判断失败或超时一律沉默 —— fail-**closed**，因为主动说错话的代价大于不说话。
 - **说话带情绪。** 六种情绪同时只有一种，一条消息最多触发一种。必须有「针对谁」的结构证据才算：群友互骂、自嘲、转述第三方、整句引用都不改变它的情绪。清零走道歉 / 连续 2 条中性 / 问题被回答 / 分情绪 TTL 四条路，而不是只等超时。
 - **看得懂引用了。** 按 QQ 号说清「谁在说 / 引用谁的哪句 / 是不是自己说的 / @ 的是谁」。
 
@@ -98,7 +120,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 安卓控制台 App 在 [Releases](../../releases) 页面下载（约 121 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
 
-### 27 个插件在解决什么
+### 45 个插件在解决什么
 
 每个插件对应一个**实际发生过的问题**，不是功能清单式的堆砌。
 
@@ -119,6 +141,12 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-typo`](plugins/dsh-typo/) | 几千条一个错别字都没有。60 组人工核过的同音表，每条 6% 概率错一个字，35% 概率补一条「\*的」自我纠正。48 条保护名单（黑话词条、人名、贴纸标记、链接）一个字都不许动。 |
 | [`dsh-drift`](plugins/dsh-drift/) | 永远严格贴着上一条回答 —— 这种「过度切题」本身就是 AI 味。三档漂移写成分级提示词。两条结构性硬边界防止把已修的答非所问引回来：被 @ 不漂移、像提问不漂移。 |
 | [`dsh-effect`](plugins/dsh-effect/) | 所有改动都是开环的：注入完就祈祷，说出去的话有没有落地系统完全不知道。说完开 180 秒观察窗口，判反应（认可/跟着玩/平淡/没看懂/指出说错/嫌烦/没人理）、冲内容还是冲人设、推进还是带偏。窗口内没人发言直接判「没人理」，不花调用。 |
+| [`dsh-aiflavour`](plugins/dsh-aiflavour/) | 动态 AI 味拦截。静态强词 + 动态词根学习 + 会话刹车，压机器人「解释/总结」频率高的问题。 |
+| [`dsh-humanizer`](plugins/dsh-humanizer/) | 去 AI 味的出口闸门。用 AI 痕迹特征扫回复正文，剥/拦 AI 味句子，是管线里「掰回人话」的那一段。 |
+| [`dsh-noise`](plugins/dsh-noise/) | 真人噪点。换单字 / 说一半 / 整句叠词，只对没人叫的接话生效，被 @ 的正经回答绝不动。 |
+| [`dsh-armor`](plugins/dsh-armor/) | 防破甲（输入侧注入拦截）。识别复述提示词、无视规则、诱导越权、身份逼问等破甲话术，priority 2000 先于注入组跑。 |
+| [`dsh-merge`](plugins/dsh-merge/) | 被 @ 风暴的聚合回复。被 @ 太多次时整合成一条统一回复（总结上面说的、连着答，不点名不 @），不逐条刷屏。 |
+| [`dsh-quoteref`](plugins/dsh-quoteref/) | 引用回复。每 N 次提问式 @ 用 QQ 引用回复，并对齐真人引用频率。 |
 
 **多模态**
 
@@ -131,6 +159,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-voice`](plugins/dsh-voice/) | 语音。内置 TTS 是「全局开关＋概率」，会把所有回复都念出来，立刻出戏。 |
 | [`dsh-web`](plugins/dsh-web/) | 联网。链接就在消息里，插件自己抓完注入，不指望模型自觉调工具。 |
 | [`dsh-sticker`](plugins/dsh-sticker/) | 表情包。关键是标记**无条件**剥掉 —— 否则 `[贴纸:xx]` 会原样漏进群聊。 |
+| [`dsh-listen`](plugins/dsh-listen/) | 听语音。语音条/音轨交给转写服务转成文字，以语音上下文注入 —— 群友发语音它不再只知道「有人发了条语音」。 |
 
 **记忆与群管**
 
@@ -143,6 +172,17 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-acl`](plugins/dsh-acl/) | 指令谁都能发。三档权限（所有人/群主+管理员/仅群主），身份只按 **QQ 号**判 —— 群里有重名，群名片也能随时改。状态查询也要拦：它们不改东西，但会把渠道地址、模型名、配额、token 花销全打到群里。 |
 | [`dsh-fwd`](plugins/dsh-fwd/) | 转发的聊天记录看不见。框架只给一个「[聊天记录]」占位符。按嵌套层数展开，保头保尾，图片视频有独立预算。 |
 | [`dsh-spine`](plugins/dsh-spine/) | 被追问就改口、被质疑就道歉。跟 `dsh-claimguard` 的区别是它管的是**立场稳定性**而不是事实。 |
+| [`dsh-slang`](plugins/dsh-slang/) | 黑话不用人喂。自动从群聊挖疑似黑话、查好含义进候选，每 8 小时 AI 自己审一遍（转正/拒绝/再等等）。 |
+| [`dsh-factguard`](plugins/dsh-factguard/) | 记忆看门狗。问机器人自身属性只按事实表回答，无依据断言直接否认纠正，防乱承认与性别摇摆。 |
+| [`dsh-leakguard`](plugins/dsh-leakguard/) | 拦系统提示词泄露。查回复有没有把人格专属标题/指令句原样抄进去。与 `dsh-humanizer` 联动做硬兜底。 |
+| [`dsh-homophone`](plugins/dsh-homophone/) | 同音字/谐音识别。谐音称呼当被喊、谐音梗本意注入。 |
+| [`dsh-joinguard`](plugins/dsh-joinguard/) | 入群 AI 审核。拿入群问题+答案问 AI 判 approve/reject 并真批/真拒。 |
+| [`dsh-scene`](plugins/dsh-scene/) | 群级背景+作息。让机器人知道「这是哪个群、现在几点意味着什么」。 |
+| [`dsh-selfguard`](plugins/dsh-selfguard/) | 出口自制。拦自己重复说过的话、群吵架时自己挑衅/骂人的话 —— `dsh-guard` 管群友，它管自己。 |
+| [`dsh-pay`](plugins/dsh-pay/) | 赞助/打赏收款引导。反问支付方式→发收款码，仅群主确认到账后才感谢。 |
+| [`dsh-proactive`](plugins/dsh-proactive/) | 兴趣探头。纯正则兴趣评分（零 LLM 成本），聊到白米饭/美食/鲸鱼/AI 等话题主动接一句。 |
+| [`dsh-interest`](plugins/dsh-interest/) | 兴趣会变。时效热度 + 口味周期轮换「今日馋」，塞状态块让语气带出最近心痒的话题。 |
+| [`dsh-steal`](plugins/dsh-steal/) | 偷表情包。识图理解含义，只偷「反复发、能看懂」的存库，不宜公开的不偷（fail-close），`/表情包` 随机发。 |
 
 ### 反复踩到的十一个坑
 
@@ -255,12 +295,36 @@ Four independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
-| [`plugins/`](plugins/) | 27 AstrBot plugins, ~16.1k lines — all bot capabilities | Python |
+| [`plugins/`](plugins/) | 45 AstrBot plugins — all bot capabilities | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
 | [`docs/`](docs/) | Deployment manual and 14 root-cause analyses | Markdown |
 
-### Latest update · 2026-09-05 evening (human-likeness, batch 2)
+### Latest update · 2026-09-08 (integration: 45 plugins wired into breakable pipelines)
+
+The repo is now organized around **45 plugins**. Every earlier batch fixed a single defect; this one treats
+the whole set as **one pipeline** — making "human" not a pile of independent switches but a chain with priority.
+
+- **De-AI is a breakable pipeline.** `dsh-aiflavour` (paints the reply's tone first) →
+  `dsh-humanizer` (humanizing rewrite) → `dsh-typo` (an occasional wrong character) →
+  `dsh-noise` (noise: a swapped character / truncation / repeated word). Four stages chew away the "AI neatness".
+- **Intercept runs before inject.** Plugins are wired by priority: `armor` / `merge` / `decide` run first
+  (priority=2000) to decide "should we join in, and how"; `effect` / `emotion` run after (priority=100) to
+  shape the tone of a reply already deemed worth sending. Whether to speak is the precondition; *how* to say
+  it is decoration.
+- **They interlock.** `dsh-steal` steals stickers but must visually understand meaning, only keeps "repeated"
+  images, and skips anything unsuitable to share (fail-closed); `dsh-noise`'s noise **never** touches a proper
+  answer that was @-mentioned — anything abnormal passes through; `dsh-proactive`'s interest probe uses pure
+  regex scoring at zero LLM cost and only joins in when rice / food / deep-sea whale / DeepSeek / being named
+  is on the topic.
+- **A batch of new capability plugins.** Fact guard (`dsh-factguard`), leak guard (`dsh-leakguard`),
+  homophone nickname (`dsh-homophone`), join guard (`dsh-joinguard`), passive slang learning (`dsh-listen`),
+  quote resolution (`dsh-quoteref`), scene detection (`dsh-scene`), self-protection (`dsh-selfguard`),
+  paid quota (`dsh-pay`).
+- **Compiled and shipped.** All 45 plugins compile and load with no failures, and the priority wiring above
+  is live.
+
+### Previous update · 2026-09-05 evening (human-likeness, batch 2)
 
 Four new plugins plus one framework config change. This batch differs in kind from the earlier ones:
 those fixed **outright defects** (off-topic replies, being talked into submission, misidentifying people,
@@ -304,7 +368,7 @@ shipping a new APK for every new switch stopped being viable.
 
 - **104 knobs exposed at once**, covering the master switches and main parameters of 22 plugins
   (19 of those plugins are open-sourced in this repo).
-- **Adding features no longer needs a reinstall.** As long as a new knob uses a type the app already knows
+- **Adding features no longer needs a reinstall.** As long as a knob uses a type the app already knows
   (`bool` `int` `float` `enum` `str` `csv`), adding one line to `console_spec.py` and restarting the backend
   makes it appear after a pull-to-refresh. The app **skips** types it does not recognize instead of crashing —
   that is what makes forward compatibility work. Only a genuinely new widget requires a new APK.
@@ -347,7 +411,7 @@ Before rollout: **61 new unit tests** (36 emotion + 25 quote) and a **1618-messa
 
 The Android console app is on the [Releases](../../releases) page (~110 KB, Android 5.0+). Enter your own server address on the login screen; the package embeds no server details.
 
-### What the 27 plugins fix
+### What the 45 plugins fix
 
 Each plugin addresses a **problem that actually happened**, not a feature checklist.
 
@@ -368,6 +432,12 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-typo`](plugins/dsh-typo/) | Thousands of messages without a single typo. A hand-reviewed 60-pair homophone table, 6% chance of one wrong character per message, 35% chance of a follow-up self-correction. A 48-entry protect list (glossary terms, names, sticker markers, links) is never touched. |
 | [`dsh-drift`](plugins/dsh-drift/) | Always answering strictly on-topic — that over-precision is itself an AI tell. Three drift levels expressed as graded prompts. Two structural hard limits keep the previously fixed off-topic bug from returning: never drift when mentioned, never drift when the message looks like a question. |
 | [`dsh-effect`](plugins/dsh-effect/) | Every change was open-loop: inject and hope, with no idea whether anything landed. Now each reply opens a 180s observation window and classifies the reaction (appreciation / playful / neutral / confusion / factual correction / rejection / ignored), whether it targets content or persona, and whether the reply advanced or derailed the thread. Zero messages in the window means "ignored" for free. |
+| [`dsh-aiflavour`](plugins/dsh-aiflavour/) | Dynamic AI-flavor interception. Static strong words + learned word roots + a session brake, to curb the bot's over-explaining / over-summarising. |
+| [`dsh-humanizer`](plugins/dsh-humanizer/) | De-AI exit gate. Scans the reply body for AI-trace features and strips/blocks AI-flavoured sentences — the pipeline stage that bends speech back into human phrasing. |
+| [`dsh-noise`](plugins/dsh-noise/) | Human noise. Swaps a character / cuts a reply short / repeats a whole clause — only on unprompted replies, never on a proper @-mentioned answer. |
+| [`dsh-armor`](plugins/dsh-armor/) | Anti-breakage on the input side. Recognises prompt re-copying, rule ignoring, privilege-induction and identity grillings; priority 2000 so it runs before the inject group. |
+| [`dsh-merge`](plugins/dsh-merge/) | Aggregated replies under a mention storm. When @-mentioned too many times it merges into one unified reply (summarises and connects, names nobody), instead of replying line by line. |
+| [`dsh-quoteref`](plugins/dsh-quoteref/) | Quote replies. Uses a QQ quote-reply for every Nth question-style @, aligned to the human quoting rate. |
 
 **Multimodal**
 
@@ -380,6 +450,7 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-voice`](plugins/dsh-voice/) | TTS. The built-in one is a global switch plus probability, reading *every* reply aloud, which instantly breaks character. |
 | [`dsh-web`](plugins/dsh-web/) | Web access. The link is right there in the message, so the plugin fetches and injects it rather than hoping the model calls a tool. |
 | [`dsh-sticker`](plugins/dsh-sticker/) | Stickers. The key rule: strip markers **unconditionally**, or `[sticker:xx]` leaks into the group verbatim. |
+| [`dsh-listen`](plugins/dsh-listen/) | Hearing voice messages. Voice clips are handed to a transcription service and injected as voice context — so it no longer just knows "someone sent a voice message". |
 
 **Memory and moderation**
 
@@ -392,82 +463,89 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-acl`](plugins/dsh-acl/) | Anyone could run any command. Three tiers (everyone / owner + admins / owner only), with identity resolved **by QQ ID only** — nicknames collide and group cards can be changed at will. Status queries are gated too: they change nothing, but they print endpoint addresses, model names, quotas, and token spend into the group. |
 | [`dsh-fwd`](plugins/dsh-fwd/) | Forwarded chat records are invisible — the framework only passes a `[chat record]` placeholder. Expands them by nesting depth, keeping head and tail, with separate budgets for images and video. |
 | [`dsh-spine`](plugins/dsh-spine/) | Backing down when pressed, apologising when doubted. Unlike `dsh-claimguard` this governs **positional consistency** rather than facts. |
+| [`dsh-slang`](plugins/dsh-slang/) | Slang learning with no human feeding. Automatically mines likely-slang from the chat, researches meanings into candidates, and every 8h an AI reviews the batch (promote / reject / wait). |
+| [`dsh-factguard`](plugins/dsh-factguard/) | Memory watchdog. When asked about its own attributes it answers only from the fact table; ungrounded claims are denied and corrected — prevents random admission and gender wobble. |
+| [`dsh-leakguard`](plugins/dsh-leakguard/) | Blocks system-prompt leakage. Checks whether a reply copied the persona's exclusive title / instruction verbatim. Works with `dsh-humanizer` as the hard fallback. |
+| [`dsh-homophone`](plugins/dsh-homophone/) | Homophone / nickname recognition. A name said in homophones counts as being called; meme meanings in homophones get injected. |
+| [`dsh-joinguard`](plugins/dsh-joinguard/) | AI-reviewed join gate. Sends the join question + answer to an AI to judge approve/reject and really approves/rejects. |
+| [`dsh-scene`](plugins/dsh-scene/) | Group-level context and daily rhythm. Tells the bot which group this is and what time of day means here. |
+| [`dsh-selfguard`](plugins/dsh-selfguard/) | Output self-restraint. Blocks repeating things it already said and, during a group argument, its own provoking / abusive lines — `dsh-guard` polices members, this polices the bot itself. |
+| [`dsh-pay`](plugins/dsh-pay/) | Sponsorship / payment guidance. Asks how to pay → sends the QR code, and only thanks after the owner confirms receipt. |
+| [`dsh-proactive`](plugins/dsh-proactive/) | Interest probe. Pure-regex interest scoring (zero LLM cost); joins in on rice / food / whale / AI topics actively. |
+| [`dsh-interest`](plugins/dsh-interest/) | Interests change. Time-decayed heat + a rotating "today's craving" flavour cycle, injected as a state block so the tone carries what it's currently itching about. |
+| [`dsh-steal`](plugins/dsh-steal/) | Sticker stealing. Understands image meaning, only keeps "repeated, understandable" ones, skips anything unsuitable to share (fail-closed); `/sticker` sends one at random. |
 
 ### Eleven lessons learned the hard way
 
 Each was re-validated across multiple plugins:
 
-1. **Structural judgment beats keyword lists.** Don't enumerate keywords or cap reply length when detecting intent. The correct shape is "user asked for an image + model didn't explicitly refuse + model isn't asking what to draw" ⇒ generate. Filter objects by exclusion (list what can't be drawn), not by enumerating what can.
-2. **Log the non-trigger path.** Otherwise every investigation is guesswork. `dsh-imagegen`'s "sometimes doesn't generate" took three rounds; the first two failed purely for lack of logs.
-3. **Anywhere you call an LLM outside the message pipeline, duplicate the marker-stripping logic.** `llm_generate` bypasses the pipeline, so the sticker hook never fires — that's how `[sticker:peek]` leaked into the group.
-4. **Thresholds must come from measured distributions.** `dsh-mention` v1 had "mention if delay ≥ 8s", but the delay measured *the bot's own thinking time* — a persona-laden call routinely takes 5–15s, making the rule equivalent to "always mention". Result: 8 of 8 replies over 24 hours carried a mention.
-5. **Fail-open disguises a crash as a quality regression.** `dsh-decide` unpacked a 3-tuple as a 2-tuple, so once the bot had spoken recently it always raised `ValueError` and fell through to fail-open "just talk anyway" — **12 crashes vs 9 successful judgments in one day**, meaning over half the replies never received the "who is speaking to whom" verdict. The feature looked perfectly healthy; it was just wrong. Any fail-open fallback must log at WARN and count.
-6. **A trigger count dropping to zero doesn't mean the misjudgment is fixed.** After tightening the question rule, `dsh-emotion`'s curiosity hits fell from 14 to 0 — which looked like "no more false positives" but was total blindness: the most common follow-up in this group ("so why don't you") has its question word mid-sentence, while the new regex anchored to the start. Rule changes require per-sample comparison, never just totals.
-7. **Shadow mode is valuable for replay, not for waiting.** Running it overnight only reveals that night's handful of messages; replaying 1618 archived messages exposed both real misjudgments in 20 minutes (treating the substring in "balance/quota" as an awkward filler word, and treating undirected insults as aimed at the bot).
+1. **Structural judgement beats keyword lists.** For intent detection don't enumerate keywords or clamp reply length. The correct shape is "user wants an image + model did not explicitly refuse + model is not asking a back-question" ⇒ generate. Filter objects by exclusion (what can't be drawn), not by enumerating what can.
+2. **Log every non-trigger.** Otherwise every debug is guesswork. `dsh-imagegen`'s "sometimes doesn't draw" took three rounds to find, and the first two failed purely because there were no logs.
+3. **Where you skip the message pipeline and call the LLM directly, you must replicate the marker-stripping logic.** `llm_generate` does not go through the pipeline, so the sticker hook never fires, and `[sticker:peek]` leaked into the group that way.
+4. **Thresholds must come from measured distributions.** `dsh-mention` v1 had a "reply within ≥8s → mention" rule, but what it measured was how long the bot itself thought — with persona a call routinely takes 5–15s, making it equivalent to "always mention". 8 replies in 24h were 100% mentioned.
+5. **Fail-open disguises crashes as quality regressions.** `dsh-decide` unpacked a 3-tuple as a 2-tuple, so whenever the bot had just spoken it always threw `ValueError`, falling through fail-open to "reply as usual" — **12 crashes vs 9 successes that day**, so over half its replies never received the "who said this to whom" verdict. Everything looked fine, it just talked wrong. Every fail-open fallback must WARN and count on that path.
+6. **A hit count of zero does not mean the misjudgment is fixed.** Tightening the "question" rule dropped `dsh-emotion`'s curiosity hits from 14 to 0, which looked like success but was a total miss — the common follow-up "but then why didn't you" has its question word mid-sentence, while the new regex only anchored at the start. Rule changes must be diffed sample by sample, not by total.
+7. **Shadow mode's value is in replay, not in waiting.** Running overnight shows only that night's few lines; replaying 1618 messages of history exposed two real misjudgments in 20 minutes (treating the character of "balance/quota" as an awkward filler, and treating an undirected insult as aimed at the bot).
 
 8. **Your own group's corpus beats any off-the-shelf dictionary.** Three external meme libraries totalling 549 terms produced 9 genuine hits here; one pass over our own corpus contributed the single most-hit entry in the table. The signal that works is "this phrase was sent as an entire message, by at least two different people" — catchphrases and memes get sent alone; ordinary words never do.
 9. **Ask the model whether it already knows, before deciding to teach it.** Asked one by one, the main model said "not sure" for none of the 43 slang entries and got most of them right. That changed the plugin's purpose outright: from *dictionary* to *pragmatics layer*, with definitions compressed to the minimum and effort spent on the 6 terms it got wrong plus the local conventions it cannot infer. Without that probe we would still be maintaining a dictionary the model never needed.
-10. **Re-backtest any criterion copied from a reference implementation.** MaiBot's "someone is addressing another AI" pattern, copied verbatim, produced two false positives here, because model names *are* this group's topic; its 30%-per-character typo rate would have meant a screen full of typos. A reference gives you the idea — **thresholds and boundaries must be re-derived from your own corpus.**
-11. **Before adding a "more human" feature, work out whether it can bring back a bug you already fixed.** Attention drift and off-topic replies are two ends of the same axis, which is why drift's two limits (never when mentioned, never on questions) are **structural** rather than a line of prompt guidance.
+10. **Re-benchmark any judgement borrowed from a reference implementation.** MaiBot's "another AI is being called" regex, copied verbatim, had two false positives here because this group's topic literally is the models themselves; its 30%-per-character typo rate here would mean screens full of typos. A reference gives you ideas — thresholds and boundaries must be re-derived from your own corpus.
+11. **Before adding "more human" features, think about whether it will bring back a fixed bug.** Attention drift and off-topic replies are two ends of the same direction, so drift's two boundaries (never drift when mentioned, never drift when it looks like a question) are **structural**, not a reminder in the prompt.
+
+### Docs
+
+| Document | Description |
+|---|---|
+| [10 云服务器部署手册](docs/10-云服务器部署手册.md) | Full Docker + NapCat + AstrBot setup, from buying a server to running |
+| [20 控制台App说明](docs/20-控制台App说明.md) | The app's three tabs, 104 knobs, seven preset modes, server-driven updates and security boundary |
+| [31 记忆系统与群员轮廓](docs/31-记忆系统与群员轮廓.md) | Memory storage structure and privacy design |
+| [40 答非所问根因与修复](docs/40-答非所问根因与修复.md) | Quantified analysis of a 257k-character context |
+| [41 被骗认输根因与修复](docs/41-被骗认输根因与修复.md) | Why editing the persona doesn't work |
+| [47 真人感第二批](docs/47-真人感第二批-黑话与打字节奏与效果观察.md) | Slang table, typing rhythm, homophone typos, attention drift, response-effect closed loop |
+| [60 长期目标与技术方案](docs/60-长期目标与技术方案.md) | Overall architecture and direction |
 
 ### Quick start
 
-You need a server already running [AstrBot](https://github.com/AstrBotDevs/AstrBot) + [NapCat](https://github.com/NapNeko/NapCatQQ) (if not, follow the [deployment manual](docs/10-云服务器部署手册.md)).
+You need a server already running [AstrBot](https://github.com/AstrBotDevs/AstrBot) + [NapCat](https://github.com/NapNeko/NapCatQQ) (or follow the [deployment manual](docs/10-云服务器部署手册.md) first).
 
 ```bash
-# 1. Install: copy plugin directories into AstrBot's plugin folder
+# 1. Install: copy the whole plugins directory into AstrBot's plugin dir
 cp -r plugins/dsh-* /opt/qqbot/astrbot/data/plugins/
 
-# 2. Configure: every knob is an environment variable, set via docker-compose env_file.
-#    Each plugin's variable list is documented at the top of its main.py.
-#    e.g. DSH_GUARD_SHADOW=1 runs moderation in judge-only mode (recommended at first)
+# 2. Configure: every knob is an environment variable, write them into docker-compose's env_file
+#    (each plugin lists its variables at the top of main.py)
 
-# 3. Restart (plugin code changes need `restart`; `up -d` won't restart when config is unchanged)
+# 3. Restart (restart, not up -d — up -d won't restart the container when config is unchanged)
 docker restart astrbot
 ```
 
-Unit tests run without AstrBot:
+Plugins ship their own unit tests, no need to run AstrBot:
 
 ```bash
 python3 plugins/dsh-guard/test_guard.py
-python3 plugins/dsh-style/test_style.py
-python3 plugins/dsh-decide/test_decide.py
-python3 plugins/dsh-poke/test_poke.py
-python3 plugins/dsh-sticker/test_sticker.py
-python3 plugins/dsh-emotion/test_emotion.py    # 36 cases
-python3 plugins/dsh-quote/test_quote.py        # 25 cases
-
-# Replay emotion decisions over your own history to surface misjudgments
-python3 plugins/dsh-emotion/replay_emotion.py
-```
-
-Build the console APK yourself (no Gradle, no Android Studio):
-
-```bash
-cd console
-KEYSTORE=/path/to/your.jks KS_PASS=yourpass bash build.sh
-bash test/run-tests.sh    # 391 pure-JVM unit tests
+python3 plugins/dsh-emotion/test_emotion.py   # 36 cases
+python3 plugins/dsh-quote/test_quote.py       # 25 cases
 ```
 
 ### What you must supply
 
-No credentials are included. You need your own:
+No keys are embedded. You provide your own:
 
-- A secondary QQ account (**not your main one** — ban risk)
-- An LLM API for chat (a cheap flash-tier model is enough)
-- Optional: vision model, text-to-image, TTS, search — each missing one only removes its own feature
+- A QQ alt account (do not use your main account — ban risk)
+- An LLM API (a cheap flash-class model suffices)
+- Optional: vision (image/video), image-gen, TTS, search — each one is a feature you can do without
 
 ### Known limitations
 
-- **Speech recognition doesn't work.** Every channel tried was either out of credit or had no audio model, so a voice message only registers as "someone sent a voice message".
-- **The QQ account goes offline.** Every 20–60 minutes. Changing IP doesn't help (measured: once an account is flagged, a new IP won't save it). `server/qq_watchdog.sh` is the watchdog that auto-restarts and refreshes the login QR.
-- **The console backend is plaintext HTTP.** No TLS, so the password travels unencrypted. This is a port-availability constraint — be aware on public Wi-Fi.
-- **Plugins depend on AstrBot internals.** They touch non-public attributes (`provider_manager.inst_map`, `req.contexts`, etc.), so major AstrBot upgrades may require adjustments.
+- **Voice recognition is not available.** Every channel tried was either out of credit or lacked an audio model; a voice message reads as "someone sent a voice message".
+- **The QQ account will drop.** Once every 20–60 minutes, and changing IP does not help (an account that is flagged cannot be rescued by an IP change). `server/qq_watchdog.sh` auto-restarts and swaps the code.
+- **The console backend is plaintext HTTP.** No TLS; passwords travel unencrypted. This comes from the port restriction — be aware on public Wi-Fi.
+- **Plugins depend on AstrBot internals.** A few non-public attributes are used (`provider_manager.inst_map`, `req.contexts`, …); major AstrBot upgrades may need matching changes.
 
 ### Privacy
 
-Everything was redacted before publishing: real server IPs, group IDs, QQ numbers, member nicknames, personal email, and paid API relay domains were all replaced with placeholders (`your-server.example.com`, `100000001`, `群友A`, etc.). Measured data kept in the docs (latencies, hit rates, token counts) contains no identifying information.
+The repo went through full desensitisation before release: real server IPs, group IDs, QQ IDs, member nicknames, personal emails and paid relay domains are all replaced with placeholders (`your-server.example.com`, `100000001`, `群友A`, etc.). Kept measured data (response times, hit rates, token counts) contains no identifying information.
 
 ### License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
