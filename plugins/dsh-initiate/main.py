@@ -77,7 +77,7 @@ ENABLED = _flag("DSH_INITIATE")
 SHADOW = _flag("DSH_INITIATE_SHADOW")
 GROUPS = {
     g.strip()
-    for g in os.environ.get("DSH_INITIATE_GROUPS", "").split(",")
+    for g in os.environ.get("DSH_INITIATE_GROUPS", "100000001").split(",")
     if g.strip()
 }
 IDLE_MIN = max(60.0, float(os.environ.get("DSH_INITIATE_IDLE", "900")))
@@ -104,7 +104,7 @@ TIMEZONE = os.environ.get("DSH_INITIATE_TZ", "Asia/Shanghai")
 HOURS = os.environ.get("DSH_INITIATE_HOURS", "10-23,0-2")
 LOOKBACK = max(3, min(20, int(os.environ.get("DSH_INITIATE_LOOKBACK", "8"))))
 TIMEOUT = max(5.0, float(os.environ.get("DSH_INITIATE_TIMEOUT", "25")))
-OWNER = os.environ.get("DSH_INITIATE_OWNER", "").strip()
+OWNER = os.environ.get("DSH_INITIATE_OWNER", "2774000001").strip()
 DB_PATH = os.environ.get("DSH_INITIATE_DB", "/AstrBot/data/dsh_memory.db")
 STATE_PATH = Path(
     os.environ.get("DSH_INITIATE_STATE", "/AstrBot/data/dsh_initiate_state.json")
