@@ -123,160 +123,212 @@ def _split_stickers(text: str) -> tuple[str, list[str]]:
     """
     tags = STICKER_RE.findall(text or "")
     if not tags:
-        return (text or ""), []
-    clean = STICKER_RE.sub("", text).strip()
+        return (text or "").strip(), []
+    cleaned = STICKER_RE.sub("", text or "").strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
     paths = []
     for t in tags:
         p = _resolve_sticker(t)
         if p:
             paths.append(p)
-    return clean, paths
+        else:
+            logger.debug("[welcome] 未知贴纸名，仅剥除标记: %r", t)
+    return cleaned, paths
 
 
-async def _fetch_name(context, uid: str, gid: str) -> str:
-    """尽量拿真昵称。拿不到返回空串。"""
-    try:
-        # 走注册的 OneBot API：get_group_member_info
-        api = context.get_platform_api("aiocqhttp")
-        if not api:
-            return ""
-        # aiocqhttp 适配器的 api 是某种包装，试着按常见形状调
-        for fn in ("get_group_member_info",):
-            f = getattr(api, fn, None)
-            if not f:
-                continue
-            if asyncio.iscoroutinefunction(f):
-                info = await f(group_id=int(gid), user_id=int(uid))
-            else:
-                info = f(group_id=int(gid), user_id=int(uid))
-            if isinstance(info, dict):
-                return info.get("card") or info.get("nickname") or ""
-            # 可能是 (status, dict) 元组
-            if isinstance(info, (tuple, list)) and len(info) >= 2:
-                d = info[-1]
-                if isinstance(d, dict):
-                    return d.get("card") or d.get("nickname") or ""
-    except BaseException as e:
-        logger.debug("[welcome] 拿昵称失败 uid=%s: %s", uid, e)
-    return ""
+def _raw_get(raw, key, default=None):
+    """notice 的 raw_message 可能是 dict 也可能是对象，统一取值。"""
+    if raw is None:
+        return default
+    if hasattr(raw, "get"):
+        try:
+            return raw.get(key, default)
+        except BaseException:
+            pass
+    return getattr(raw, key, default)
+
+
+class GroupIncreaseFilter(CustomFilter):
+    """只放行 OneBot group_increase（有人进群）通知。"""
+
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        raw = getattr(event.message_obj, "raw_message", None)
+        return (
+            _raw_get(raw, "post_type") == "notice"
+            and _raw_get(raw, "notice_type") == "group_increase"
+        )
+
+
+def _prune() -> None:
+    """清掉过期的去重记录，别让字典无限长。"""
+    now = time.time()
+    for k in [k for k, ts in _welcomed.items() if now - ts > DEDUP_TTL * 2]:
+        _welcomed.pop(k, None)
 
 
 class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[welcome] 已加载：%s 去重%.0fs 冷却%.0fs 延迟%.0f~%.0fs 群=%s",
-            "开" if WELCOME_ENABLED else "关", DEDUP_TTL, GROUP_COOLDOWN,
-            DELAY_MIN, DELAY_MAX, "、".join(ONLY_GROUPS) or "全部",
+            "[welcome] 已加载：开关=%s 去重=%.0fs 冷却=%.0fs 延迟=%.0f~%.0fs 限定群=%s",
+            "开" if WELCOME_ENABLED else "关",
+            DEDUP_TTL,
+            GROUP_COOLDOWN,
+            DELAY_MIN,
+            DELAY_MAX,
+            ONLY_GROUPS or "全部",
         )
 
-    @filter.custom_filter(CustomFilter(
-        # OneBot V11 group_increase 通知的原始特征都会被 AstrBot 剥掉，
-        # 适配器只留下一个 type=GROUP_MESSAGE 的空消息对象。所以只能靠
-        # raw_message 里有 group_increase 字样来认（这个字段会被透传）。
-        # 带 try：不同适配器/版本字段形状不一样，宁可放过也不要炸。
-        check=_raw_has_group_increase,
-    ))
-    async def on_new_member(self, event: AstrMessageEvent):
-        """新成员入群：生成欢迎词并发出。"""
+    async def _member_name(self, event: AstrMessageEvent, gid: str, uid: str) -> str:
+        """尽量取到新成员的群名片/昵称；取不到返回空串。"""
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return ""
+        try:
+            # 同 imgctx：多连接时不传 self_id 会 ApiNotAvailable。
+            # 入群欢迎是 notice 事件，同样已离开 websocket 上下文。
+            _sid = str(getattr(event.message_obj, "self_id", "") or "")
+            _kw = {"self_id": int(_sid)} if _sid.isdigit() else {}
+            info = await bot.get_group_member_info(
+                group_id=int(gid), user_id=int(uid), no_cache=True, **_kw
+            )
+            return (info.get("card") or info.get("nickname") or "").strip()
+        except BaseException as e:
+            logger.debug("[welcome] 取昵称失败 uid=%s: %s", uid, e)
+            return ""
+
+    async def _persona_prompt(self) -> str | None:
+        """取群人格的 system_prompt。取不到返回 None（LLM 就用裸提示词）。"""
+        try:
+            target = self.context.get_config()["provider_settings"].get(
+                "default_personality"
+            )
+            if not target:
+                return None
+            # get_personas 是协程，返回 Persona(SQLModel) 列表
+            for p in await self.context.get_db().get_personas() or []:
+                if getattr(p, "persona_id", None) == target:
+                    return getattr(p, "system_prompt", None)
+        except BaseException as e:
+            logger.debug("[welcome] 取人格失败，用裸提示词: %s", e)
+        return None
+
+    async def _gen_text(self, event: AstrMessageEvent, name: str) -> str:
+        """让 LLM 用群人格写一句欢迎；失败则回落到预置短句。"""
+        who = f"，名字叫「{name}」" if name else ""
+        try:
+            # get_current_chat_provider_id 需要 umo（会话来源），
+            # 而且它是**协程**，必须 await。
+            # 之前漏了 await：拿到的是 coroutine 对象，它是真值，
+            # `if not provider_id` 拦不住，一路传进 llm_generate 变成
+            # 「Provider <coroutine object ...> not found」，
+            # 于是欢迎词从上线起就一直走 FALLBACKS 兜底短句，LLM 一次都没成功。
+            # 异常被下面的 except 吞成一行 debug 日志，所以一直没人发现。
+            provider_id = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+            if not provider_id:
+                raise RuntimeError("没有可用的 chat provider")
+
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=GEN_PROMPT.format(who=who),
+                system_prompt=await self._persona_prompt(),
+            )
+            text = (resp.completion_text or "").strip()
+            # 模型偶尔会加引号或多行，只取第一行并去掉包裹引号
+            text = text.splitlines()[0].strip().strip('"').strip("“”").strip()
+            if text:
+                return text
+            raise ValueError("LLM 返回空")
+        except BaseException as e:
+            logger.warning("[welcome] LLM 生成失败，用兜底句: %s", e)
+            return random.choice(FALLBACKS)
+
+    @filter.custom_filter(GroupIncreaseFilter)
+    async def on_member_join(self, event: AstrMessageEvent):
         if not WELCOME_ENABLED:
             return
         try:
-            info = _parse_notice(event)
-            if not info:
-                logger.info("[welcome] 认不出 group_increase（字段形状不同）")
+            raw = getattr(event.message_obj, "raw_message", None)
+            gid = str(_raw_get(raw, "group_id", "") or event.get_group_id() or "")
+            uid = str(_raw_get(raw, "user_id", "") or "")
+            self_id = str(_raw_get(raw, "self_id", "") or event.get_self_id() or "")
+
+            if not gid or not uid:
                 return
-            gid, uid = info
-
-            # 机器人自己被拉进来：不欢迎自己
-            try:
-                if str(uid) == str(event.get_self_id() or ""):
-                    return
-            except BaseException:
-                pass
-
-            # 群过滤
-            try:
-                msg_gid = str(event.get_group_id() or "")
-                current_gid = gid or msg_gid
-            except BaseException:
-                current_gid = gid
-            if ONLY_GROUPS and (current_gid not in ONLY_GROUPS):
+            if uid == self_id:
+                logger.info("[welcome] 是机器人自己被拉进群 %s，不欢迎自己", gid)
+                return
+            if ONLY_GROUPS and gid not in ONLY_GROUPS:
+                logger.debug("[welcome] 群 %s 不在限定范围，跳过", gid)
                 return
 
-            # 去重 + 同群冷却
             now = time.time()
-            key = (str(gid), str(uid))
-            last = _welcomed.get(key, 0.0)
-            if now - last < DEDUP_TTL:
-                logger.info("[welcome] 该用户已在 %.0fs 内欢迎过，跳过", DEDUP_TTL)
+            _prune()
+
+            key = (gid, uid)
+            prev = _welcomed.get(key)
+            if prev is not None and now - prev < DEDUP_TTL:
+                logger.info("[welcome] %s 在 %.0fs 前已欢迎过，跳过重放", uid, now - prev)
                 return
-            glast = _group_last.get(str(gid), 0.0)
-            wait = GROUP_COOLDOWN - (now - glast)
-            if wait > 0:
-                logger.info("[welcome] 本群冷却中，还要等 %.0fs", wait)
-                await asyncio.sleep(wait)
+
+            last = _group_last.get(gid)
+            if last is not None and now - last < GROUP_COOLDOWN:
+                logger.info(
+                    "[welcome] 群 %s 冷却中（%.0fs 前刚欢迎过），跳过以免刷屏",
+                    gid,
+                    now - last,
+                )
+                _welcomed[key] = now
+                return
+
+            # 先占位，防止同一事件并发重入
             _welcomed[key] = now
-            _group_last[str(gid)] = time.time()
+            _group_last[gid] = now
 
-            # 真人一样的反应延迟：机器人的回复速度也是人设的一部分
-            try:
-                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-            except BaseException:
-                pass
+            name = await self._member_name(event, gid, uid)
+            raw_text = await self._gen_text(event, name)
+            # llm_generate 不走 on_llm_response 管道，dsh-sticker 的钩子
+            # 不会触发，必须自己剥掉 [贴纸:x] 并补发 GIF
+            text, stickers = _split_stickers(raw_text)
+            if not text:
+                text = random.choice(FALLBACKS)
 
-            name = await _fetch_name(self.context, str(uid), str(gid))
-            who = f"{name}（{uid}）" if name else f"{uid}"
-            await self._send_welcome(event, who, str(uid), str(gid))
-        except BaseException as e:  # noqa: BLE001
-            # 欢迎是锦上添花，任何异常都不能让插件崩
-            logger.error("[welcome] 处理 group_increase 异常: %s", e)
+            # 像真人一样迟疑一下再说话，也顺便躲开「入群提示和欢迎同一秒」的机械感
+            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    async def _send_welcome(self, event, who: str, uid: str, gid: str) -> None:
-        """生成欢迎词并发送。LLM 失败回落预置短句。"""
-        text = ""
-        try:
-            prompt = GEN_PROMPT.format(who=who)
-            # 用 llm_generate 直接生成。不带图片、不依赖管道，正是之前的坑。
-            resp = await self.context.llm_generate(
-                event.unified_msg_origin, prompt, system_prompt=""
+            await event.send(
+                MessageChain(chain=[At(qq=uid, name=name or uid), Plain(" " + text)])
             )
-            text = (resp.completion_text or "").strip()
-        except BaseException as e:  # noqa: BLE001
-            logger.warning("[welcome] LLM 生成欢迎词失败，回落预置: %s", e)
-        if not text:
-            text = random.choice(FALLBACKS)
-
-        # 剥掉贴纸标记；能对上的贴纸单独补发一张
-        clean, stickers = _split_stickers(text)
-        if clean:
-            chain = MessageChain()
-            chain.chain.append(At(qq=uid))
-            chain.chain.append(Plain(" " + clean))
-            await event.send(chain)
-        if stickers:
-            for p in stickers:
+            # 贴纸单独发一条（图文混在一条里会被丢弃）
+            for p in stickers[:1]:
                 try:
-                    await event.send(MessageChain(chain=[Image.fromFileSystem(p)]))
-                except BaseException as e:  # noqa: BLE001
-                    logger.warning("[welcome] 贴纸发送失败: %s", e)
+                    await event.send(
+                        MessageChain(chain=[Image.fromFileSystem(p)])
+                    )
+                except BaseException as e:
+                    logger.warning("[welcome] 贴纸发送失败 %s: %s", p, e)
+            logger.info(
+                "[welcome] 已欢迎 群=%s 新成员=%s(%s): %s%s",
+                gid,
+                name or "?",
+                uid,
+                text,
+                f" +{len(stickers[:1])}张贴纸" if stickers else "",
+            )
+        except BaseException as e:
+            logger.error("[welcome] 处理入群事件失败: %s", e)
+        finally:
+            # 通知类事件没有正常回复内容，明确终止传播，
+            # 免得后面的阶段拿空消息去问 LLM
+            event.stop_event()
 
     @filter.command("欢迎测试")
-    async def cmd_dry(self, event: AstrMessageEvent):
-        """/欢迎测试 —— 不真发，只预览 LLM 会生成什么欢迎词。"""
-        raw_text = ""
-        try:
-            resp = await self.context.llm_generate(
-                event.unified_msg_origin,
-                GEN_PROMPT.format(who="一个新同学"),
-                system_prompt="",
-            )
-            raw_text = (resp.completion_text or "").strip()
-        except BaseException as e:  # noqa: BLE001
-            yield event.plain_result(f"LLM 生成失败：{e}")
-            return
-        if not raw_text:
-            raw_text = random.choice(FALLBACKS)
+    async def cmd_test(self, event: AstrMessageEvent):
+        """/欢迎测试 —— 用自己当新人，试一次欢迎词（不影响真实去重记录）。"""
+        name = event.get_sender_name() or ""
+        raw_text = await self._gen_text(event, name)
         text, stickers = _split_stickers(raw_text)
         tail = f"（另附 {len(stickers)} 张贴纸）" if stickers else ""
         yield event.plain_result(f"[欢迎词预览] {text or '（空）'}{tail}")
@@ -285,7 +337,7 @@ class Main(star.Star):
     async def cmd_status(self, event: AstrMessageEvent):
         """/欢迎状态 —— 查看欢迎功能配置与最近记录。"""
         gid = event.get_group_id() or "?"
-        last = _group_last.get(str(gid))
+        last = _group_last.get(gid)
         last_s = f"{time.time() - last:.0f}s 前" if last else "无记录"
         yield event.plain_result(
             f"入群欢迎：{'开' if WELCOME_ENABLED else '关'}\n"
