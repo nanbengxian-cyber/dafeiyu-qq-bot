@@ -1,0 +1,2 @@
+# Windows-only packaging dependency. Keep this pinned for reproducible EXE builds.
+pyinstaller==6.11.1

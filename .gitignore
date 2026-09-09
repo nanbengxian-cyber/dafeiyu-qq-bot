@@ -14,6 +14,20 @@ config.json
 *.credentials.yaml
 *.idsig
 
+# Windows desktop-controller local packaging artifacts
+/desktop-controller/build/
+/desktop-controller/dist/
+/desktop-controller/.venv-build/
+/desktop-controller/__pycache__/
+/desktop-controller/tests/__pycache__/
+/desktop-controller/*.spec
+/desktop-controller/controller-profile.json
+/desktop-controller/server-profile.json
+
+# 机器人真实运行配置：只留在服务器上，绝不入库
+/deploy/robot.env
+/deploy/*.tmp
+
 # 编辑器与系统
 .DS_Store
 *.swp

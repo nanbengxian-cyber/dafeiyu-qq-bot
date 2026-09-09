@@ -1,0 +1,184 @@
+{
+  "version": 1,
+  "comment": "控制台按这份清单生成配置界面。改这里就能增减配置项，不用重新打包 EXE。",
+  "knobs": [
+    {
+      "key": "DSH_DECIDE",
+      "label": "插话判断",
+      "group": "说话频率",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "开着＝主动插话前先判断群里在聊什么、该不该开口；关掉＝退回纯随机插话"
+    },
+    {
+      "key": "DSH_DECIDE_MIN_GAP",
+      "label": "自己说完歇多久",
+      "group": "说话频率",
+      "type": "float",
+      "min": 0,
+      "max": 600,
+      "step": 10,
+      "default": "60",
+      "restart_required": true,
+      "hint": "刚说完话多少秒内不主动再插嘴（被 @ 不受影响）"
+    },
+    {
+      "key": "DSH_DECIDE_COOLDOWN",
+      "label": "同一话题冷却",
+      "group": "说话频率",
+      "type": "int",
+      "min": 0,
+      "max": 3600,
+      "default": "600",
+      "restart_required": true,
+      "hint": "同一个话题聊过之后，多少秒内不重复接话"
+    },
+    {
+      "key": "DSH_DECIDE_DIVE",
+      "label": "允许潜水",
+      "group": "说话频率",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "开＝多数消息选择不回复，更像真人；关＝每条都参与"
+    },
+    {
+      "key": "DSH_HUMAN",
+      "label": "人味化改写",
+      "group": "说话风格",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "把过于工整的句子掰回口语"
+    },
+    {
+      "key": "DSH_HUMAN_SPLIT_RATE",
+      "label": "分段发送比例",
+      "group": "说话风格",
+      "type": "float",
+      "min": 0,
+      "max": 1,
+      "step": 0.05,
+      "default": "0.7",
+      "restart_required": true,
+      "hint": "长回复拆成几条发的概率"
+    },
+    {
+      "key": "DSH_TYPO_RATE",
+      "label": "错别字概率",
+      "group": "说话风格",
+      "type": "float",
+      "min": 0,
+      "max": 0.5,
+      "step": 0.01,
+      "default": "0.06",
+      "restart_required": true,
+      "hint": "每条回复打一个同音错字的概率；调 0 可完全关闭"
+    },
+    {
+      "key": "DSH_NOISE",
+      "label": "口语噪点",
+      "group": "说话风格",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "叠词、换字、截断等小噪点；不会作用于被 @ 的正经回答"
+    },
+    {
+      "key": "DSH_CTX_KEEP_TURNS",
+      "label": "保留对话轮数",
+      "group": "上下文与记忆",
+      "type": "int",
+      "min": 5,
+      "max": 200,
+      "default": "30",
+      "restart_required": true,
+      "hint": "带多少轮历史给模型；太大容易答非所问，太小会忘事"
+    },
+    {
+      "key": "DSH_MEM_DECAY",
+      "label": "记忆随时间衰减",
+      "group": "上下文与记忆",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "久远的记忆权重降低，避免拿旧印象套现在的对话"
+    },
+    {
+      "key": "DSH_WEB_ENABLE",
+      "label": "联网搜索",
+      "group": "联网与审核",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "关掉后模型无法联网查资料"
+    },
+    {
+      "key": "DSH_WEB_MOD",
+      "label": "出口审核",
+      "group": "联网与审核",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "先审后发，防止把违规或敏感内容发到群里；建议保持开启"
+    },
+    {
+      "key": "DSH_WEB_MOD_TIMEOUT",
+      "label": "审核超时",
+      "group": "联网与审核",
+      "type": "int",
+      "min": 3,
+      "max": 60,
+      "default": "12",
+      "restart_required": true,
+      "hint": "单位秒；超时按不放行处理（fail-closed）"
+    },
+    {
+      "key": "DSH_WEB_SEARCH_KEY",
+      "label": "搜索接口密钥",
+      "group": "联网与审核",
+      "type": "str",
+      "default": "",
+      "secret": true,
+      "restart_required": true,
+      "hint": "只保存在服务器上；控制台只显示已设置或未设置"
+    },
+    {
+      "key": "DSH_ACL",
+      "label": "指令权限管控",
+      "group": "权限与安全",
+      "type": "bool",
+      "default": "1",
+      "restart_required": true,
+      "hint": "限制谁能发管理类指令"
+    },
+    {
+      "key": "DSH_ACL_OWNER",
+      "label": "管理员 QQ 号",
+      "group": "权限与安全",
+      "type": "str",
+      "default": "",
+      "restart_required": true,
+      "hint": "填你自己的 QQ 号，只保存在服务器上，不要写进仓库"
+    },
+    {
+      "key": "DSH_ACL_QUIET",
+      "label": "拒绝时静默",
+      "group": "权限与安全",
+      "type": "bool",
+      "default": "0",
+      "restart_required": true,
+      "hint": "开＝无权限的指令直接忽略，不回复提示"
+    },
+    {
+      "key": "DSH_SCENE_TZ",
+      "label": "时区",
+      "group": "权限与安全",
+      "type": "str",
+      "default": "Asia/Shanghai",
+      "restart_required": true,
+      "hint": "影响「现在几点」这类判断"
+    }
+  ]
+}

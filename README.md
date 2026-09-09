@@ -14,13 +14,15 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 一个跑在 QQ 群里的 AI 群友（人格叫「小鲸鱼」）。它不是客服式问答机器人 —— 目标是**混在群里像个真人**：会潜水、会插话、会发表情包、会戳回去、看得见图片和视频、记得住群友是谁。
 
-仓库包含四块可独立使用的东西：
+仓库包含六块可独立使用的东西：
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
 | [`plugins/`](plugins/) | 45 个 AstrBot 插件 —— 机器人的全部能力 | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
+| [`desktop-controller/`](desktop-controller/) | Windows EXE 控制台：填服务器信息 → 自动部署并启动 → 在线改配置 | Python |
+| [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
 | [`docs/`](docs/) | 部署手册与 14 份问题根因分析 | Markdown |
 
 ### 最新更新 · 2026-09-08（整体整合：45 个插件连成断点管线）
