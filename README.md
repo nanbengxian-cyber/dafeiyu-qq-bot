@@ -216,8 +216,10 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [45-戳一戳与违规禁言](docs/45-戳一戳与违规禁言.md) | 权限模型与限流设计 |
 | [46-主动开口与情绪系统](docs/46-主动开口与情绪系统.md) | 冷场主动开口的五道闸门、单一主情绪的仲裁与清零、引用按 QQ 号认人；含影子回放揪出的两个真误判 |
 | [47-真人感第二批](docs/47-真人感第二批-黑话与打字节奏与效果观察.md) | 黑话词表（含三个外部热梗库的回测数据与「先问模型知不知道」的探针结论）、打字节奏、同音错别字、注意力漂移、回复效果闭环 |
+| [48-黑话自动审核](docs/48-黑话自动审核-更新详解.md) | `dsh-slang` 自动审核:从群聊挖候选 → 主模型考究释义 → 每 8 小时 AI 自动审核转正,群主命令兜底 |
 | [50-多模态接入与验证记录](docs/50-多模态接入与验证记录.md) | 图/视频/语音/联网的逐项实测，含失败记录 |
 | [60-长期目标与技术方案](docs/60-长期目标与技术方案.md) | 整体架构与演进方向 |
+| [群指令手册](docs/群指令手册.md) | 群里所有指令的用途、权限与示例(50 条插件指令 + 9 条内置指令) |
 
 ### 快速开始
 
@@ -502,7 +504,9 @@ Each was re-validated across multiple plugins:
 | [40 答非所问根因与修复](docs/40-答非所问根因与修复.md) | Quantified analysis of a 257k-character context |
 | [41 被骗认输根因与修复](docs/41-被骗认输根因与修复.md) | Why editing the persona doesn't work |
 | [47 真人感第二批](docs/47-真人感第二批-黑话与打字节奏与效果观察.md) | Slang table, typing rhythm, homophone typos, attention drift, response-effect closed loop |
+| [48 黑话自动审核](docs/48-黑话自动审核-更新详解.md) | `dsh-slang` auto-review: mine candidates → research with main model → AI auto-review every 8h, owner commands as fallback |
 | [60 长期目标与技术方案](docs/60-长期目标与技术方案.md) | Overall architecture and direction |
+| [命令手册](docs/群指令手册.md) | All in-group commands with usage, permissions and examples (50 plugin commands + 9 built-in) |
 
 ### Quick start
 
