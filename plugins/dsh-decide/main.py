@@ -815,7 +815,7 @@ class Main(star.Star):
     # ResultDecorateStage → RespondStage，压根不经过 on_llm_request ——
     # 静音群里任何人敲一条公开指令，机器人照样会出声。
     # 这不是假想：dsh-guard 的警告是 event.send 直发，同样绕过那道闸门，
-    # 已经真的在 1048435041 说过一句「群里不聊这个，收着点」。
+    # 已经真的在 100000001 说过一句「群里不聊这个，收着点」。
     #
     # 所以这里补一道**出口级**兜底：结果装好、还没发出去时，
     # 群在静音名单里就把整个 result 清掉。clear_result() 是框架自己的 API，

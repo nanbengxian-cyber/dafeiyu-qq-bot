@@ -152,11 +152,37 @@ assert len(_head) <= 70, "注入块说明文字 %d 字，太长了" % len(_head)
 # --------------------------------------------------- 审查过的不变量
 # 每条词条都必须在真语料里命中过（零命中的死词已删，别再加回来）
 assert all(e.terms for e in module.GLOSSARY)
-# 只有两条词条配两句例句，多了就是在跟 dsh-style 抢活
+# 只有傲娇一条配两句例句，多了就是在跟 dsh-style 抢活
+# （人机原来也是两句，9-09 换成第三人称原话后只剩一句，见下面的自指降级断言）
 _two = [e.terms[0] for e in module.GLOSSARY if len(e.usage) > 1]
-assert _two == ["人机", "傲娇"], _two
+assert _two == ["傲娇"], _two
 # 例句一律不超过 dsh-style 的样本上限 18 字 + 一点余量，太长就不像口语了
 assert max(len(u) for e in module.GLOSSARY for u in e.usage) <= 20
+
+# --------------------------------------------------- 自指类词条：第三人称降级（9-09）
+class _FakeEvent:
+    def __init__(self, text, at=False):
+        self.message_str = text
+        self.is_at_or_wake_command = at
+
+
+def rendered(text, at=False):
+    event = _FakeEvent(text, at)
+    return module.render(module.matched_entries(text), addressed=module._addressed(event))
+
+
+# 群主原话：在说别的 AI 账号，必须出现「是在说别人」的硬提示
+assert "是在说别人" in rendered("主要是那些都是人机啊")
+# 第二人称 = 冲机器人来的，不降级（这是旧词条要教的语用，不能一起丢掉）
+assert "是在说别人" not in rendered("你是不是人机？")
+# 被 @/唤醒同样不降级
+assert "是在说别人" not in rendered("人机咋了", at=True)
+# 释义本身也必须中性：不许再出现「冲你说这个」这种第二人称引导
+_hit = [e for e in module.GLOSSARY if e.terms == ("人机",)][0]
+assert _hit.selfref and "冲你说" not in _hit.meaning
+assert "那些都是人机" in _hit.meaning
+# 别的词条没标 selfref，不受影响
+assert "是在说别人" not in rendered("还全是车轱辘废话，水平很差")
 
 print("GLOSSARY_TEST_OK terms=%d usage=%d meaning_chars=%d head=%d"
       % (len(module.GLOSSARY), sum(len(e.usage) for e in module.GLOSSARY),

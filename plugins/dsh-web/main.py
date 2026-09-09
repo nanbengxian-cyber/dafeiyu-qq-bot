@@ -28,13 +28,14 @@
 #   - 智谱 web_search 可用且每条结果自带约 680 字摘要，比自己抓正文稳得多，
 #     所以「抓不到正文」时用搜索结果兜底（拿 URL 里的标题词去搜）。
 #
-# 安全：SSRF 是这类插件的头号风险（群里随便发个 http://172.18.0.2:6185 就能
+# 安全：SSRF 是这类插件的头号风险（群里随便发个 http://192.0.2.10:6185 就能
 #   让机器人去读内网面板）。所以强制：只允许 http/https、解析后的 IP 必须是
 #   公网地址（私网/环回/链路本地/保留段全拒）、跟随重定向时每一跳都重新校验、
 #   响应体截断、Content-Type 白名单。
 
 import asyncio
 import ipaddress
+import json
 import os
 import random
 import re
@@ -364,6 +365,66 @@ AV_RE = re.compile(r"\bav(\d{1,12})\b", re.I)
 
 _BILI_HOSTS = ("bilibili.com", "b23.tv", "acg.tv", "bilibili.tv")
 
+# 回复出口闸用的网址识别：比 URL_RE 更宽，额外认不带协议的裸域名，
+# 因为「贴网址」不总是带 http:// 前缀。只在回复含疑似网址时触发送审。
+_REPLY_URL_RE = re.compile(
+    r"https?://\S+"
+    r"|(?<![\w.@/-])((?:www\.|[a-z0-9-]+\.(?:com|net|org|cn|io|tv|me|xyz|wiki)"
+    r")[^\s\u4e00-\u9fff，。！？；、）】》\"'<>]*)",
+    re.I,
+)
+
+# ---------------------------------------------------------------- 出口审核
+#
+# 问题：机器人会把抓到的/搜到的网页正文**原样贴进群**（/看网页、/搜 这两个
+# 指令的结果直接 yield event.plain_result，不经过 LLM，也不经过 dsh-guard 的
+# 判定）。一旦正文里含敏感人物/时政内容（例如维基百科条目、新闻搜索结果），
+# 就等于机器人自己在群里发违禁内容 —— 群秒炸、号必封。
+#
+# 现有的 SENSITIVE_RE / _GEO_CONFLICT_RE 是**纯正则关键词表**，只能拦「命中
+# 关键词」的；维基百科那种正文通篇在讲一个敏感人物但未必含上表里那几个词的
+# 页面，正则漏一条就炸一条。所以加一道**小模型审核**：把准备进群的网页正文/
+# 搜索结果交给模型判一句「能不能发」，拿不准的一律不发。
+#
+# 设计取舍（与 dsh-guard 一致）：
+#   - 模型只回答「能不能发 + 为什么」，不回答「要不要禁言」（那是 guard 的事）；
+#   - 失败/超时/解析失败 -> **不发**（fail-closed）。理由同上：这是要进群的内容，
+#     漏判一条就炸一条，宁可发一句「这条我不发」也不能把可疑正文贴出来；
+#   - 用一个独立 provider/env，不抢主对话的额度。没配就用当前会话的 provider。
+MOD_PROVIDER = os.environ.get("DSH_WEB_MOD_PROVIDER", "").strip()
+MOD_TIMEOUT = float(os.environ.get("DSH_WEB_MOD_TIMEOUT", "12"))
+MOD_ENABLED = os.environ.get("DSH_WEB_MOD", "1") not in ("0", "false", "False")
+# 回复出口闸的超时单独给短些：这道闸在 on_llm_response 上，模型话都说完了，
+# 等太久群友看着干瞪眼；超时走降级（只摘网址+正则复查），不整条拦。
+RESPONSE_MOD_TIMEOUT = float(os.environ.get("DSH_WEB_MOD_RESPONSE_TIMEOUT", "8"))
+# 审核结论缓存：同一个链接/同一段文字不必反复送审
+MOD_TTL = float(os.environ.get("DSH_WEB_MOD_TTL", "1800"))
+# 正则快筛：命中这些词的内容直接判「不发」，省一次模型调用。
+# 这只是**成本闸门 + 兜底**，模型那道仍然要跑（正则漏的词模型来补）。
+# 注意：这里刻意不收「核心」「领导」这类单字泛词（「团队的核心领导能力」
+# 会误伤），只收几乎必然踩线的完整词；英文词是给维基/外媒摘要准备的。
+_MOD_BLOCK_RE = re.compile(
+    r"习近平|李强总理|政治局|中共中央|总书记|国家主席|人大常委|全国政协"
+    r"|台独|港独|疆独|藏独|法轮|六四|达赖|维吾尔|新疆再教育"
+    r"|颜色革命|政变|军事演习|统一台湾|武统"
+    r"|国家领导人|党和国家|最高领导人"
+    r"|Xi Jinping|Li Qiang|Tiananmen|Falun|Dalai Lama|Uyghur|Uighur",
+    re.I,
+)
+# 审核结论缓存 url/文本指纹 -> (时间, 能否发, 原因)
+_mod_cache: dict[str, tuple[float, bool, str]] = {}
+# 出口审核拦下后的替话。用人格里的口吻，不提「审核/安全」这类机制词。
+_REFUSALS = ("这个我不聊。", "这话题我碰不了。", "这个我不发，换一个吧。")
+
+
+def _regex_block_hit(text: str) -> bool:
+    """纯正则出口检查（零成本）。用于 B 站这类高频低风险路径。"""
+    t = text or ""
+    return bool(
+        _MOD_BLOCK_RE.search(t)
+        or SENSITIVE_RE.search(t)
+        or _GEO_CONFLICT_RE.search(t)
+    )
 # ---------------------------------------------------------------- SSRF 防护
 
 
@@ -876,6 +937,130 @@ def _drop_sensitive(res: list[dict]) -> tuple[list[dict], int]:
     return keep, len(res) - len(keep)
 
 
+# ---------------------------------------------------------------- 出口审核
+_MOD_SYS = (
+    "你是一个内容安全审核模块。你的唯一任务是判断一段即将发到中文 QQ 群的"
+    "文字会不会被 QQ 的内容安全系统拦截（拦截后果是整个群被封）。"
+    "只输出一个 JSON 对象，不解释，不输出其他任何文字。"
+)
+_MOD_PROMPT = """判断下面这段文字能否原样发到中文 QQ 群。
+
+这段文字的来源：机器人抓取的网页正文/搜索结果，或机器人自己写的一段回复。
+QQ 内容安全对时政、敏感人物、色情、赌博、诈骗极其严格，发出去可能导致整个群被封。
+
+要审核的文字（可能被截断）：
+{content}
+
+只输出 JSON，字段固定为：
+{{"politics": true/false, "sensitive_figure": true/false, "nsfw": true/false,
+"illegal": true/false, "hate": true/false, "reason": "一句话理由，放行为空串", "can_send": true/false}}
+
+判定口径（从严：宁可误拦，不可漏放）：
+- politics：时事政治、政权/政策、领导人及敏感人物的活动、民族宗教冲突、
+  领土主权、历史政治事件（如政治运动、广场事件）。网页通篇在讲某个人物、
+  即便没点名也算 —— 看内容实质，不看有没有关键词。
+- sensitive_figure：出现中国敏感政治人物（现任/前任最高领导人、被官方定性者）
+  的实质内容，中英文名都算。
+- nsfw：色情/裸露；illegal：赌博/毒品/诈骗/违法交易；hate：煽动/仇恨/暴力号召。
+- 以下放行（全 false、can_send=true）：游戏剧情里的国家/阵营、纯历史科普、
+  球队/地名/动植物、技术文档、日常百科、商品/天气/生活内容。
+"""
+
+
+def _mod_parse(raw: str) -> dict | None:
+    """解析审核模型的 JSON 输出。容忍 ```json``` 围栏和前后空白。"""
+    if not raw:
+        return None
+    s = raw.strip()
+    # 去掉可能的 ```json ... ``` 围栏
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", s, re.S)
+    if m:
+        s = m.group(1)
+    else:
+        m = re.search(r"\{.*\}", s, re.S)
+        if m:
+            s = m.group(0)
+    try:
+        d = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    return d
+
+
+async def _moderate(
+    context, umo: str, content: str, url: str = "", timeout: float | None = None
+) -> tuple[bool, str]:
+    """审核一段准备进群的文字。返回 (能否发, 原因)。
+
+    - 命中 _MOD_BLOCK_RE 正则 -> 直接 block，省一次模型调用；
+    - 否则交小模型判定（带结论缓存：同 URL/同文本不重复送审）；
+    - 失败/超时/解析失败 -> block（fail-closed：宁可不发也不炸群）。
+      原因串里带「超时/异常/解析失败/无可用模型」字样的属于**没审成**，
+      回复出口闸会据此降级处理（只摘网址），其余视为**确定拦截**。
+    """
+    if not MOD_ENABLED:
+        return True, ""
+    blob = (content or "").strip()
+    if not blob:
+        return True, ""
+    if _MOD_BLOCK_RE.search(blob):
+        return False, "命中敏感词(正则)"
+    key = url.strip() if (url or "").strip() else "c:%d" % hash(blob[:500])
+    now = time.time()
+    hit = _mod_cache.get(key)
+    if hit and now - hit[0] < MOD_TTL:
+        return hit[1], hit[2]
+    pid = MOD_PROVIDER
+    if not pid:
+        try:
+            pid = await context.get_current_chat_provider_id(umo)
+        except Exception:  # noqa: BLE001
+            pid = ""
+    if not pid:
+        # 拿不到 provider 审不了 -> 不发（fail-closed）。
+        return False, "无可用模型审核"
+    try:
+        resp = await asyncio.wait_for(
+            context.llm_generate(
+                chat_provider_id=pid,
+                prompt=_MOD_PROMPT.format(content=blob[:2000]),
+                system_prompt=_MOD_SYS,
+                temperature=0,  # 审核是判定不是创作，随机性只带来摇摆
+                max_tokens=200,
+            ),
+            timeout=timeout or MOD_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return False, "审核超时"
+    except Exception as e:  # noqa: BLE001
+        return False, "审核异常:%s" % type(e).__name__
+    raw = (getattr(resp, "completion_text", "") or "").strip()
+    if not raw:
+        raw = (getattr(resp, "reasoning_content", "") or "").strip()
+    d = _mod_parse(raw)
+    if not d:
+        return False, "审核结果解析失败"
+    # 任何一个 block 类信号为 true 就强制 block，不依赖模型给的 can_send
+    for k in ("politics", "sensitive_figure", "nsfw", "illegal", "hate"):
+        if d.get(k) is True:
+            verdict = (False, (d.get("reason") or k or "").strip()[:60])
+            break
+    else:
+        verdict = (
+            (True, "")
+            if d.get("can_send", False)
+            else (False, (d.get("reason") or "模型判定不发").strip()[:60])
+        )
+    # 只缓存确定性结论；超时/异常/没审成的不缓存（下次可能就好了）
+    _mod_cache[key] = (now, verdict[0], verdict[1])
+    if len(_mod_cache) > 300:
+        for k2 in sorted(_mod_cache, key=lambda x: _mod_cache[x][0])[:150]:
+            _mod_cache.pop(k2, None)
+    return verdict
+
+
 # ---------------------------------------------------------------- 自动搜索
 
 # 用户明确要求联网搜索。刻意只收显式动词，不收「X是什么」这类泛问句：
@@ -964,27 +1149,33 @@ class Main(star.Star):
             if not urls and not bare_bv:
                 return
             await asyncio.wait_for(
-                self._attach(req, urls, bare_bv), timeout=BUDGET
+                self._attach(req, urls, bare_bv, event.unified_msg_origin or ""),
+                timeout=BUDGET,
             )
         except asyncio.TimeoutError:
             logger.warning("[web] 超过 %.0fs 预算，本轮放弃网页上下文", BUDGET)
         except BaseException as e:  # noqa: BLE001
             logger.error("[web] 钩子异常：%s", e)
 
-    async def _attach(self, req, urls: list[str], bare_bv: str) -> None:
+    async def _attach(self, req, urls: list[str], bare_bv: str, umo: str = "") -> None:
         blocks: list[str] = []
 
         if bare_bv:
             info, err = await _bili_info(bare_bv)
-            blocks.append(info if info else f"（{bare_bv} 查不到：{err}）")
+            if info and _regex_block_hit(info):
+                info = ""
+                logger.info("[web] B 站信息命中敏感词，已拦下（%s）", bare_bv[:30])
+            blocks.append(info if info else f"（{bare_bv} 查不到：{err or '内容不予展示'}）")
 
         for url in urls:
             if _is_bili(url):
                 info, err = await _bili_info(url)
-                if info:
+                if info and _regex_block_hit(info):
+                    logger.info("[web] B 站信息命中敏感词，退回抓网页(%s)", url[:60])
+                elif info:
                     blocks.append(info)
                     continue
-                logger.info("[web] B 站查询失败(%s)，退回抓网页", err)
+                logger.info("[web] B 站查询失败(%s)，退回抓网页", err or "内容不予展示")
             title, body, err = await _fetch(url)
             if body and (
                 SENSITIVE_RE.search("%s %s" % (title or "", body))
@@ -998,6 +1189,22 @@ class Main(star.Star):
                 logger.info("[web] 链接 %s 命中时政，已拦下", url[:60])
                 continue
             if body:
+                # 出口审核：正则没命中的正文也要过一次小模型，
+                # 防止维基百科那种通篇讲敏感人物但不含关键词表的页面漏过去。
+                # 审核不通过 -> 同样换成「这个我不聊」，绝不把原文注进去。
+                ok, why = await _moderate(
+                    self.context, umo, "%s %s" % (title or "", body), url,
+                    timeout=8,  # 审核太慢就宁可拦：预算只给 8 秒
+                )
+                if not ok:
+                    blocks.append(
+                        f"链接 {url[:90]} 审核未通过（{why}），这类你不聊。"
+                        "用自己的语气说一句「这个我不聊」，别复述里面的内容。"
+                    )
+                    logger.info(
+                        "[web] 链接 %s 审核未通过(%s)，已拦下", url[:60], why
+                    )
+                    continue
                 head = f"链接 {url[:90]}"
                 if title:
                     head += f"，标题《{title[:60]}》"
@@ -1069,6 +1276,27 @@ class Main(star.Star):
                 )
                 logger.info("[web] 自动搜索「%s」失败：%s", query[:40], err)
                 return
+            # 正则摘完还剩的，再整体送一次出口审核 —— 搜索结果的摘要里
+            # 同样可能藏着正则表外的敏感内容（外媒报道、维基摘要等）。
+            ok, why = await _moderate(
+                self.context,
+                event.unified_msg_origin or "",
+                _fmt_search(query, res),
+                timeout=8,
+            )
+            if not ok:
+                req.extra_user_content_parts.append(
+                    TextPart(
+                        text="<search_context>\n"
+                        f"搜「{query}」的结果审核未通过，这类你不聊。"
+                        "用你自己的语气说一句「这个我不聊」糊过去，"
+                        "别复述任何内容、别列标题。\n</search_context>"
+                    )
+                )
+                logger.info(
+                    "[web] 自动搜索「%s」审核未通过(%s)，已拦下", query[:40], why
+                )
+                return
             req.extra_user_content_parts.append(
                 TextPart(
                     text="<search_context>\n"
@@ -1105,6 +1333,18 @@ class Main(star.Star):
                 "搜出来的全是时政新闻，这类不聊。"
                 "用你自己的语气说一句「这个我不聊」，别复述内容。"
             )
+        ok, why = await _moderate(
+            self.context,
+            event.unified_msg_origin or "",
+            _fmt_search(query, res),
+            timeout=8,
+        )
+        if not ok:
+            logger.info("[web] 工具搜索「%s」审核未通过(%s)", query[:40], why)
+            return (
+                "搜索结果审核未通过，这类不聊。"
+                "用你自己的语气说一句「这个我不聊」，别复述任何内容、别列标题。"
+            )
         logger.info("[web] 工具搜索「%s」→ %d 条", query[:40], len(res))
         return _fmt_search(query, res) + "\n（据此回答用户，别编造没出现的内容）"
 
@@ -1117,11 +1357,27 @@ class Main(star.Star):
         """
         if _is_bili(url):
             info, err = await _bili_info(url)
+            if info and _regex_block_hit(info):
+                logger.info("[web] 工具读页 %s 命中敏感词(B站)，已拦下", url[:60])
+                return "这个链接的内容不予展示。请如实告诉用户你读不了，不要编造。"
             if info:
                 return info
         title, body, err = await _fetch(url)
         if not body:
             return f"打不开这个网页：{err}。请如实告诉用户你读不了，不要编造内容。"
+        ok, why = await _moderate(
+            self.context,
+            event.unified_msg_origin or "",
+            "%s %s" % (title or "", body),
+            url,
+            timeout=10,
+        )
+        if not ok:
+            logger.info("[web] 工具读页 %s 审核未通过(%s)", url[:60], why)
+            return (
+                "这个网页的内容审核未通过，属于你不能碰的内容。"
+                "用你自己的语气说这个你不看/不聊，别提内容，也别把网址贴出来。"
+            )
         logger.info("[web] 工具读页 %s → %d 字", url[:60], len(body))
         return f"《{title}》\n{body}"
 
@@ -1136,6 +1392,9 @@ class Main(star.Star):
         info, err = await _bili_info(video)
         if not info:
             return f"查不到这个视频：{err}。请如实告诉用户，不要编造。"
+        if _regex_block_hit(info):
+            logger.info("[web] 工具查B站命中敏感词，已拦下")
+            return "这个视频的信息不予展示。请如实告诉用户你查不到，不要编造。"
         return info
 
     # ------------------------------------------------ 只做清理，不兜底
@@ -1155,14 +1414,57 @@ class Main(star.Star):
             raw = getattr(response, "completion_text", "") or ""
             # 参与接力：万一 web 先跑，也要把原文留给后面的插件
             cleaned, _ = _leak_relay(event, raw, None, None)
-            if cleaned != raw:
+            # ---- 回复出口闸 ----
+            # 机器人的回复里带网址 = 他要「发网页」进群。这是群秒炸的最直接
+            # 路径（敏感人物的维基百科网址一发，整群没）。只有带网址时才
+            # 送审，平时零开销。审核不过：先把网址全摘掉再正则复查；
+            # 正文本身也过不了正则就整条换成拒答短话。
+            gate_changed = False
+            if cleaned.strip() and MOD_ENABLED and _REPLY_URL_RE.search(cleaned):
+                cleaned = await self._outbound_gate(event, cleaned)
+                gate_changed = True
+            if cleaned != raw or gate_changed:
                 try:
                     response.completion_text = cleaned
                 except Exception:  # noqa: BLE001
                     response._completion_text = cleaned
-                logger.warning("[web] 已清理模型泄漏的伪工具调用标记")
+                if gate_changed:
+                    logger.warning("[web] 回复已被出口闸改写")
+                else:
+                    logger.warning("[web] 已清理模型泄漏的伪工具调用标记")
         except BaseException as e:  # noqa: BLE001
             logger.error("[web] 清理钩子异常：%s", e)
+
+    async def _outbound_gate(self, event: AstrMessageEvent, text: str) -> str:
+        """回复出口闸：回复带网址时调用。返回最终要发出去的文字。"""
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        ok, why = await _moderate(
+            self.context, umo, text, timeout=RESPONSE_MOD_TIMEOUT
+        )
+        if ok:
+            return text
+        degrade = any(
+            k in why for k in ("超时", "异常", "解析失败", "无可用模型")
+        )
+        if not degrade:
+            # 确定拦截：整条换成拒答短话，一个字都不留
+            logger.warning("[web] 回复出口审核拦下(%s)：%r", why, text[:60])
+            return random.choice(_REFUSALS)
+        # 没审成（超时等）：不能放网址走，摘掉全部网址后正则复查正文
+        stripped = _REPLY_URL_RE.sub("", text)
+        stripped = BARE_RE.sub("", stripped)
+        if _regex_block_hit(stripped):
+            logger.warning(
+                "[web] 回复出口审核未成(%s)且正文命中敏感词，整条拦下：%r",
+                why, text[:60],
+            )
+            return random.choice(_REFUSALS)
+        logger.warning(
+            "[web] 回复出口审核未成(%s)，降级：已摘掉全部网址", why
+        )
+        return re.sub(r"[ \t]{2,}", " ", stripped).strip() or random.choice(
+            _REFUSALS
+        )
 
     # ------------------------------------------------ 触发 3：显式指令
 
@@ -1179,6 +1481,9 @@ class Main(star.Star):
             return
         if _is_bili(urls[0]):
             info, err = await _bili_info(urls[0])
+            if info and _regex_block_hit(info):
+                yield event.plain_result("查不到：这个视频的信息不予展示")
+                return
             yield event.plain_result(info or f"查不到：{err}")
             return
         title, body, err = await _fetch(urls[0])
@@ -1187,9 +1492,19 @@ class Main(star.Star):
             return
         # 指令结果直接进群、不经过 LLM，不会踩上游 content_filter，
         # 但机器人自己把时政内容贴进群同样是风险。
-        if SENSITIVE_RE.search("%s %s" % (title or "", body)) or \
-                _GEO_CONFLICT_RE.search("%s %s" % (title or "", body)):
+        # 先正则快筛，再送小模型出口审核（fail-closed：没审成也不发）。
+        if _regex_block_hit("%s %s" % (title or "", body)):
             yield event.plain_result("这是时政内容，我不聊。")
+            return
+        ok, why = await _moderate(
+            self.context,
+            event.unified_msg_origin or "",
+            "%s %s" % (title or "", body),
+            urls[0],
+        )
+        if not ok:
+            logger.info("[web] /看网页 %s 审核未通过(%s)", urls[0][:60], why)
+            yield event.plain_result(random.choice(_REFUSALS))
             return
         yield event.plain_result(f"《{title}》\n\n{body[:900]}")
 
@@ -1217,6 +1532,14 @@ class Main(star.Star):
             lines.append(f"{i}. {r['title'][:52]}")
             if r["content"]:
                 lines.append(f"   {r['content'][:110]}")
+        # 正则摘完还剩的送出口审核（fail-closed）
+        ok, why = await _moderate(
+            self.context, event.unified_msg_origin or "", "\n".join(lines)
+        )
+        if not ok:
+            logger.info("[web] /搜「%s」审核未通过(%s)", arg[:40], why)
+            yield event.plain_result(random.choice(_REFUSALS))
+            return
         yield event.plain_result("\n".join(lines))
 
     @filter.command("b站")
@@ -1227,6 +1550,9 @@ class Main(star.Star):
             yield event.plain_result("用法：/b站 BV1xx411c7mD")
             return
         info, err = await _bili_info(arg)
+        if info and _regex_block_hit(info):
+            yield event.plain_result("查不到：这个视频的信息不予展示")
+            return
         yield event.plain_result(info or f"查不到：{err}")
 
     @filter.command("联网状态")
@@ -1237,6 +1563,8 @@ class Main(star.Star):
             f"联网：{'开' if ENABLED else '关'}\n"
             f"搜索：{SEARCH_ENGINE}｜Key：{'已配置' if ZHIPU_KEY else '未配置'}｜"
             f"连通：{'正常' if res else '失败(' + err[:40] + ')'}\n"
+            f"出口审核：{'开（先正则后模型，审不过不发）' if MOD_ENABLED else '关'}｜"
+            f"审核模型：{MOD_PROVIDER or '当前会话模型'}｜超时 {MOD_TIMEOUT:.0f}s\n"
             f"单页上限 {MAX_CHARS} 字｜每条消息最多 {MAX_URLS} 个链接｜"
             f"超时 {TIMEOUT}s｜预算 {BUDGET:.0f}s\n"
             f"B 站走 wbi/view 端点（香港直连普通端点被 -412 拦）\n"
