@@ -25,7 +25,32 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
 | [`docs/`](docs/) | 部署手册与 14 份问题根因分析 | Markdown |
 
-### 最新更新 · 2026-09-08（整体整合：45 个插件连成断点管线）
+### 最新更新 · 2026-09-09（Windows 控制台 EXE 可在发行版直接下载）
+
+桌面控制台（`desktop-controller/`）之前只有源码 —— EXE 必须在 Windows 上打包，而部署机器人的服务器是 Linux，
+所以想用的人得自己装 Python 再跑打包脚本。现在打包这件事交给 GitHub 自己：
+
+- **推一个标签就出 EXE。** 新增工作流 [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)：
+  推 `controller-v*` 标签（例如 `controller-v1.0.0`）时，GitHub 在自己的 `windows-latest` 机器上用
+  PyInstaller 打包单文件 EXE，并挂到 [Releases](../../releases) —— 和安卓版控制台一样，点开就能下载。
+- **不打标签也能试。** 在 Actions 页面手动 Run workflow，只构建、不发布，产物在本次运行的 Artifacts 里。
+- **每次构建两个文件。** `dafeiyu-controller.exe`（单文件、免安装、双击即用）和
+  `dafeiyu-controller.exe.sha256`（校验值）。校验方法：PowerShell 里执行
+  `Get-FileHash .\dafeiyu-controller.exe -Algorithm SHA256`，与 `.sha256` 文件里的值比对。
+- **为什么发布资源用英文名。** EXE 内部的程序名仍然是「大肥鱼机器人控制台」，但发布出去的文件名用 ASCII，
+  避免浏览器 / 杀软对中文文件名的兼容问题。
+- **打包脚本加了 `-PythonExe`。** `desktop-controller/build-windows.ps1` 现在可以指定解释器
+  （CI 里传 setup-python 的 `python`，本地不传则沿用 Windows 的 `py -3`），
+  并且改用通配符定位产物、不再依赖中文路径字面量。
+
+安全边界没有变：EXE 里**不含**任何服务器地址、账号、密码、私钥、Token 或机器人配置，全部由使用者在界面里填；
+工作流也不读取任何密钥。
+
+验证：`controller-v1.0.0` 标签触发首次构建，Actions 八个步骤全绿；发行版页面已出现 `dafeiyu-controller.exe`
+（16.1 MB，PE32+ GUI 可执行文件）和 `.sha256` 校验文件。把产物下载回来后实测 SHA-256 与 `.sha256` 里的值一致，
+并在二进制里搜过生产 IP、部署路径、群号、Token —— 全部 0 命中。
+
+### 上一次更新 · 2026-09-08（整体整合：45 个插件连成断点管线）
 
 这之后把仓库整理到了**45 个插件**。前面每一批都是在单点修故障，这一批是第一次把所有插件
 **当成一套管线来布线**——让「像真人」这件事不再是一堆各自为战的开关，而是按优先级串联起来。
@@ -120,7 +145,12 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 ### 成品下载
 
-安卓控制台 App 在 [Releases](../../releases) 页面下载（约 121 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
+[Releases](../../releases) 页面：
+
+| 产物 | 平台 | 说明 |
+|---|---|---|
+| `dafeiyu-console.apk` | 安卓 5.0+ | 安卓控制台 App（约 121 KB）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。 |
+| `dafeiyu-controller.exe` | Windows 10/11 | 桌面控制台（单文件、免安装）：填服务器 SSH 与仓库信息 → 自动部署并启动 → 之后在同一个界面里改配置。同页的 `.sha256` 是校验值。 |
 
 ### 45 个插件在解决什么
 
@@ -295,16 +325,47 @@ MIT，见 [LICENSE](LICENSE)。
 
 An AI "group member" that lives in a QQ group (persona: *Little Whale*). Not a Q&A support bot — the goal is to **blend in as a real person**: it lurks, jumps into conversations, sends stickers, pokes back, sees images and videos, and remembers who people are.
 
-Four independently usable parts:
+Six independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
 | [`plugins/`](plugins/) | 45 AstrBot plugins — all bot capabilities | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
+| [`desktop-controller/`](desktop-controller/) | Windows EXE console: enter server details → auto-deploy and start → edit config online | Python |
+| [`deploy/`](deploy/) | Deployment interface: config item list + runtime config template | JSON / env |
 | [`docs/`](docs/) | Deployment manual and 14 root-cause analyses | Markdown |
 
-### Latest update · 2026-09-08 (integration: 45 plugins wired into breakable pipelines)
+### Latest update · 2026-09-09 (Windows controller EXE downloadable from Releases)
+
+The desktop controller (`desktop-controller/`) used to be source only — an EXE must be built on Windows while
+the bot runs on Linux, so anyone who wanted it had to install Python and run the packaging script. Packaging now
+happens on GitHub's own machines:
+
+- **Push a tag, get an EXE.** New workflow [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml):
+  pushing a `controller-v*` tag (e.g. `controller-v1.0.0`) makes GitHub build a single-file EXE with PyInstaller
+  on its own `windows-latest` runner and attach it to [Releases](../../releases) — one click to download, exactly
+  like the Android console.
+- **No tag needed to try it.** Run the workflow manually from the Actions tab to build without publishing; that
+  run's artifacts hold the EXE.
+- **Two files per build.** `dafeiyu-controller.exe` (single file, no install, double-click to run) and
+  `dafeiyu-controller.exe.sha256` (checksum). Verify with
+  `Get-FileHash .\dafeiyu-controller.exe -Algorithm SHA256` and compare it against the `.sha256` file.
+- **Why the release asset uses an ASCII name.** The program inside is still named "大肥鱼机器人控制台", but the
+  published file name is ASCII to avoid browser / antivirus trouble with non-ASCII file names.
+- **The build script now takes `-PythonExe`.** `desktop-controller/build-windows.ps1` can be pointed at a specific
+  interpreter (CI passes setup-python's `python`; locally it still defaults to Windows `py -3`), and it locates the
+  output with a wildcard instead of a hard-coded non-ASCII path.
+
+The security boundary is unchanged: the EXE contains **no** server address, account, password, private key, Token,
+or bot configuration — you enter all of it in the UI, and the workflow never reads any secret.
+
+Verified: the `controller-v1.0.0` tag triggered the first build — all eight Actions steps green — and Releases now
+serves `dafeiyu-controller.exe` (16.1 MB, a PE32+ GUI executable) plus its `.sha256` file. I downloaded the artifact
+and the computed SHA-256 matched the published value, then searched the binary for production IPs, deployment paths,
+group IDs and Tokens: zero hits.
+
+### Previous update · 2026-09-08 (integration: 45 plugins wired into breakable pipelines)
 
 The repo is now organized around **45 plugins**. Every earlier batch fixed a single defect; this one treats
 the whole set as **one pipeline** — making "human" not a pile of independent switches but a chain with priority.
