@@ -347,9 +347,16 @@ class Main(star.Star):
             if SHADOW:
                 logger.info("[selfguard] 影子模式：本来要拦（%s）", brief)
                 return
-            event.clear_result()
-            logger.info("[selfguard] 出口拦下一条（%s）", brief)
-            event.stop_event()
+            # 不走 clear_result+stop_event：AstrBot 框架 respond 阶段仍会把清空
+            # 后的空 chain 发出去（群友看到的就是「不说话」）。改为替换成一句
+            # 中性短拒答：有回应、不重复原话、也不刷屏。
+            reply = "（这个话题刚说过啦）" if hit == "自我重复" else "（先不吵啦）"
+            try:
+                event.set_result(reply)
+            except BaseException:
+                event.clear_result()
+                event.stop_event()
+            logger.info("[selfguard] 出口拦下一条（%s）-> %s", brief, reply)
         except BaseException as exc:
             # 自己出问题就当没这道门，绝不连累正常回复
             logger.warning("[selfguard] 闸门异常，放行: %r", exc)
