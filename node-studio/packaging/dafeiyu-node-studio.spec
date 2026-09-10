@@ -1,16 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-# SPECPATH already points at the directory containing this spec file.
-ROOT = Path(SPECPATH).resolve().parent.parent
+# PyInstaller defines SPECPATH as the directory containing this spec file.
+ROOT = Path(SPECPATH).resolve().parent
 
 analysis = Analysis(
-    [str(ROOT / "packaging" / "windows_entry.py")],
-    pathex=[str(ROOT)],
+    [str(ROOT / "windows_entry.py")],
+    pathex=[str(ROOT.parent)],
     binaries=[],
     datas=[
-        (str(ROOT / "dafeiyu_flow" / "static"), "dafeiyu_flow/static"),
-        (str(ROOT / "graphs"), "graphs"),
+        (str(ROOT.parent / "dafeiyu_flow" / "static"), "dafeiyu_flow/static"),
+        (str(ROOT.parent / "graphs"), "graphs"),
     ],
     hiddenimports=[],
     hookspath=[],
