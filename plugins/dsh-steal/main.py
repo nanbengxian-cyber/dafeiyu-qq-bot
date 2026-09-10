@@ -54,7 +54,7 @@ import PIL.Image as PILImage
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import Image
 from astrbot.core import logger
 from astrbot.core.platform.message_type import MessageType
 
@@ -534,18 +534,17 @@ class Main(star.Star):
 
     @filter.command("表情包")
     async def cmd_sticker(self, event: AstrMessageEvent):
-        """随机发一张偷来的表情包（图文分开发，混一条会被丢弃）。"""
+        """随机发一张偷来的表情包。只发图，不配含义注解——图本身就是意思。"""
         p = self._pick()
         if not p:
             yield event.plain_result("还没偷到表情包，群里多发点梗图让我学学[贴纸:装可怜]")
             return
-        path, caption = p
-        # 图单独一条，含义文字放底下另一条（照 dsh-welcome 实测：图文混一条丢图）
+        path, _caption = p
+        # 图单独一条（照 dsh-welcome 实测：图文混一条丢图）；含义留在库存里
+        # 当选图依据，不解释成文字（真人用梗图不会配一句“这张图表示X”）。
         yield event.chain_result(
             MessageChain([Image.fromFileSystem(os.path.join(HOME, path))])
         )
-        if caption:
-            yield event.plain_result("这表情懂的人是懂.jpg（%s）" % caption)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
     async def maybe_serve(self, event: AstrMessageEvent) -> None:
@@ -568,8 +567,9 @@ class Main(star.Star):
             p = self._pick()
             if not p:
                 return
-            path, caption = p
-            # 图单独一条（照 dsh-welcome：图文混一条会被丢弃）
+            path, _caption = p
+            # 图单独一条（照 dsh-welcome：图文混一条会被丢弃）。只发图，
+            # 不配含义注解——想表达意思时才发，发出去就是意思本身。
             try:
                 await event.send(
                     MessageChain([Image.fromFileSystem(os.path.join(HOME, path))])
@@ -577,10 +577,6 @@ class Main(star.Star):
             except BaseException as e:
                 logger.warning("[steal] 表情包发送失败 %s: %s", path, e)
                 return
-            if caption:
-                await event.send(
-                    MessageChain([Plain("这表情懂的人是懂.jpg（%s）" % caption)])
-                )
         except BaseException:
             pass
 
