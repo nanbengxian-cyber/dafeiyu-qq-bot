@@ -34,7 +34,7 @@
 判据是**两个信号取或**，拿它自己 44 条真话回测定的：
 
   * 最长公共子串 ≥ 4 字   → 抓「土地公公这波是工伤」→「土地公公实锤了」
-  * 共享 bigram ≥ 2 **且** 占较短那条的 ≥ 25%
+  * 共享 bigram ≥ 2 **且** 占较短那条的 ≥ 35%
                           → 抓「造反前记得先喊我一声」→「我也要，记得喊我」
                             （这一对最长公共子串只有 2，光看子串会漏）
 
@@ -89,6 +89,7 @@
 """
 
 import os
+import random
 import re
 import sqlite3
 import time
@@ -119,13 +120,32 @@ KEEP = max(1, int(os.environ.get("DSH_SELFGUARD_KEEP", "3")))
 LCS_MIN = max(2, int(os.environ.get("DSH_SELFGUARD_LCS", "4")))
 # 共享 bigram 的个数下限与占比下限
 BG_MIN = max(1, int(os.environ.get("DSH_SELFGUARD_BIGRAM", "2")))
-BG_RATIO = min(1.0, max(0.05, float(os.environ.get("DSH_SELFGUARD_RATIO", "0.25"))))
+# 占比下限 35%（2026-09-10 从 25% 调高）：真语料里「…是吧」「…了是」这类
+# 语气词尾 bigram 占比常在 25%~30%，被误拦成「自我重复」，报菜名话题一晚上
+# 连拦 7 条；而真实重复（「喵一下」「也没收」）占比普遍 ≥40%，不受影响。
+BG_RATIO = min(1.0, max(0.05, float(os.environ.get("DSH_SELFGUARD_RATIO", "0.35"))))
 # 「群里在冲突」回看多少秒
 CONFLICT_WINDOW = max(30.0, float(os.environ.get("DSH_SELFGUARD_WINDOW", "180")))
 # 太短的话没有「重复」可言（「6」「草」真人也会连发）
 MIN_LEN = max(2, int(os.environ.get("DSH_SELFGUARD_MIN_LEN", "5")))
 MEM_DB = os.environ.get("DSH_MEM_DB", "/AstrBot/data/dsh_memory.db")
 OWNERS = _set("DSH_SELFGUARD_OWNER", "2774000001")
+
+# 拦截后的中性短拒答话术池（随机轮换，见出口处注释）
+_REPEAT_REPLIES = (
+    "（这个话题刚说过啦）",
+    "（刚说过了呀）",
+    "（这句说过了）",
+    "（上一条就是这个）",
+    "（重复啦，换个说法）",
+)
+_TAUNT_REPLIES = (
+    "（先不吵啦）",
+    "（这轮先跳过）",
+    "（这句先不发）",
+)
+# 上一条用过的拒答（避免连发同一句）
+_last_reply = [""]
 
 
 # ---------------------------------------------------------------- 纯函数（可离线回测）
@@ -350,7 +370,12 @@ class Main(star.Star):
             # 不走 clear_result+stop_event：AstrBot 框架 respond 阶段仍会把清空
             # 后的空 chain 发出去（群友看到的就是「不说话」）。改为替换成一句
             # 中性短拒答：有回应、不重复原话、也不刷屏。
-            reply = "（这个话题刚说过啦）" if hit == "自我重复" else "（先不吵啦）"
+            # 2026-09-10 起从话术池随机挑且避开上一条：固定一句拒答本身就会变成
+            # 机器人的「自我重复」，群里连拦几次全是同一句，比原话更显机械。
+            pool = _REPEAT_REPLIES if hit == "自我重复" else _TAUNT_REPLIES
+            cands = [r for r in pool if r != _last_reply[0]] or list(pool)
+            reply = random.choice(cands)
+            _last_reply[0] = reply
             try:
                 event.set_result(reply)
             except BaseException:
