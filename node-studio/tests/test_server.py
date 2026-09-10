@@ -132,8 +132,21 @@ class ServerTests(unittest.TestCase):
         while server.active_workers != 1 and time.time() < deadline: time.sleep(0.01)
         second = socket.create_connection(server.server_address, timeout=2)
         second.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-        self.assertIn(b"503 Service Unavailable", second.recv(256))
-        first.close(); second.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+        try:
+            second.settimeout(2)
+            response = b""
+            try:
+                while b"\r\n\r\n" not in response:
+                    chunk = second.recv(256)
+                    if not chunk:
+                        break
+                    response += chunk
+            except (ConnectionAbortedError, ConnectionResetError):
+                # Windows may surface a close immediately after the complete response as WSAECONNABORTED.
+                pass
+            self.assertIn(b"503 Service Unavailable", response)
+        finally:
+            first.close(); second.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 
     def test_unknown_run_and_path_traversal(self):
         status, _, _ = self.request("GET", "/api/runs/run-missing")
