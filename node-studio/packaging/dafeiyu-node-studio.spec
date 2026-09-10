@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-ROOT = Path(SPECPATH).resolve().parent
+# SPECPATH already points at the directory containing this spec file.
+ROOT = Path(SPECPATH).resolve().parent.parent
 
 analysis = Analysis(
     [str(ROOT / "packaging" / "windows_entry.py")],
