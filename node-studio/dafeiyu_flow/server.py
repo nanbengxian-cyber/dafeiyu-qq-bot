@@ -288,10 +288,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def serve_file(self, path: Path) -> None:
         try:
+            static_root = STATIC.resolve(strict=True)
             resolved = path.resolve(strict=True)
         except (OSError, RuntimeError):
             self.error_json("未找到", 404, "NOT_FOUND"); return
-        if STATIC not in resolved.parents and resolved != STATIC:
+        if static_root not in resolved.parents and resolved != static_root:
             self.error_json("未找到", 404, "NOT_FOUND"); return
         body = resolved.read_bytes()
         ctype = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
