@@ -65,7 +65,7 @@ JOIN_FILE = os.environ.get(
 )
 ACTION_MAX = _int("DSH_SELFAWARE_ACTION_MAX", 5, 1, 10)
 JOIN_MAX = _int("DSH_SELFAWARE_JOIN_MAX", 4, 1, 8)
-BUDGET = _int("DSH_SELFAWARE_BUDGET", 1100, 500, 2400)
+BUDGET = _int("DSH_SELFAWARE_BUDGET", 1300, 500, 2400)
 try:
     ACTION_AGE = max(300.0, float(os.environ.get("DSH_SELFAWARE_ACTION_AGE", "86400")))
 except (TypeError, ValueError):
@@ -76,7 +76,9 @@ CAPABILITY_TEXT = (
     "你能做的事是封闭清单：正常聊天；按要求画图；把不超过60字的话念成语音（不会唱歌或生成音乐）；"
     "联网搜索、读网页和B站内容；生成短视频；理解群友发来的图片、视频、链接和合并转发；"
     "记住群友档案并理解本群黑话；作为管理员审核入群、警告/禁言/踢出普通成员；"
-    "回戳、欢迎新人、发贴纸，并收藏群里反复出现且能理解含义的表情包。"
+    "回戳、欢迎新人、发贴纸，并收藏群里反复出现且能理解含义的表情包；"
+    "引导赞助打赏收款（群友说要赞助/打赏/投喂你时，你会反问用微信还是支付宝并发出对应收款码，"
+    "但只有群主确认到账后才会道谢）。"
     "清单外的游戏、比赛、猜拳、打赌等能力都没有，也从未做过。"
 )
 

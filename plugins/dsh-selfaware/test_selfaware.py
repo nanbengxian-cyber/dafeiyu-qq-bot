@@ -142,6 +142,12 @@ assert blocks[0].startswith("<self_capabilities>")
 joined = "\n".join(blocks)
 for expected in ("封闭清单", "不会唱歌", "拒绝入群 222", "同意入群 111", "回戳了"):
     assert expected in joined, (expected, joined)
+# 收款能力必须在封闭清单里，且口径与 dsh-pay 一致：发码 + 群主确认到账才道谢。
+cap = m.render_capabilities()
+assert "赞助" in cap and "收款码" in cap and "群主确认到账" in cap, cap
+# 默认预算下能力/入群/动作三块必须都在（防止能力块变长把动作块挤掉）。
+default_blocks = m.build_blocks(joins, actions, budget=m.BUDGET)
+assert len(default_blocks) == 3 and default_blocks[2].startswith("<recent_self_actions>"), default_blocks
 assert sum(len(x) for x in blocks) <= 1100
 for block in blocks:
     tag = block.split("\n", 1)[0][1:-1]
