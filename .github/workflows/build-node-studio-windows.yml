@@ -50,7 +50,7 @@ jobs:
             }
             if (-not $ready) { throw "EXE smoke test failed" }
             $root = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:18765/" -TimeoutSec 2
-            if ($root.StatusCode -ne 200 -or $root.Content -notmatch "id=\"graph\"") { throw "Root page smoke failed" }
+            if ($root.StatusCode -ne 200 -or $root.Content -notmatch 'id="graph"') { throw "Root page smoke failed" }
             foreach ($asset in @("/static/app.js", "/static/styles.css")) {
               if ((Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:18765$asset" -TimeoutSec 2).StatusCode -ne 200) { throw "Asset smoke failed: $asset" }
             }

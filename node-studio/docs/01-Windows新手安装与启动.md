@@ -6,7 +6,7 @@
 
 - `dafeiyu-node-studio.exe`：程序本体；
 - `dafeiyu-node-studio.exe.sha256`：校验文件；
-- `dafeiyu-node-lab-source-v0.1.0.zip`：留存源码，不运行程序时可以不下载。
+- `dafeiyu-node-studio-source-v0.1.0.zip`：留存源码，不运行程序时可以不下载。
 
 不要从不明网盘下载同名程序。
 

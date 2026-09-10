@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List
 
 ROOT = Path(__file__).resolve().parent.parent
 RELEASE = ROOT / "release"
-ARCHIVE_NAME = "dafeiyu-node-lab-source-v0.1.0.zip"
+ARCHIVE_NAME = "dafeiyu-node-studio-source-v0.1.0.zip"
 ALLOWLIST = [
     ".gitignore", "README.md", "CHANGELOG.md",
     "dafeiyu_flow/__init__.py", "dafeiyu_flow/cli.py",
