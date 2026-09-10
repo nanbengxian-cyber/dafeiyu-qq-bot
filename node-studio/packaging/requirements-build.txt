@@ -1,2 +1,2 @@
-# 固定版本用于可复现的 Windows 打包环境
+# Pinned build dependency for the Windows packaging environment.
 pyinstaller==6.11.1

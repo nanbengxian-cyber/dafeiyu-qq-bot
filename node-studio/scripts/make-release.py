@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RELEASE = ROOT / "release"
 ARCHIVE_NAME = "dafeiyu-node-lab-source-v0.1.0.zip"
 ALLOWLIST = [
-    ".gitignore", "README.md", "CHANGELOG.md", ".github/workflows/build-windows.yml",
+    ".gitignore", "README.md", "CHANGELOG.md",
     "dafeiyu_flow/__init__.py", "dafeiyu_flow/cli.py",
     "dafeiyu_flow/desktop.py", "dafeiyu_flow/engine.py", "dafeiyu_flow/model.py",
     "dafeiyu_flow/registry.py", "dafeiyu_flow/server.py", "dafeiyu_flow/types.py",
