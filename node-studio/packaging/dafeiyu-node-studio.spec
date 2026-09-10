@@ -3,15 +3,18 @@ from pathlib import Path
 
 # PyInstaller exposes SPECPATH as the spec directory; its parent is this module root.
 ROOT = Path(SPECPATH).resolve().parent
+STATIC = ROOT / "dafeiyu_flow" / "static"
+GRAPHS = ROOT / "graphs"
+DATA_FILES = (
+    [(str(path), "dafeiyu_flow/static") for path in sorted(STATIC.iterdir()) if path.is_file()]
+    + [(str(path), "graphs") for path in sorted(GRAPHS.glob("*.json"))]
+)
 
 analysis = Analysis(
     [str(ROOT / "packaging" / "windows_entry.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        (str(ROOT / "dafeiyu_flow" / "static"), "dafeiyu_flow/static"),
-        (str(ROOT / "graphs"), "graphs"),
-    ],
+    datas=DATA_FILES,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
