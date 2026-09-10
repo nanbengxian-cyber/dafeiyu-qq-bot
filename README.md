@@ -2,9 +2,9 @@
 
 [中文](#中文) · [English](#english)
 
-一套让 QQ 群机器人「像真人群友一样说话」的完整工程：45 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App，以及记录每个问题根因与实测数据的技术文档。
+一套让 QQ 群机器人「像真人群友一样说话」的完整工程：48 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App、一个 Windows 桌面控制台，以及记录每个问题根因与实测数据的技术文档。
 
-A complete engineering effort to make a QQ group bot *talk like an actual group member*: 45 AstrBot plugins, a QQ↔AI bridge, an Android console app, and technical documents recording the root cause and measured data behind every fix.
+A complete engineering effort to make a QQ group bot *talk like an actual group member*: 48 AstrBot plugins, a QQ↔AI bridge, an Android console app, a Windows desktop controller, and technical documents recording the root cause and measured data behind every fix.
 
 ---
 
@@ -14,16 +14,72 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 一个跑在 QQ 群里的 AI 群友（人格叫「小鲸鱼」）。它不是客服式问答机器人 —— 目标是**混在群里像个真人**：会潜水、会插话、会发表情包、会戳回去、看得见图片和视频、记得住群友是谁。
 
-仓库包含四块可独立使用的东西：
+仓库包含六块可独立使用的东西：
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
-| [`plugins/`](plugins/) | 45 个 AstrBot 插件 —— 机器人的全部能力 | Python |
+| [`plugins/`](plugins/) | 48 个 AstrBot 插件 —— 机器人的全部能力 | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
-| [`docs/`](docs/) | 部署手册与 14 份问题根因分析 | Markdown |
+| [`desktop-controller/`](desktop-controller/) | Windows EXE 控制台：填服务器信息 → 自动部署并启动 → 在线改配置 | Python |
+| [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
+| [`docs/`](docs/) | 部署手册与 19 份技术文档（根因分析、设计方案与实施记录） | Markdown |
 
-### 最新更新 · 2026-09-08（整体整合：45 个插件连成断点管线）
+### 最新更新 · 2026-09-09（第八版：社交关系 / 自身利益 / 联网出口审核）
+
+第八版把「像真人」从**说话方式**推进到**立场与边界**，并补上一道防炸群的出口闸。三块新能力加两处修正，
+插件总数到 **47 个**：
+
+- **社交关系（[`dsh-social`](plugins/dsh-social/)）。** 按群隔离的关系账本：亲密度 -100..100、信任 0..100，
+  30 天半衰期回落、单人单日变动封顶 ±10。只认三种**直接指向它**的信号（被 @ 后的感谢 +1/+1、明确的
+  「别插话」-1 且 24 小时少打扰、明确的重度辱骂 -2/-1）；第三人称的「那些都是人机」、群友互撕、没回复
+  一律不算。默认**影子模式**：先只记账、不动回复，确认没有误判再切口吻。**@、提问、能力请求永远照常完整
+  回答** —— 这条是代码里的硬条件。细节见 [62-社交关系](docs/62-社交关系-按群隔离的社交距离.md)。
+- **自身利益（[`dsh-selfworth`](plugins/dsh-selfworth/)）。** 治「卖了他还替别人数钱」：认低身价、认下贬低、
+  认被白嫖、替外人记账四类损己发言（从 3097 条真话回测出来的）。判据必须**两侧同时成立**才动手 ——
+  输入侧确实有人在占它便宜（TTL 内），输出侧回复出现认账形状。单看任何一侧都会误伤，因为它嘴硬时也说
+  「身价」「白嫖」「傻鱼」。默认把认账那句换成傲娇的顶回去。细节见
+  [63-自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md)。
+- **联网出口审核（[`dsh-web`](plugins/dsh-web/)）。** `/看网页`、`/搜` 的结果**不经过 LLM 直接进群**，
+  原来只有关键词正则兜着 —— 维基那种「通篇讲一个敏感人物但不含词表词」的页面漏一条就炸群。现在出口
+  先审后发：正则快筛 → 小模型 JSON 五布尔判定（任一为 true 强制拦）→ **超时/异常/无模型一律不发**
+  （fail-closed），结论缓存 30 分钟、超时不缓存。覆盖五条出口，其中回复出口闸只在回复带网址时触发、
+  平时零开销。细节见 [64-联网出口审核](docs/64-联网出口审核-先审后发防炸群.md)。
+- **黑话自指修正（[`dsh-glossary`](plugins/dsh-glossary/)）。** 「人机」的旧释义写「群里冲你说这个多半是
+  拿你是机器人打趣」、例句又全是第二人称，模型把群友第三人称的「那些都是人机」接成了对自己的攻击。
+  改成中性释义 + 第三人称例句，并在没被点名时补一句硬提示。
+- **文档与索引同步。** 新增 62/63/64 三份文档；插件表、文档索引、插件数（45 → 47）全部对齐；仓库里
+  可识别信息按[文档索引](docs/README.md)承诺的口径复扫了一遍（真实昵称、群号、QQ 号）。
+
+验证（容器内 py3.12 实跑）：`dsh-social` 17 项断言、`dsh-selfworth` 离线回测、`dsh-glossary` 词表回测、
+`dsh-quote` 25 项、`dsh-style` / `dsh-decide` / `dsh-memory` 全部通过；`dsh-web` 出口审核 19 项断言全过。
+
+### 上一次更新 · 2026-09-09（Windows 控制台 EXE 可在发行版直接下载）
+
+桌面控制台（`desktop-controller/`）之前只有源码 —— EXE 必须在 Windows 上打包，而部署机器人的服务器是 Linux，
+所以想用的人得自己装 Python 再跑打包脚本。现在打包这件事交给 GitHub 自己：
+
+- **推一个标签就出 EXE。** 新增工作流 [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)：
+  推 `controller-v*` 标签（例如 `controller-v1.0.0`）时，GitHub 在自己的 `windows-latest` 机器上用
+  PyInstaller 打包单文件 EXE，并挂到 [Releases](../../releases) —— 和安卓版控制台一样，点开就能下载。
+- **不打标签也能试。** 在 Actions 页面手动 Run workflow，只构建、不发布，产物在本次运行的 Artifacts 里。
+- **每次构建两个文件。** `dafeiyu-controller.exe`（单文件、免安装、双击即用）和
+  `dafeiyu-controller.exe.sha256`（校验值）。校验方法：PowerShell 里执行
+  `Get-FileHash .\dafeiyu-controller.exe -Algorithm SHA256`，与 `.sha256` 文件里的值比对。
+- **为什么发布资源用英文名。** EXE 内部的程序名仍然是「大肥鱼机器人控制台」，但发布出去的文件名用 ASCII，
+  避免浏览器 / 杀软对中文文件名的兼容问题。
+- **打包脚本加了 `-PythonExe`。** `desktop-controller/build-windows.ps1` 现在可以指定解释器
+  （CI 里传 setup-python 的 `python`，本地不传则沿用 Windows 的 `py -3`），
+  并且改用通配符定位产物、不再依赖中文路径字面量。
+
+安全边界没有变：EXE 里**不含**任何服务器地址、账号、密码、私钥、Token 或机器人配置，全部由使用者在界面里填；
+工作流也不读取任何密钥。
+
+验证：`controller-v1.0.0` 标签触发首次构建，Actions 八个步骤全绿；发行版页面已出现 `dafeiyu-controller.exe`
+（16.1 MB，PE32+ GUI 可执行文件）和 `.sha256` 校验文件。把产物下载回来后实测 SHA-256 与 `.sha256` 里的值一致，
+并在二进制里搜过生产 IP、部署路径、群号、Token —— 全部 0 命中。
+
+### 上一次更新 · 2026-09-08（整体整合：45 个插件连成断点管线）
 
 这之后把仓库整理到了**45 个插件**。前面每一批都是在单点修故障，这一批是第一次把所有插件
 **当成一套管线来布线**——让「像真人」这件事不再是一堆各自为战的开关，而是按优先级串联起来。
@@ -118,9 +174,14 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 ### 成品下载
 
-安卓控制台 App 在 [Releases](../../releases) 页面下载（约 121 KB，安卓 5.0+）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。
+[Releases](../../releases) 页面：
 
-### 45 个插件在解决什么
+| 产物 | 平台 | 说明 |
+|---|---|---|
+| `dafeiyu-console.apk` | 安卓 5.0+ | 安卓控制台 App（约 121 KB）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。 |
+| `dafeiyu-controller.exe` | Windows 10/11 | 桌面控制台（单文件、免安装）：填服务器 SSH 与仓库信息 → 自动部署并启动 → 之后在同一个界面里改配置。同页的 `.sha256` 是校验值。 |
+
+### 47 个插件在解决什么
 
 每个插件对应一个**实际发生过的问题**，不是功能清单式的堆砌。
 
@@ -133,6 +194,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-decide`](plugins/dsh-decide/) | 主动插话前先用小模型判断「在聊什么、该不该开口」，判沉默就掐掉整次主模型调用，省约 9400 token。 |
 | [`dsh-mention`](plugins/dsh-mention/) | 每条回复都 @ 人。只在「调了工具 / 被别人的消息刷走 / 隔太久」时才 @。 |
 | [`dsh-claimguard`](plugins/dsh-claimguard/) | 被骗认输。有人说「叫我爸爸」「单挑你输了」它就当真 —— 靠注入事实而不是改人格来修。 |
+| [`dsh-selfworth`](plugins/dsh-selfworth/) | 卖了他还替别人数钱。认低身价、认下贬低、认被白嫖、替外人记账四类损己发言（3097 条真话回测）。输入侧「有人在占便宜」+ 输出侧「回复认了账」两侧同时成立才动手 —— 它嘴硬时也说这些词，单看一侧必误伤。 |
 | [`dsh-initiate`](plugins/dsh-initiate/) | 冷场就一直安静。真人会自己起话头，它不会。五道纯代码闸门（冷场 15 分钟~6 小时、活跃时段、1 小时冷却、每日 3 次）过了才让小模型看一眼有没有值得接的话头；决定开口就造合成事件走**完整消息管道**，贴纸剥离/@ 策略/分段发送全部照常。判断失败一律沉默。 |
 | [`dsh-emotion`](plugins/dsh-emotion/) | 语气永远一个样。六种情绪同时只有一种，固定优先级仲裁保证一条消息只触发一种（「你好厉害但也真让我失望」只取低落）。清零四条路：道歉、连续 2 条中性、问题被回答、分情绪 TTL。 |
 | [`dsh-quote`](plugins/dsh-quote/) | 看不懂引用，把别人做的事说成自己做的。框架的引用块只给昵称，而群里有真人把昵称改成和机器人一样 —— **凭昵称在群聊里永远认不了人**。改为按 QQ 号写清「谁在说 / 引用谁的哪句 / 是不是自己说的 / 这次 @ 谁」。 |
@@ -157,7 +219,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-imagegen`](plugins/dsh-imagegen/) | 嘴上答应却不出图。便宜模型在长上下文里经常不调工具，必须有兜底钩子。 |
 | [`dsh-video`](plugins/dsh-video/) | 看视频 + 生成视频。抽 4 帧比传整段快 5 倍、省 18 倍 token，质量一样。生成一次要 4 分钟，绝不能在工具里等（会锁死整个会话）。 |
 | [`dsh-voice`](plugins/dsh-voice/) | 语音。内置 TTS 是「全局开关＋概率」，会把所有回复都念出来，立刻出戏。 |
-| [`dsh-web`](plugins/dsh-web/) | 联网。链接就在消息里，插件自己抓完注入，不指望模型自觉调工具。 |
+| [`dsh-web`](plugins/dsh-web/) | 联网。链接就在消息里，插件自己抓完注入，不指望模型自觉调工具。抓到的正文**先审后发**：正则快筛 + 小模型判定，超时/异常/无模型一律不发（fail-closed），防机器人自己把违禁内容贴进群。 |
 | [`dsh-sticker`](plugins/dsh-sticker/) | 表情包。关键是标记**无条件**剥掉 —— 否则 `[贴纸:xx]` 会原样漏进群聊。 |
 | [`dsh-listen`](plugins/dsh-listen/) | 听语音。语音条/音轨交给转写服务转成文字，以语音上下文注入 —— 群友发语音它不再只知道「有人发了条语音」。 |
 
@@ -166,6 +228,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | 插件 | 解决的问题 |
 |---|---|
 | [`dsh-memory`](plugins/dsh-memory/) | 记不住人。框架自带的只是「最近 20 条」滑动窗口，滑出去就没了。自建缓冲 + 后台抽取，带隐私脱敏、注入防护、按人容量上限、自助 `/忘记我`。 |
+| [`dsh-social`](plugins/dsh-social/) | 对所有人一个口吻：对熟人太客气、对陌生人太熟络。按群隔离的关系账本（30 天半衰期、单日封顶），只认直接指向它的三种信号，默认影子模式；负档只改语气与主动性，**@/提问/能力请求永远照常完整回答**。 |
 | [`dsh-guard`](plugins/dsh-guard/) | 违规禁言。三层：关键词预筛（0 成本，真群实测仅 2.2% 命中）→ 小模型只输出布尔 → **代码**决定禁不禁。 |
 | [`dsh-poke`](plugins/dsh-poke/) | 戳一戳没反应。回话不问 LLM，三道限流防对戳循环。 |
 | [`dsh-welcome`](plugins/dsh-welcome/) | 入群欢迎。用 LLM 现场生成而不是写死模板（模板会破人设）。 |
@@ -174,6 +237,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`dsh-spine`](plugins/dsh-spine/) | 被追问就改口、被质疑就道歉。跟 `dsh-claimguard` 的区别是它管的是**立场稳定性**而不是事实。 |
 | [`dsh-slang`](plugins/dsh-slang/) | 黑话不用人喂。自动从群聊挖疑似黑话、查好含义进候选，每 8 小时 AI 自己审一遍（转正/拒绝/再等等）。 |
 | [`dsh-factguard`](plugins/dsh-factguard/) | 记忆看门狗。问机器人自身属性只按事实表回答，无依据断言直接否认纠正，防乱承认与性别摇摆。 |
+| [`dsh-selfaware`](plugins/dsh-selfaware/) | 自我认知账本。注入封闭能力清单、近期入群审核和真实动作；动作从现有成功日志旁路捕获进独立 SQLite，不改其它插件。 |
 | [`dsh-leakguard`](plugins/dsh-leakguard/) | 拦系统提示词泄露。查回复有没有把人格专属标题/指令句原样抄进去。与 `dsh-humanizer` 联动做硬兜底。 |
 | [`dsh-homophone`](plugins/dsh-homophone/) | 同音字/谐音识别。谐音称呼当被喊、谐音梗本意注入。 |
 | [`dsh-joinguard`](plugins/dsh-joinguard/) | 入群 AI 审核。拿入群问题+答案问 AI 判 approve/reject 并真批/真拒。 |
@@ -219,6 +283,10 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [48-黑话自动审核](docs/48-黑话自动审核-更新详解.md) | `dsh-slang` 自动审核:从群聊挖候选 → 主模型考究释义 → 每 8 小时 AI 自动审核转正,群主命令兜底 |
 | [50-多模态接入与验证记录](docs/50-多模态接入与验证记录.md) | 图/视频/语音/联网的逐项实测，含失败记录 |
 | [60-长期目标与技术方案](docs/60-长期目标与技术方案.md) | 整体架构与演进方向 |
+| [61-桌面控制台](docs/61-桌面控制台-一键部署与在线配置.md) | Windows EXE 一键部署：填服务器与仓库信息 → 自动拉代码/起容器 → 在线改配置；含安全边界与已知边界 |
+| [62-社交关系](docs/62-社交关系-按群隔离的社交距离.md) | 按群隔离的社交距离：数据模型、只认哪些信号（以及哪些明确不算）、五档口吻、影子模式与隐私边界 |
+| [63-自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md) | 四类损己发言的真语料证据、为什么人格治不了、为什么判据是「输入侧证据 + 输出侧形状」两侧同时成立 |
+| [64-联网出口审核](docs/64-联网出口审核-先审后发防炸群.md) | 五条出口的审核路径、为什么必须 fail-closed、回复出口闸的降级策略与残留风险 |
 | [群指令手册](docs/群指令手册.md) | 群里所有指令的用途、权限与示例(50 条插件指令 + 9 条内置指令) |
 
 ### 快速开始
@@ -293,16 +361,85 @@ MIT，见 [LICENSE](LICENSE)。
 
 An AI "group member" that lives in a QQ group (persona: *Little Whale*). Not a Q&A support bot — the goal is to **blend in as a real person**: it lurks, jumps into conversations, sends stickers, pokes back, sees images and videos, and remembers who people are.
 
-Four independently usable parts:
+Six independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
-| [`plugins/`](plugins/) | 45 AstrBot plugins — all bot capabilities | Python |
+| [`plugins/`](plugins/) | 48 AstrBot plugins — all bot capabilities | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
-| [`docs/`](docs/) | Deployment manual and 14 root-cause analyses | Markdown |
+| [`desktop-controller/`](desktop-controller/) | Windows EXE console: enter server details → auto-deploy and start → edit config online | Python |
+| [`deploy/`](deploy/) | Deployment interface: config item list + runtime config template | JSON / env |
+| [`docs/`](docs/) | Deployment manual and 19 technical documents (root-cause analyses, designs, implementation records) | Markdown |
 
-### Latest update · 2026-09-08 (integration: 45 plugins wired into breakable pipelines)
+### Latest update · 2026-09-09 (v8: social distance / self-interest / outbound moderation)
+
+v8 moves "sounding human" from **how it talks** to **where it stands and where its limits are**, and adds a gate
+that keeps the bot from getting the group banned. Three new capabilities plus two fixes; the plugin count is now
+**47**:
+
+- **Social distance ([`dsh-social`](plugins/dsh-social/)).** A per-group relationship ledger: affinity -100..100,
+  trust 0..100, a 30-day half-life back to neutral, and a ±10 daily cap per person. Only three signals count, and
+  only when they are **aimed at the bot** (thanks after an @: +1/+1; an explicit "stop butting in": -1 plus a
+  24-hour quiet period; explicit heavy abuse: -2/-1). Third-person "they're all bots", members fighting each other,
+  and silence count for nothing. Default is **shadow mode**: it scores and audits but changes no reply. **An @, a
+  question, or a capability request is always answered in full** — a hard condition in code, not a hint. Details in
+  [62](docs/62-社交关系-按群隔离的社交距离.md).
+- **Self-interest ([`dsh-selfworth`](plugins/dsh-selfworth/)).** Fixes "sell him and he'll count your money for
+  you": four shapes of self-harming speech (accepting a low price, accepting an insult, accepting freeloading, and
+  bookkeeping on the owner's behalf), mined from 3097 real bot utterances. The verdict requires **both sides** —
+  someone is taking advantage of it (within a TTL) *and* the reply actually concedes. Either side alone misfires,
+  because it also says "price", "freeload" and "silly fish" when it is pushing back. Default replaces the conceding
+  line with a short bratty retort. Details in [63](docs/63-自身利益-不认账不自贬不替外人记账.md).
+- **Outbound moderation ([`dsh-web`](plugins/dsh-web/)).** `/看网页` and `/搜` results go **straight into the group
+  without passing the LLM**, guarded only by a keyword regex — a Wikipedia page that is entirely about one sensitive
+  figure but contains none of the keywords slips through and gets the group banned. Everything leaving the plugin is
+  now reviewed first: regex pre-filter → small-model JSON verdict (any of five booleans true forces a block) →
+  **timeout / exception / no model means do not send** (fail-closed), with a 30-minute cache for definite verdicts
+  and none for timeouts. Five exit paths are covered; the reply gate only fires when a reply contains a URL, so it
+  costs nothing otherwise. Details in [64](docs/64-联网出口审核-先审后发防炸群.md).
+- **Slang self-reference fix ([`dsh-glossary`](plugins/dsh-glossary/)).** The old definition of the "人机" (bot)
+  entry read "when someone says this to you they are teasing you for being a bot" and every example used the second
+  person, so the model read a member's third-person "they're all bots" as an attack on itself. The definition is now
+  neutral, the example is third-person, and an un-mentioned hit gets an explicit hard hint.
+- **Docs and indexes synced.** Three new documents (62/63/64); the plugin table, docs index and plugin count
+  (45 → 47) are all aligned; every identifying string in the repo was re-swept against the policy the index page
+  promises (real nicknames, group IDs, QQ numbers).
+
+Verified in the container (py3.12): `dsh-social` 17 assertions, `dsh-selfworth` offline backtest, `dsh-glossary`
+term backtest, `dsh-quote` 25 checks, and `dsh-style` / `dsh-decide` / `dsh-memory` all pass; `dsh-web` moderation
+19 assertions all pass.
+
+### Previous update · 2026-09-09 (Windows controller EXE downloadable from Releases)
+
+The desktop controller (`desktop-controller/`) used to be source only — an EXE must be built on Windows while
+the bot runs on Linux, so anyone who wanted it had to install Python and run the packaging script. Packaging now
+happens on GitHub's own machines:
+
+- **Push a tag, get an EXE.** New workflow [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml):
+  pushing a `controller-v*` tag (e.g. `controller-v1.0.0`) makes GitHub build a single-file EXE with PyInstaller
+  on its own `windows-latest` runner and attach it to [Releases](../../releases) — one click to download, exactly
+  like the Android console.
+- **No tag needed to try it.** Run the workflow manually from the Actions tab to build without publishing; that
+  run's artifacts hold the EXE.
+- **Two files per build.** `dafeiyu-controller.exe` (single file, no install, double-click to run) and
+  `dafeiyu-controller.exe.sha256` (checksum). Verify with
+  `Get-FileHash .\dafeiyu-controller.exe -Algorithm SHA256` and compare it against the `.sha256` file.
+- **Why the release asset uses an ASCII name.** The program inside is still named "大肥鱼机器人控制台", but the
+  published file name is ASCII to avoid browser / antivirus trouble with non-ASCII file names.
+- **The build script now takes `-PythonExe`.** `desktop-controller/build-windows.ps1` can be pointed at a specific
+  interpreter (CI passes setup-python's `python`; locally it still defaults to Windows `py -3`), and it locates the
+  output with a wildcard instead of a hard-coded non-ASCII path.
+
+The security boundary is unchanged: the EXE contains **no** server address, account, password, private key, Token,
+or bot configuration — you enter all of it in the UI, and the workflow never reads any secret.
+
+Verified: the `controller-v1.0.0` tag triggered the first build — all eight Actions steps green — and Releases now
+serves `dafeiyu-controller.exe` (16.1 MB, a PE32+ GUI executable) plus its `.sha256` file. I downloaded the artifact
+and the computed SHA-256 matched the published value, then searched the binary for production IPs, deployment paths,
+group IDs and Tokens: zero hits.
+
+### Previous update · 2026-09-08 (integration: 45 plugins wired into breakable pipelines)
 
 The repo is now organized around **45 plugins**. Every earlier batch fixed a single defect; this one treats
 the whole set as **one pipeline** — making "human" not a pile of independent switches but a chain with priority.
@@ -413,7 +550,7 @@ Before rollout: **61 new unit tests** (36 emotion + 25 quote) and a **1618-messa
 
 The Android console app is on the [Releases](../../releases) page (~110 KB, Android 5.0+). Enter your own server address on the login screen; the package embeds no server details.
 
-### What the 45 plugins fix
+### What the 47 plugins fix
 
 Each plugin addresses a **problem that actually happened**, not a feature checklist.
 
@@ -426,6 +563,7 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-decide`](plugins/dsh-decide/) | Before jumping in unprompted, a small model judges "what's being discussed, should I speak". A "stay silent" verdict cancels the entire main-model call, saving ~9400 tokens. |
 | [`dsh-mention`](plugins/dsh-mention/) | @-mentioning on every reply. Now only when a tool was used, the message got buried, or too much time passed. |
 | [`dsh-claimguard`](plugins/dsh-claimguard/) | Being talked into submission. Someone says "call me daddy" or "you lost our duel" and it complies — fixed by injecting facts, not by editing the persona. |
+| [`dsh-selfworth`](plugins/dsh-selfworth/) | Conceding its own value under pressure. Requires both fresh input-side evidence of exploitation and an output-side concession shape, then rewrites or blocks only the self-harming line; ordinary pushback passes untouched. |
 | [`dsh-initiate`](plugins/dsh-initiate/) | Staying silent forever once the room goes quiet. Five pure-code gates (idle 15min–6h, active hours, 1h cooldown, 3/day) run before a small model even looks for a thread worth picking up; once it decides, a **synthetic event goes through the full message pipeline**, so sticker stripping, mention policy, and segmented sending all still apply. Any judgment failure means silence. |
 | [`dsh-emotion`](plugins/dsh-emotion/) | One flat tone forever. Six emotions, exactly one at a time; fixed-priority arbitration guarantees a single message triggers only one ("you're great, but you really let me down" yields sadness only). Four reset paths: apology, two consecutive neutral messages, question answered, per-emotion TTL. |
 | [`dsh-quote`](plugins/dsh-quote/) | Misreading quotes and claiming someone else's work as its own. The framework's quote block carries only a nickname — and a real member had renamed themselves to match the bot. **Nicknames can never identify anyone in a group chat.** Now it states, by QQ ID: who is speaking, whose line they quoted, whether that line was the bot's own, and who was mentioned. |
@@ -450,7 +588,7 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-imagegen`](plugins/dsh-imagegen/) | Agreeing to draw but not drawing. Cheap models routinely skip tool calls in long contexts, so a fallback hook is mandatory. |
 | [`dsh-video`](plugins/dsh-video/) | Watching and generating video. Four frames are 5× faster and 18× cheaper than the full clip at equal quality. Generation takes 4 minutes — never wait inside the tool (it would lock the whole session). |
 | [`dsh-voice`](plugins/dsh-voice/) | TTS. The built-in one is a global switch plus probability, reading *every* reply aloud, which instantly breaks character. |
-| [`dsh-web`](plugins/dsh-web/) | Web access. The link is right there in the message, so the plugin fetches and injects it rather than hoping the model calls a tool. |
+| [`dsh-web`](plugins/dsh-web/) | Web access plus outbound moderation. It fetches links already present in a message instead of hoping for a tool call, then reviews every page/search/tool/command exit before sending: regex fast-block → small-model JSON verdict → fail-closed on timeout or failure. |
 | [`dsh-sticker`](plugins/dsh-sticker/) | Stickers. The key rule: strip markers **unconditionally**, or `[sticker:xx]` leaks into the group verbatim. |
 | [`dsh-listen`](plugins/dsh-listen/) | Hearing voice messages. Voice clips are handed to a transcription service and injected as voice context — so it no longer just knows "someone sent a voice message". |
 
@@ -459,6 +597,7 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | Plugin | Problem solved |
 |---|---|
 | [`dsh-memory`](plugins/dsh-memory/) | Not remembering people. The built-in feature is a 20-message sliding window; anything older is gone. Custom buffer plus background extraction, with PII scrubbing, prompt-injection defense, per-person caps, and self-service `/forget me`. |
+| [`dsh-social`](plugins/dsh-social/) | Per-group social distance without changing truth or access. Direct, bot-addressed signals adjust affinity/trust under decay and daily caps; default shadow mode only audits, and questions, @ mentions and capability requests are always answered fully. |
 | [`dsh-guard`](plugins/dsh-guard/) | Moderation. Three layers: regex prefilter (free; only 2.2% hit rate measured on real traffic) → small model emitting booleans only → **code** decides whether to mute. |
 | [`dsh-poke`](plugins/dsh-poke/) | No reaction to pokes. The reply never calls an LLM; three rate limits prevent poke loops. |
 | [`dsh-welcome`](plugins/dsh-welcome/) | Greeting new members. Generated by the LLM rather than a fixed template (templates break character). |
@@ -467,6 +606,7 @@ Each plugin addresses a **problem that actually happened**, not a feature checkl
 | [`dsh-spine`](plugins/dsh-spine/) | Backing down when pressed, apologising when doubted. Unlike `dsh-claimguard` this governs **positional consistency** rather than facts. |
 | [`dsh-slang`](plugins/dsh-slang/) | Slang learning with no human feeding. Automatically mines likely-slang from the chat, researches meanings into candidates, and every 8h an AI reviews the batch (promote / reject / wait). |
 | [`dsh-factguard`](plugins/dsh-factguard/) | Memory watchdog. When asked about its own attributes it answers only from the fact table; ungrounded claims are denied and corrected — prevents random admission and gender wobble. |
+| [`dsh-selfaware`](plugins/dsh-selfaware/) | Self-awareness ledger. Injects the closed capability list, recent join reviews, and verified recent actions; captures existing success logs into its own SQLite database without modifying other plugins. |
 | [`dsh-leakguard`](plugins/dsh-leakguard/) | Blocks system-prompt leakage. Checks whether a reply copied the persona's exclusive title / instruction verbatim. Works with `dsh-humanizer` as the hard fallback. |
 | [`dsh-homophone`](plugins/dsh-homophone/) | Homophone / nickname recognition. A name said in homophones counts as being called; meme meanings in homophones get injected. |
 | [`dsh-joinguard`](plugins/dsh-joinguard/) | AI-reviewed join gate. Sends the join question + answer to an AI to judge approve/reject and really approves/rejects. |
@@ -506,6 +646,10 @@ Each was re-validated across multiple plugins:
 | [47 真人感第二批](docs/47-真人感第二批-黑话与打字节奏与效果观察.md) | Slang table, typing rhythm, homophone typos, attention drift, response-effect closed loop |
 | [48 黑话自动审核](docs/48-黑话自动审核-更新详解.md) | `dsh-slang` auto-review: mine candidates → research with main model → AI auto-review every 8h, owner commands as fallback |
 | [60 长期目标与技术方案](docs/60-长期目标与技术方案.md) | Overall architecture and direction |
+| [61 桌面控制台](docs/61-桌面控制台-一键部署与在线配置.md) | Windows EXE one-click deployment, online configuration, security boundary and verification record |
+| [62 社交关系](docs/62-社交关系-按群隔离的社交距离.md) | Per-group social-distance ledger, accepted signals, five style tiers, shadow mode and fairness boundary |
+| [63 自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md) | Four self-harming reply classes and the two-sided input-evidence + output-shape verdict |
+| [64 联网出口审核](docs/64-联网出口审核-先审后发防炸群.md) | Review-before-send across five outbound paths, fail-closed behavior and residual risks |
 | [命令手册](docs/群指令手册.md) | All in-group commands with usage, permissions and examples (50 plugin commands + 9 built-in) |
 
 ### Quick start

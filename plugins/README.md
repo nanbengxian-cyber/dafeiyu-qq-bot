@@ -1,8 +1,8 @@
 # 插件目录 / Plugin Directory
 
-45 个 AstrBot 插件的索引。每个插件的设计取舍、踩过的坑、实测数据都写在各自 `main.py` 顶部注释里 —— 那里比这张表详细得多。
+48 个 AstrBot 插件的索引。每个插件的设计取舍、踩过的坑、实测数据都写在各自 `main.py` 顶部注释里 —— 那里比这张表详细得多。
 
-Index of 45 AstrBot plugins. Design tradeoffs, pitfalls, and measured data live in the header comment of each `main.py`, which is far more detailed than this table.
+Index of 48 AstrBot plugins. Design tradeoffs, pitfalls, and measured data live in the header comment of each `main.py`, which is far more detailed than this table.
 
 ## 安装 / Install
 
@@ -50,7 +50,7 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-imagegen` | 1053 | `/画图` `/画图状态` | `generate_image` | 文生图 API |
 | `dsh-video` | 1342 | `/做视频` `/视频状态` | `generate_video` | 视觉模型 + 文生视频 API |
 | `dsh-voice` | 947 | `/说话` `/音色` `/语音状态` | `send_voice` | TTS API |
-| `dsh-web` | 1605 | `/看网页` `/搜` `/b站` `/联网状态` | `web_search` `read_webpage` `bilibili_video` | 搜索 API + B 站公开端点 + 出口审核(小模型) |
+| `dsh-web` | 1580 | `/看网页` `/搜` `/b站` `/联网状态` | `web_search` `read_webpage` `bilibili_video` | 搜索 API + B 站公开端点 + 出口审核(小模型) |
 | `dsh-sticker` | 344 | `/贴纸状态` | — | — |
 | `dsh-listen` | 488 | `/听语音状态` | — | AssemblyAI(转写) |
 
@@ -59,6 +59,7 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | 插件 | 行数 | 指令 | LLM 工具 | 外部服务 |
 |---|---|---|---|---|
 | `dsh-memory` | 1810 | `/我的档案` `/忘记我` `/记住` `/记忆状态` `/群记忆` 等 | — | 抽取用小模型 |
+| `dsh-social` | 418 | `/我和鱼` `/社交退出` `/关系状态` `/关系标签` | — | — |
 | `dsh-guard` | 828 | `/禁言状态` | — | 小模型 |
 | `dsh-poke` | 319 | `/戳一戳状态` | — | — |
 | `dsh-welcome` | 351 | `/欢迎测试` `/欢迎状态` | — | 聊天模型 |
@@ -67,6 +68,7 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-spine` | 542 | `/脊梁状态` | — | — |
 | `dsh-slang` | 1097 | `/黑话学习状态` `/黑话候选` `/黑话详情` `/黑话确认` `/黑话拒绝` `/黑话备注` | — | 主模型(提取+考究+每 8h 自动审核) |
 | `dsh-factguard` | 204 | (自动运行) | — | — |
+| `dsh-selfaware` | 456 | `/自我认知状态` | — | — |
 | `dsh-leakguard` | 400 | (自动运行) | — | — |
 | `dsh-homophone` | 155 | (自动运行) | — | — |
 | `dsh-joinguard` | 422 | `/入群问题` `/入群审核模式` | — | 小模型(审核) |
@@ -77,9 +79,9 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-interest` | 370 | `/馋什么` | — | — |
 | `dsh-steal` | 610 | `/表情包` | — | 视觉模型(识图) |
 
-零外部依赖的插件(`acl`、`aiflavour`、`armor`、`claimguard`、`ctxclean`、`drift`、`emotion`、`factguard`、`glossary`、`homophone`、`human`、`humanizer`、`interest`、`leakguard`、`merge`、`mention`、`noise`、`pay`、`poke`、`proactive`、`quote`、`quoteref`、`scene`、`selfguard`、`spine`、`sticker`、`style`、`typo`)拷进去就能用,不需要额外配 API —— **45 个里有 28 个属于这一类**。
+零外部依赖的插件(`acl`、`aiflavour`、`armor`、`claimguard`、`ctxclean`、`drift`、`emotion`、`factguard`、`glossary`、`homophone`、`human`、`humanizer`、`interest`、`leakguard`、`merge`、`mention`、`noise`、`pay`、`poke`、`proactive`、`quote`、`quoteref`、`scene`、`selfaware`、`selfguard`、`selfworth`、`social`、`spine`、`sticker`、`style`、`typo`)拷进去就能用,不需要额外配 API —— **48 个里有 31 个属于这一类**。
 
-Plugins with no external dependencies (`acl`, `aiflavour`, `armor`, `claimguard`, `ctxclean`, `drift`, `emotion`, `factguard`, `glossary`, `homophone`, `human`, `humanizer`, `interest`, `leakguard`, `merge`, `mention`, `noise`, `pay`, `poke`, `proactive`, `quote`, `quoteref`, `scene`, `selfguard`, `spine`, `sticker`, `style`, `typo`) work as soon as they are copied in — no extra API setup. That's **28 of the 45**.
+Plugins with no external dependencies (`acl`, `aiflavour`, `armor`, `claimguard`, `ctxclean`, `drift`, `emotion`, `factguard`, `glossary`, `homophone`, `human`, `humanizer`, `interest`, `leakguard`, `merge`, `mention`, `noise`, `pay`, `poke`, `proactive`, `quote`, `quoteref`, `scene`, `selfaware`, `selfguard`, `selfworth`, `social`, `spine`, `sticker`, `style`, `typo`) work as soon as they are copied in — no extra API setup. That's **31 of the 48**.
 
 ## 建议的启用顺序 / Suggested rollout order
 
@@ -111,9 +113,9 @@ Plugins with no external dependencies (`acl`, `aiflavour`, `armor`, `claimguard`
 
 ## 测试 / Tests
 
-仓库里 24 个插件带纯函数单元测试,不需要跑起 AstrBot:
+仓库里 27 个插件带纯函数单元测试,不需要跑起 AstrBot:
 
-24 plugins in the repo ship pure-function unit tests that run without AstrBot:
+27 plugins in the repo ship pure-function unit tests that run without AstrBot:
 
 ```bash
 python3 dsh-acl/test_acl.py                 # 三档权限 + 只按 QQ 号判身份 + 拒绝提示冷却
@@ -134,7 +136,9 @@ python3 dsh-proactive/test_proactive.py     # 正则兴趣评分 + 限流 + 每�
 python3 dsh-quote/test_quote.py             # 25 项:@剥离 + 只认 QQ 号的身份判定 + 块形状
 python3 dsh-quoteref/test_quoteref.py       # 计数器 + 冷却 + At 摘除
 python3 dsh-scene/test_scene.py             # 背景加载 + 作息判定
+python3 dsh-selfaware/test_selfaware.py     # 行为日志解析 + 独立账本 + 入群记录 + 注入预算
 python3 dsh-selfworth/test_selfworth.py     # 四类占便宜 + 认账形状 + 嘴硬必须放行
+python3 dsh-social/test_social.py           # 按群隔离 + 信号边界 + 衰减/日上限 + 退出
 python3 dsh-selfguard/test_selfguard.py     # 重复判定 + 冲突拱火 + 豁免
 python3 dsh-slang/test_slang.py             # 16 项:触发/幻觉拦截/注入预算/自动审核门/重启持久化
 python3 dsh-sticker/test_sticker.py         # 标记剥离(含不误伤用例)
