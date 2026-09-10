@@ -542,9 +542,13 @@ class Main(star.Star):
         path, _caption = p
         # 图单独一条（照 dsh-welcome 实测：图文混一条丢图）；含义留在库存里
         # 当选图依据，不解释成文字（真人用梗图不会配一句“这张图表示X”）。
-        yield event.chain_result(
-            MessageChain([Image.fromFileSystem(os.path.join(HOME, path))])
-        )
+        # chain_result() 接收的是组件 list，不是 MessageChain。AstrBot 4.27
+        # 的签名是 chain_result(chain: list[BaseMessageComponent])；传后者会让
+        # 下游 dsh-sticker 遍历 result.chain 时抛出
+        # "'MessageChain' object is not iterable"，最终一张图也发不出去。
+        full_path = os.path.join(HOME, path)
+        yield event.chain_result([Image.fromFileSystem(full_path)])
+        logger.info("[steal] /表情包 已出图：%s", path)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
     async def maybe_serve(self, event: AstrMessageEvent) -> None:
@@ -574,6 +578,7 @@ class Main(star.Star):
                 await event.send(
                     MessageChain([Image.fromFileSystem(os.path.join(HOME, path))])
                 )
+                logger.info("[steal] 自然语言触发已出图：%s", path)
             except BaseException as e:
                 logger.warning("[steal] 表情包发送失败 %s: %s", path, e)
                 return
