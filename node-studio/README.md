@@ -32,7 +32,8 @@
 ## 运行 Studio
 
 ```bash
-cd /home/ubuntu/workspace/dafeiyu-node-lab
+git clone https://github.com/nanbengxian-cyber/dafeiyu-qq-bot.git
+cd dafeiyu-qq-bot/node-studio
 bash scripts/start-studio.sh
 ```
 
@@ -66,7 +67,7 @@ dist\dafeiyu-node-studio.exe
 dist\dafeiyu-node-studio.exe.sha256
 ```
 
-也可以把源码上传至 GitHub 后手动运行 `.github/workflows/build-windows.yml`。工作流只生成 Artifact，不自动发布 Release；必须等人工确认后再上传或发布。Linux 上的 PyInstaller 不能生成可信的 Windows PE，因此不要把 Linux 构建物冒充 Windows EXE。
+也可以在仓库的 Actions 页面手动运行 `.github/workflows/build-node-studio-windows.yml`。工作流只生成 Artifact；正式 Release 由维护者在验证后发布。Linux 上的 PyInstaller 不能生成可信的 Windows PE，因此不要把 Linux 构建物冒充 Windows EXE。
 
 EXE 启动后仅监听 `127.0.0.1:8765` 并打开系统浏览器。端口占用时可运行：
 
