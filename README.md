@@ -2,9 +2,9 @@
 
 [中文](#中文) · [English](#english)
 
-一套让 QQ 群机器人「像真人群友一样说话」的完整工程：47 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App、一个 Windows 桌面控制台，以及记录每个问题根因与实测数据的技术文档。
+一套让 QQ 群机器人「像真人群友一样说话」的完整工程：47 个 AstrBot 插件、QQ↔AI 桥接、安卓与 Windows 控制台，以及独立的可视化行为节点 Studio。
 
-A complete engineering effort to make a QQ group bot *talk like an actual group member*: 47 AstrBot plugins, a QQ↔AI bridge, an Android console app, a Windows desktop controller, and technical documents recording the root cause and measured data behind every fix.
+A complete engineering effort to make a QQ group bot *talk like an actual group member*: 47 AstrBot plugins, QQ↔AI bridges and controllers, plus an isolated visual behavior-node Studio.
 
 ---
 
@@ -23,7 +23,12 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
 | [`desktop-controller/`](desktop-controller/) | Windows EXE 控制台：填服务器信息 → 自动部署并启动 → 在线改配置 | Python |
 | [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
+| [`node-studio/`](node-studio/) | 行为节点 Studio：类似 Blender 几何节点的离线可视化编排原型 | Python / JavaScript |
 | [`docs/`](docs/) | 部署手册与 19 份技术文档（根因分析、设计方案与实施记录） | Markdown |
+
+### 最新更新 · 2026-09-11（行为节点 Studio v0.1.0）
+
+新增独立目录 [`node-studio/`](node-studio/)：通过类型化端口和 DAG 把机器人行为拆成可视节点，附 12 类节点、3 张脱敏示例图、运行轨迹和 Windows 单文件 EXE 构建链。该模块与现有机器人完全隔离，不连接 QQ、AstrBot、服务器或生产配置。新手从 [Windows 安装](node-studio/docs/01-Windows新手安装与启动.md)、[五分钟节点编辑](node-studio/docs/02-五分钟节点编辑入门.md) 和 [源码构建](node-studio/docs/03-源码构建与故障排查.md) 开始；完整变化见 [更新记录](node-studio/CHANGELOG.md)。当前画布编辑为临时演示，刷新或退出不会保存。
 
 ### 最新更新 · 2026-09-09（第八版：社交关系 / 自身利益 / 联网出口审核）
 
