@@ -100,6 +100,15 @@ def fmt_text(text):
     return t
 
 
+# 一条**空正文**的 `Prepare to send` 不是发出去的消息，只是一次「这轮不开口」
+# 的决定：dsh-decide 判沉默、dsh-poke 回戳时都会走到 respond.stage，日志照样
+# 打一行，紧接着必有一条 `stopped event propagation`。实测 688/688 都是如此，
+# **内容为空 = 一条都没送到群里**。老版本把它渲染成 (非文本/空)，看着像机器人在
+# 疯狂刷空消息，也把「机器人说了多少话」这个数直接灌水一倍多（142 vs 真实 31）。
+# 这里如实标成「决定不说」，并从统计口径里剔出去。
+PHANTOM_NOTE = "(决定不说 · 未发出)"
+
+
 def render(events, show_plug=True):
     out = []
     last_user = None
@@ -112,7 +121,8 @@ def render(events, show_plug=True):
             out.append("%s  %s(%s) %s: %s" % (stamp, ev["who"], ev["qq"], tag, fmt_text(ev["text"])))
             last_user = ev
         elif ev["kind"] == "bot":
-            out.append("%s      └─ 大肥鱼 → %s(%s): %s" % (stamp, ev["who"], ev["qq"], fmt_text(ev["text"])))
+            shown = fmt_text(ev["text"]) if ev["text"] else PHANTOM_NOTE
+            out.append("%s      └─ 大肥鱼 → %s(%s): %s" % (stamp, ev["who"], ev["qq"], shown))
         else:
             if not show_plug:
                 continue
@@ -139,8 +149,11 @@ def stats(events):
                 replied += 1
                 pending = None
     total_user = sum(users.values())
+    real = bots - empty_bot
     lines = [
-        "群友消息: %d 条 / 机器人回复: %d 条 (非文本回复 %d)" % (total_user, bots, empty_bot),
+        "群友消息: %d 条 / 机器人**发出去**的回复: %d 条（另 %d 次决定不开口，没送到群里）"
+        % (total_user, real, empty_bot),
+        "开口率: %.0f%%（真实回复 / 群友消息）" % (100.0 * real / total_user if total_user else 0.0),
         "活跃群友: " + ", ".join(
             "%s×%d" % (k, v) for k, v in sorted(users.items(), key=lambda x: -x[1])[:15]
         ),
