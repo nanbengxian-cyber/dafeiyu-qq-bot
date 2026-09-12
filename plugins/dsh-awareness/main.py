@@ -33,7 +33,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import CustomFilter
 from astrbot.core import logger
 from astrbot.core.agent.message import TextPart
-from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.message_type import MessageType  # noqa: F401
 
 # AstrBot 以文件方式加载插件目录，不保证它是可 import 的 Python 包。
 _PLUGIN_DIR = str(Path(__file__).resolve().parent)
@@ -154,6 +154,21 @@ def init_db() -> None:
         con.close()
 
 
+def _poke_target(event) -> str:
+    """戳一戳戳的是谁。Poke 组件优先，回落到 raw 的 target_id。"""
+    for comp in getattr(event.message_obj, "message", None) or []:
+        fn = getattr(comp, "target_id", None)
+        if callable(fn):
+            try:
+                got = fn()
+            except BaseException:
+                got = None
+            if got:
+                return str(got)
+    raw = getattr(event.message_obj, "raw_message", None)
+    return str(_rg(raw, "target_id") or "")
+
+
 def _parts_of(event) -> list:
     """把 astrbot 消息组件压成 event_ring 能吃的轻量结构。"""
     out = []
@@ -192,9 +207,26 @@ class AwarenessFilter(CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         try:
             raw = getattr(event.message_obj, "raw_message", None)
-            return _rg(raw, "post_type") in (None, "message", "notice")
-        except BaseException:
-            return False
+            post = _rg(raw, "post_type")
+            sub = _rg(raw, "sub_type")
+            comps = [type(c).__name__ for c in (getattr(event.message_obj, "message", None) or [])]
+            if post != "message" or sub or any("Poke" in c for c in comps):
+                # 诊断：非普通消息的事件（通知类 / 戳一戳）原样记下来。
+                # 戳一戳采集丢失就卡在这一层，必须能看到它的真实字段。
+                try:
+                    dump = repr(dict(raw))[:400] if hasattr(raw, "keys") else repr(raw)[:400]
+                except BaseException:
+                    dump = "<无法 dump>"
+                logger.info(
+                    "[awareness] 事件诊断 post=%r sub=%r raw_type=%s mtype=%s comps=%s dump=%s",
+                    post, sub, type(raw).__name__,
+                    str(getattr(event.message_obj, "type", "?")), comps, dump,
+                )
+            # 诊断期全放行：由 handler 做业务判断，先确认事件能不能走到这里。
+            return True
+        except BaseException as exc:
+            logger.warning("[awareness] filter 异常 %r", exc)
+            return True
 
 
 class Main(star.Star):
@@ -279,11 +311,23 @@ class Main(star.Star):
             self._record_notice(raw, gid)
             return
 
+        kind, text, extra = classify(_parts_of(event))
+        if kind == KIND_POKE:
+            # 有些实现把戳一戳当「带 Poke 组件的消息」上报（post_type=message）。
+            # 走这条路时通知分支永远不会触发，必须在这里收成同一个 poke 事实，
+            # 否则只会留下一条没有「谁戳了谁」的空记录。
+            who = str(event.get_sender_id() or "")
+            target = _poke_target(event)
+            if who and target:
+                self._record_poke_row(
+                    gid, who, str(event.get_self_id() or ""), target, int(time.time()),
+                )
+            return
+
         uid = str(event.get_sender_id() or "")
         me = str(event.get_self_id() or "")
         if not uid or uid == me:
             return
-        kind, text, extra = classify(_parts_of(event))
         text = scrub_for_store(text, STORE_TEXT_MAX)
         if text == "" and kind == "text":
             # 纯文本但整条被敏感过滤掉 —— 不留空壳记录。
@@ -381,17 +425,13 @@ class Main(star.Star):
             con.close()
         return str(row[0]) if row and row[0] else ""
 
-    def _record_poke(self, raw, gid: str) -> None:
+    def _record_poke_row(self, gid: str, who: str, me: str, target: str, stamp) -> None:
         """戳一戳：记下谁戳了谁。
 
-        被戳的是机器人时尤其重要——通知的正文是空的、昵称是 QQ 号，
+        被戳的是机器人时尤其重要 —— 通知的正文是空的、昵称又是 QQ 号，
         不补这一条，机器人在后续轮次里只会反问「戳谁呀？」。
+        戳一戳可能以「通知」或「带 Poke 组件的消息」两种形态到达，统一从这里入库。
         """
-        who = str(_rg(raw, "user_id") or "")
-        target = str(_rg(raw, "target_id") or "")
-        if not who or not target:
-            return
-        me = str(_rg(raw, "self_id") or "")
         name = self._name_for(gid, who) or who
         extra = {"by": who, "by_name": name, "target": target}
         if me and target == me:
@@ -403,7 +443,7 @@ class Main(star.Star):
             "name": name,
             "kind": KIND_POKE,
             "text": "",
-            "message_id": "poke:%s:%s" % (who, _rg(raw, "time") or int(time.time())),
+            "message_id": "poke:%s:%s:%s" % (who, target, stamp),
             "extra": extra,
         }
         if self._insert(row):
@@ -413,6 +453,17 @@ class Main(star.Star):
                 gid, name, who, target, "（戳的是机器人）" if extra.get("to_me") else "",
             )
 
+    def _record_poke(self, raw, gid: str) -> None:
+        """通知形态的戳一戳（post_type=notice）。"""
+        who = str(_rg(raw, "user_id") or "")
+        target = str(_rg(raw, "target_id") or "")
+        if not who or not target:
+            return
+        self._record_poke_row(
+            gid, who, str(_rg(raw, "self_id") or ""), target,
+            _rg(raw, "time") or int(time.time()),
+        )
+
     # --- 采集入口 ---------------------------------------------------------
     @filter.custom_filter(AwarenessFilter)
     async def on_event(self, event: AstrMessageEvent) -> None:
@@ -421,20 +472,27 @@ class Main(star.Star):
         try:
             raw = getattr(event.message_obj, "raw_message", None)
             is_notice = _rg(raw, "post_type") == "notice"
-            # 通知类事件不走 message_type 判断（它与常规消息字段不一致）。
-            if not is_notice and event.get_message_type() != MessageType.GROUP_MESSAGE:
-                return
-            gid = str(event.get_group_id() or "")
+            sub = _rg(raw, "sub_type")
+            is_poke = sub == "poke" or _poke_target(event) != ""
+            if is_notice:
+                # 通知事件量小但关键（撤回/戳一戳）。先落日志再判断，
+                # 免得又被某一层过滤静默吃掉 —— 「戳一戳全丢」那次就是这么埋住的。
+                logger.info(
+                    "[awareness] 收到通知 sub=%s gid=%r raw_gid=%r uid=%s target=%r",
+                    sub, str(event.get_group_id() or ""), _rg(raw, "group_id"),
+                    str(event.get_sender_id() or ""), _rg(raw, "target_id"),
+                )
+            # 刻意不检查 message_type：戳一戳可能不带 group_id，adapter 会把它
+            # 归成 FRIEND_MESSAGE，按消息类型判断就会把这一整类丢掉。
+            # 群归属一律只看 gid，够用且不会误伤。
+            gid = str(event.get_group_id() or _rg(raw, "group_id") or "")
+            if not gid and is_poke and len(GROUPS) == 1:
+                # 只监控一个群时兜底归到它，否则这条事实会整条丢掉。
+                gid = next(iter(GROUPS))
             if not gid or (GROUPS and gid not in GROUPS):
                 _stat["skipped_group"] += 1
                 return
             _stat["seen"] += 1
-            if is_notice:
-                # 通知事件量小但关键（撤回/戳一戳），各落一条日志便于事后核对。
-                logger.info(
-                    "[awareness] 收到通知 sub=%s gid=%s uid=%s",
-                    _rg(raw, "sub_type"), gid, str(event.get_sender_id() or ""),
-                )
             self._record_event(event, gid)
             self._cleanup(time.time())
         except BaseException as exc:

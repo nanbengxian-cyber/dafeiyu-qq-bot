@@ -253,19 +253,20 @@ def test_poke_flow():
 
 
 def test_filter():
-    """filter 只分「哪一类事件」，群过滤在 handler 里。
+    """filter 只负责「唤醒」，事件类别判断全在 handler 里。
 
-    线上事故：filter 里多判断了一层 message_type/平台名，把 poke 通知整类
-    静默拦掉，采集全丢（DB 里 poke 0 条，同期实际被戳 3 次）。
+    线上事故：filter 里按 message_type 判断，把 poke 通知整类静默拦掉
+    （DB 里 poke 0 条，同期实际被戳 3 次）。能跑的 dsh-poke 判据也极简 ——
+    教训是别在这一层做字段假设，让它无条件放行、业务判断下移。
     """
     f = aw.AwarenessFilter()
     assert f.filter(FakeEvent(raw={"post_type": "message"}), None) is True
-    # 通知类必须放行 —— 撤回与戳一戳都走这里。
+    # 通知类（撤回/戳一戳）必须放行。
     assert f.filter(FakeEvent(raw={"post_type": "notice", "sub_type": "poke"}), None) is True
     assert f.filter(
         FakeEvent(raw={"post_type": "notice", "notice_type": "group_recall"}), None) is True
-    # 既不是消息也不是通知的（心跳/请求）不放行。
-    assert f.filter(FakeEvent(raw={"post_type": "meta_event"}), None) is False
+    # 连不认识的类型也放行 —— 由 handler 依据 gid 决定收不收。
+    assert f.filter(FakeEvent(raw={"post_type": "meta_event"}), None) is True
 
     # 群过滤由 handler 负责：别的群一律不采集。
     model = fresh()
@@ -281,7 +282,35 @@ def test_filter():
     pokes = [r for r in model._load(GID, time.time() - 600) if r["kind"] == "poke"]
     assert len(pokes) == 1, "poke 通知必须入库"
     assert pokes[0]["extra"]["to_me"] is True, pokes[0]
+
+    # 群内 poke 通知可能不带 group_id（adapter 于是把它归成 FRIEND_MESSAGE，
+    # 旧 filter 正是因此把 poke 整类拦掉）。只监控一个群时必须兜底归类。
+    asyncio.run(model.on_event(FakeEvent(
+        raw={"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+             "user_id": "222", "target_id": BOT, "self_id": BOT,
+             "time": 1780000200}, gid="")))
+    pokes = [r for r in model._load(GID, time.time() - 600) if r["kind"] == "poke"]
+    assert len(pokes) == 2, "不带 group_id 的 poke 也必须归属到唯一监控群"
     print("  filter/scope ok")
+
+
+def test_poke_as_message():
+    """戳一戳也可能以「带 Poke 组件的消息」形态到达（post_type=message）。
+
+    这条路 adapter 会把它归成 FRIEND_MESSAGE（没有 group_id），线上正是
+    按 message_type 判断把它整类丢掉的 —— 两条到达路径都必须收成同一个事实。
+    """
+    model = fresh()
+    poke_comp = comp("Poke")
+    poke_comp.target_id = lambda: BOT
+    asyncio.run(model.on_event(FakeEvent(
+        comps=[poke_comp], uid="333", name="333",
+        raw={"post_type": "message"}, gid="")))
+    pokes = [r for r in model._load(GID, time.time() - 600) if r["kind"] == "poke"]
+    assert len(pokes) == 1, "带 Poke 组件的消息形态也必须入库"
+    assert pokes[0]["extra"]["to_me"] is True, pokes[0]
+    assert pokes[0]["uid"] == "333", pokes[0]
+    print("  poke(message) ok")
 
 
 def test_sensitive_not_stored():
@@ -299,6 +328,7 @@ def main():
     test_index_and_detail_injection()
     test_poke_flow()
     test_filter()
+    test_poke_as_message()
     test_sensitive_not_stored()
     print("AWARENESS_INTEGRATION_TEST_OK")
 
