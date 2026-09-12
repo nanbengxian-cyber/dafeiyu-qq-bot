@@ -35,7 +35,7 @@ fake_logger.setLevel(logging.DEBUG)
 sys.modules["astrbot.api"].star = types.SimpleNamespace(Star=FakeStar, Context=object)
 sys.modules["astrbot.api.event"].AstrMessageEvent = object
 sys.modules["astrbot.api.event"].filter = types.SimpleNamespace(
-    on_llm_request=deco, command=deco,
+    on_llm_request=deco, on_llm_response=deco, command=deco,
 )
 sys.modules["astrbot.core"].logger = fake_logger
 sys.modules["astrbot.core.agent.message"].TextPart = FakeTextPart
@@ -145,9 +145,12 @@ for expected in ("封闭清单", "不会唱歌", "拒绝入群 222", "同意入�
 # 收款能力必须在封闭清单里，且口径与 dsh-pay 一致：发码 + 群主确认到账才道谢。
 cap = m.render_capabilities()
 assert "赞助" in cap and "收款码" in cap and "群主确认到账" in cap, cap
-# 默认预算下能力/入群/动作三块必须都在（防止能力块变长把动作块挤掉）。
+# 默认预算变紧但仍保留核心事实；历史可按空间缩减，绝不突破总预算。
 default_blocks = m.build_blocks(joins, actions, budget=m.BUDGET)
-assert len(default_blocks) == 3 and default_blocks[2].startswith("<recent_self_actions>"), default_blocks
+assert default_blocks[0].startswith("<self_capabilities>"), default_blocks
+assert any(x.startswith("<recent_self_actions>") for x in default_blocks), default_blocks
+assert sum(len(x) for x in default_blocks) <= m.BUDGET
+assert m.BUDGET == 1400
 assert sum(len(x) for x in blocks) <= 1100
 for block in blocks:
     tag = block.split("\n", 1)[0][1:-1]

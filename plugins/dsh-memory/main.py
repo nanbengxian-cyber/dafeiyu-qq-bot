@@ -45,6 +45,7 @@
 #    没有上限的记忆系统最后会把上下文吃光、把账单跑飞。
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -128,7 +129,7 @@ EXPIRE_DAYS = _envf("DSH_MEM_EXPIRE_DAYS", 45)
 #
 # 收集和抽取是两件事，成本差好几个数量级：收集是一次 INSERT，
 # 抽取是一次 LLM 调用，还占全局每日额度。
-# 实测：两个「只收语料、机器人不说话」的群（225400545 / 1048435041）
+# 实测：两个「只收语料、机器人不说话」的群（100000001 / 100000001）
 # 已经被抽出 36 条群员档案，而那两个群一共 962 人、机器人一句话都不会说，
 # 档案永远不会被注入——纯烧钱，还会挤掉主群的每日抽取额度。
 # 所以这里把「抽不抽」和「收不收」分开：不在名单里的群照常入库当语料，
@@ -150,7 +151,17 @@ MAX_OTHERS = _envi("DSH_MEM_MAX_OTHERS", 3)
 
 # 单值型条目：新的覆盖旧的（一个人只有一个称呼、一个身份）
 SINGLE_KINDS = ("称呼", "身份")
-VALID_KINDS = ("称呼", "身份", "爱好", "习惯", "梗", "忌讳", "其他")
+# v1.1 不再只记“特点”：加入偏好/关系、可追踪事件、承诺与纠正。
+# 旧七类完整保留，数据库无损原地升级。
+VALID_KINDS = (
+    "称呼", "身份", "爱好", "习惯", "梗", "忌讳", "其他",
+    "偏好", "关系", "经历", "承诺", "纠正",
+)
+EPISODIC_KINDS = ("经历", "承诺", "纠正")
+# 经历不应跟人格特点一样常驻；过期后保留历史但不注入。
+EPISODE_TTL_DAYS = _envf("DSH_MEM_EPISODE_TTL_DAYS", 30)
+# 同一目标抽取租约，挡住高并发消息重复排多个 LLM 任务。
+EXTRACT_LEASE_SECONDS = _envf("DSH_MEM_LEASE_SECONDS", max(90.0, EXTRACT_TIMEOUT + EXTRACT_DELAY + 15.0))
 
 
 # ---------------------------------------------------------------- 隐私
@@ -665,6 +676,13 @@ CREATE TABLE IF NOT EXISTS facts (
     source      TEXT NOT NULL DEFAULT 'auto',  -- auto / manual
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active', -- active / superseded / retracted
+    confidence  REAL NOT NULL DEFAULT 0.70,
+    valid_from  REAL,
+    valid_to    REAL,
+    last_confirmed_at REAL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    supersedes_id INTEGER,
     UNIQUE(group_id, user_id, kind, content)
 );
 CREATE INDEX IF NOT EXISTS idx_facts_owner ON facts(group_id, user_id);
@@ -677,7 +695,9 @@ CREATE TABLE IF NOT EXISTS members (
     first_seen  REAL NOT NULL,
     last_seen   REAL NOT NULL,
     last_extract REAL NOT NULL DEFAULT 0,
-    pending     INTEGER NOT NULL DEFAULT 0,   -- 上次抽取后新增的消息数
+    pending     INTEGER NOT NULL DEFAULT 0,   -- 上次成功抽取后新增的消息数
+    extract_lease_until REAL NOT NULL DEFAULT 0,
+    last_buffer_id INTEGER NOT NULL DEFAULT 0,
     opted_out   INTEGER NOT NULL DEFAULT 0,   -- /忘记我 之后永久不记
     PRIMARY KEY(group_id, user_id)
 );
@@ -696,7 +716,53 @@ CREATE TABLE IF NOT EXISTS counters (
     day         TEXT PRIMARY KEY,
     extracts    INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS extraction_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    window_max_id INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL,       -- running / succeeded / failed
+    started_at  REAL NOT NULL,
+    finished_at REAL,
+    error       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_runs_owner ON extraction_runs(group_id,user_id,started_at);
 """
+
+
+_MIGRATION_COLUMNS = {
+    "facts": {
+        "status": "TEXT NOT NULL DEFAULT 'active'",
+        "confidence": "REAL NOT NULL DEFAULT 0.70",
+        "valid_from": "REAL",
+        "valid_to": "REAL",
+        "last_confirmed_at": "REAL",
+        "evidence_json": "TEXT NOT NULL DEFAULT '[]'",
+        "supersedes_id": "INTEGER",
+    },
+    "members": {
+        "extract_lease_until": "REAL NOT NULL DEFAULT 0",
+        "last_buffer_id": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
+def _migrate_schema(c: sqlite3.Connection) -> None:
+    """幂等原地迁移；SQLite ADD COLUMN 不会改写已有事实。"""
+    for table, columns in _MIGRATION_COLUMNS.items():
+        existing = {str(r[1]) for r in c.execute("PRAGMA table_info(%s)" % table)}
+        for name, ddl in columns.items():
+            if name not in existing:
+                c.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, ddl))
+    c.execute("CREATE INDEX IF NOT EXISTS idx_facts_active "
+              "ON facts(group_id,user_id,status,valid_to)")
+    c.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('version','2')")
 
 
 class Store:
@@ -730,6 +796,7 @@ class Store:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA synchronous=NORMAL")
                 self._conn.executescript(_SCHEMA)
+                _migrate_schema(self._conn)
                 self._conn.commit()
             finally:
                 os.umask(_um)
@@ -801,9 +868,12 @@ class Store:
     def _facts(self, gid: str, uid: str) -> list[dict]:
         c = self._c()
         rows = c.execute(
-            """SELECT id,kind,content,weight,source,updated_at FROM facts
-               WHERE group_id=? AND user_id=?""",
-            (gid, uid),
+            """SELECT id,kind,content,weight,source,updated_at,confidence,valid_from,
+                      valid_to,last_confirmed_at,evidence_json,status,supersedes_id
+               FROM facts
+               WHERE group_id=? AND user_id=? AND status='active'
+                 AND (valid_to IS NULL OR valid_to>?)""",
+            (gid, uid, time.time()),
         ).fetchall()
         # 排序在 Python 里做，因为要按**有效权重**（weight × 时间衰减）排，
         # 而 SQL 里算不了。原来是 `ORDER BY weight DESC, updated_at DESC`，
@@ -812,26 +882,52 @@ class Store:
         now = time.time()
         out = [
             {"id": r[0], "kind": r[1], "content": r[2], "weight": r[3],
-             "source": r[4], "updated_at": r[5]}
+             "source": r[4], "updated_at": r[5], "confidence": r[6],
+             "valid_from": r[7], "valid_to": r[8], "last_confirmed_at": r[9],
+             "evidence_json": r[10], "status": r[11], "supersedes_id": r[12]}
             for r in rows
         ]
-        out.sort(key=lambda f: (-eff_weight(f["weight"], f["updated_at"], f["source"], now),
-                                -float(f["updated_at"] or 0)))
+        out.sort(key=lambda f: (-(float(f["confidence"] or 0.7) *
+                                  eff_weight(f["weight"], f["updated_at"], f["source"], now)),
+                                -float(f["last_confirmed_at"] or f["updated_at"] or 0)))
         return out
 
     def _put_fact(
-        self, gid: str, uid: str, kind: str, content: str, source: str, weight: float
+        self, gid: str, uid: str, kind: str, content: str, source: str, weight: float,
+        confidence: float = 0.7, evidence: list | None = None,
+        valid_from: float | None = None, valid_to: float | None = None,
+        supersedes: str = "",
     ) -> str:
-        """写一条。返回 'new' / 'bump' / 'replace' / 'skip'。"""
+        """写一条带证据和有效期的记忆；显式纠正时保留旧记录并标为 superseded。"""
         c = self._c()
         now = time.time()
+        confidence = max(0.05, min(float(confidence or 0.7), 1.0))
+        evidence_json = json.dumps((evidence or [])[:8], ensure_ascii=False)
         cap = MAX_GROUP_FACTS if uid == "" else MAX_FACTS_PER_USER
+
+        supersedes_id = None
+        if supersedes:
+            candidates = c.execute(
+                "SELECT id,content,source FROM facts WHERE group_id=? AND user_id=? "
+                "AND status='active'", (gid, uid)
+            ).fetchall()
+            for rid, old_content, old_source in candidates:
+                if old_source == "manual" and source != "manual":
+                    continue
+                if (_similar(str(old_content), supersedes) or
+                        supersedes in str(old_content) or str(old_content) in supersedes):
+                    c.execute(
+                        "UPDATE facts SET status='superseded',valid_to=?,updated_at=? WHERE id=?",
+                        (now, now, rid),
+                    )
+                    supersedes_id = rid
+                    break
 
         # 单值型：同 kind 只留一条，新的覆盖旧的
         if kind in SINGLE_KINDS and uid != "":
             old = c.execute(
                 "SELECT id,content,source FROM facts "
-                "WHERE group_id=? AND user_id=? AND kind=?",
+                "WHERE group_id=? AND user_id=? AND kind=? AND status='active'",
                 (gid, uid, kind),
             ).fetchone()
             # ★ manual 不许被 auto 覆盖 ★
@@ -844,14 +940,16 @@ class Store:
             if old:
                 if old[1] == content:
                     c.execute(
-                        "UPDATE facts SET weight=MIN(weight+0.5,5.0),updated_at=? WHERE id=?",
-                        (now, old[0]),
+                        "UPDATE facts SET weight=MIN(weight+0.5,5.0),updated_at=?,"
+                        "last_confirmed_at=?,confidence=MAX(confidence,?) WHERE id=?",
+                        (now, now, confidence, old[0]),
                     )
                     c.commit()
                     return "bump"
                 c.execute(
-                    "UPDATE facts SET content=?,updated_at=?,source=? WHERE id=?",
-                    (content, now, source, old[0]),
+                    "UPDATE facts SET content=?,updated_at=?,last_confirmed_at=?,source=?,"
+                    "confidence=?,evidence_json=?,supersedes_id=? WHERE id=?",
+                    (content, now, now, source, confidence, evidence_json, supersedes_id, old[0]),
                 )
                 c.commit()
                 return "replace"
@@ -860,13 +958,15 @@ class Store:
         # manual 的 weight 是顶格 5.0，MIN(weight+0.5, 5.0) 不会降它，
         # 所以这条分支对 manual 无害，不用额外判断。
         old = c.execute(
-            "SELECT id FROM facts WHERE group_id=? AND user_id=? AND kind=? AND content=?",
+            "SELECT id FROM facts WHERE group_id=? AND user_id=? AND kind=? AND content=? "
+            "AND status='active'",
             (gid, uid, kind, content),
         ).fetchone()
         if old:
             c.execute(
-                "UPDATE facts SET weight=MIN(weight+0.5,5.0),updated_at=? WHERE id=?",
-                (now, old[0]),
+                "UPDATE facts SET weight=MIN(weight+0.5,5.0),updated_at=?,"
+                "last_confirmed_at=?,confidence=MAX(confidence,?),evidence_json=? WHERE id=?",
+                (now, now, confidence, evidence_json, old[0]),
             )
             c.commit()
             return "bump"
@@ -883,21 +983,25 @@ class Store:
         # _similar 的否决层（极性/数字/最小对立）跨 kind 一样有效，
         # 「喜欢打球」和「讨厌打球」照样分得开，所以放开 kind 是安全的。
         for rid, rcontent in c.execute(
-            "SELECT id,content FROM facts WHERE group_id=? AND user_id=?",
+            "SELECT id,content FROM facts WHERE group_id=? AND user_id=? AND status='active'",
             (gid, uid),
         ).fetchall():
             if _similar(rcontent, content):
                 c.execute(
-                    "UPDATE facts SET weight=MIN(weight+0.5,5.0),updated_at=? WHERE id=?",
-                    (now, rid),
+                    "UPDATE facts SET weight=MIN(weight+0.5,5.0),updated_at=?,"
+                    "last_confirmed_at=?,confidence=MAX(confidence,?),evidence_json=? WHERE id=?",
+                    (now, now, confidence, evidence_json, rid),
                 )
                 c.commit()
                 return "bump"
 
         c.execute(
-            """INSERT INTO facts(group_id,user_id,kind,content,weight,source,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (gid, uid, kind, content, weight, source, now, now),
+            """INSERT INTO facts(
+                   group_id,user_id,kind,content,weight,source,created_at,updated_at,
+                   status,confidence,valid_from,valid_to,last_confirmed_at,evidence_json,supersedes_id)
+               VALUES(?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?)""",
+            (gid, uid, kind, content, weight, source, now, now, confidence,
+             valid_from, valid_to, now, evidence_json, supersedes_id),
         )
         # 同类超额：先在类别内淘汰。放在总量裁剪之前，
         # 这样「某一类刷了十条」不会把别的类挤掉。
@@ -918,12 +1022,13 @@ class Store:
             return 0
         if kind is None:
             rows = c.execute(
-                "SELECT id,weight,source,updated_at FROM facts WHERE group_id=? AND user_id=?",
+                "SELECT id,weight,source,updated_at FROM facts WHERE group_id=? AND user_id=? "
+                "AND status='active'",
                 (gid, uid)).fetchall()
         else:
             rows = c.execute(
                 "SELECT id,weight,source,updated_at FROM facts "
-                "WHERE group_id=? AND user_id=? AND kind=?", (gid, uid, kind)).fetchall()
+                "WHERE group_id=? AND user_id=? AND kind=? AND status='active'", (gid, uid, kind)).fetchall()
         if len(rows) <= cap:
             return 0
         now = time.time()
@@ -937,6 +1042,8 @@ class Store:
         n = c.execute(
             "DELETE FROM facts WHERE group_id=? AND user_id=?", (gid, uid)
         ).rowcount
+        # 清理该用户抽取运行记录；证据只保存本插件 buffer id，不含原文。
+        c.execute("DELETE FROM extraction_runs WHERE group_id=? AND user_id=?", (gid, uid))
         c.execute("DELETE FROM buffer WHERE group_id=? AND user_id=?", (gid, uid))
         if opt_out:
             now = time.time()
@@ -1072,6 +1179,77 @@ class Store:
             "db_bytes": os.path.getsize(self.path) if os.path.exists(self.path) else 0,
         }
 
+    def _claim_extract(self, gid: str, uid: str) -> tuple[int, int] | None:
+        """原子领取抽取窗口；失败不清 pending，租约到期可恢复。"""
+        c = self._c()
+        now = time.time()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            m = c.execute(
+                "SELECT pending,last_extract,extract_lease_until,opted_out FROM members "
+                "WHERE group_id=? AND user_id=?", (gid, uid)
+            ).fetchone()
+            if (not m or m[3] or m[0] < EXTRACT_MIN_MSGS or
+                    now - m[1] < EXTRACT_MIN_GAP or m[2] > now):
+                c.rollback()
+                return None
+            row = c.execute(
+                "SELECT COALESCE(MAX(id),0) FROM buffer WHERE group_id=?", (gid,)
+            ).fetchone()
+            max_id = int(row[0] or 0)
+            cur = c.execute(
+                "INSERT INTO extraction_runs(group_id,user_id,window_max_id,status,started_at) "
+                "VALUES(?,?,?,'running',?)", (gid, uid, max_id, now)
+            )
+            c.execute(
+                "UPDATE members SET extract_lease_until=? WHERE group_id=? AND user_id=?",
+                (now + EXTRACT_LEASE_SECONDS, gid, uid),
+            )
+            c.commit()
+            return int(cur.lastrowid), max_id
+        except BaseException:
+            c.rollback()
+            raise
+
+    def _finish_extract(self, gid: str, uid: str, run_id: int, max_id: int,
+                        success: bool, error: str = "") -> None:
+        """成功才扣除窗口内 pending；失败仅释放租约，保留重试资格。"""
+        c = self._c()
+        now = time.time()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if success:
+                remaining = c.execute(
+                    "SELECT COUNT(*) FROM buffer WHERE group_id=? AND user_id=? AND id>?",
+                    (gid, uid, max_id),
+                ).fetchone()[0]
+                c.execute(
+                    "UPDATE members SET pending=?,last_extract=?,last_buffer_id=?,"
+                    "extract_lease_until=0 WHERE group_id=? AND user_id=?",
+                    (remaining, now, max_id, gid, uid),
+                )
+            else:
+                c.execute(
+                    "UPDATE members SET extract_lease_until=0 WHERE group_id=? AND user_id=?",
+                    (gid, uid),
+                )
+            c.execute(
+                "UPDATE extraction_runs SET status=?,finished_at=?,error=? WHERE id=?",
+                ("succeeded" if success else "failed", now, str(error)[:500], run_id),
+            )
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+
+    def _window_claimed(self, gid: str, max_id: int, limit: int) -> list[tuple]:
+        c = self._c()
+        rows = c.execute(
+            "SELECT id,user_id,name,text,ts FROM buffer WHERE group_id=? AND id<=? "
+            "ORDER BY id DESC LIMIT ?", (gid, max_id, limit)
+        ).fetchall()
+        return list(reversed(rows))
+
     # ---- 异步包装
 
     async def _run(self, fn, *a):
@@ -1090,8 +1268,13 @@ class Store:
     async def facts(self, gid, uid):
         return await self._run(self._facts, gid, uid)
 
-    async def put_fact(self, gid, uid, kind, content, source="auto", weight=1.0):
-        return await self._run(self._put_fact, gid, uid, kind, content, source, weight)
+    async def put_fact(self, gid, uid, kind, content, source="auto", weight=1.0,
+                       confidence=0.7, evidence=None, valid_from=None, valid_to=None,
+                       supersedes=""):
+        return await self._run(
+            self._put_fact, gid, uid, kind, content, source, weight,
+            confidence, evidence, valid_from, valid_to, supersedes,
+        )
 
     async def forget(self, gid, uid, opt_out=True):
         return await self._run(self._forget, gid, uid, opt_out)
@@ -1111,6 +1294,17 @@ class Store:
     async def window(self, gid, limit):
         return await self._run(self._window, gid, limit)
 
+    async def claim_extract(self, gid, uid):
+        return await self._run(self._claim_extract, gid, uid)
+
+    async def finish_extract(self, gid, uid, run_id, max_id, success, error=""):
+        return await self._run(
+            self._finish_extract, gid, uid, run_id, max_id, success, error
+        )
+
+    async def window_claimed(self, gid, max_id, limit):
+        return await self._run(self._window_claimed, gid, max_id, limit)
+
     async def mark_extracted(self, gid, uid):
         return await self._run(self._mark_extracted, gid, uid)
 
@@ -1126,6 +1320,33 @@ class Store:
     async def stats(self):
         return await self._run(self._stats)
 
+def _memory_terms(text: str) -> set[str]:
+    """轻量中文相关词：字二元组，无外部向量依赖。"""
+    t = _norm_key(text or "")
+    if not t:
+        return set()
+    return {t[i:i + 2] for i in range(max(1, len(t) - 1))}
+
+
+def _rank_for_query(facts: list[dict], query: str, now: float | None = None) -> list[dict]:
+    """相关度 + 置信度 + 强度 + 新鲜度；空查询退回通用强度排序。"""
+    now = time.time() if now is None else now
+    qt = _memory_terms(query)
+    ranked = []
+    kind_bonus = {"纠正": 0.35, "承诺": 0.25, "偏好": 0.18, "忌讳": 0.18}
+    for pos, f in enumerate(facts):
+        ft = _memory_terms(str(f.get("content") or ""))
+        overlap = len(qt & ft) / max(1, len(qt)) if qt else 0.0
+        confidence = max(0.05, min(float(f.get("confidence") or 0.7), 1.0))
+        strength = eff_weight(f.get("weight", 1.0), f.get("updated_at"),
+                              f.get("source", "auto"), now)
+        score = overlap * 3.0 + confidence + min(strength, 5.0) * 0.12
+        score += kind_bonus.get(str(f.get("kind") or ""), 0.0)
+        ranked.append((score, -pos, f))
+    ranked.sort(key=lambda x: (-x[0], x[1]))
+    return [x[2] for x in ranked]
+
+
 # ---------------------------------------------------------------- 抽取
 #
 # 抽取提示词刻意写得很死：只让模型输出 JSON，且明确列出「不许记什么」。
@@ -1137,6 +1358,7 @@ EXTRACT_PROMPT = """你在读一段 QQ 群聊记录，任务是为其中一个�
 目标对象：{who}（QQ号 {uid}）
 
 记录每行开头有一个标记：**★ 表示这行是目标对象说的，· 表示是别人说的**。
+标记后的 `[消息编号 @ Unix时间]` 用于 evidence 和事件时间，不能写进 content。
 说话人后面括号里是他 QQ 号的后四位，比如「群主(7216)」。
 
 **facts 里的每一条都必须能在 ★ 开头的行里找到依据。**
@@ -1147,11 +1369,16 @@ EXTRACT_PROMPT = """你在读一段 QQ 群聊记录，任务是为其中一个�
 括号里的号码只用来分辨谁是谁，不许写进 content 里。
 {known}
 只输出 JSON，不要解释，不要 markdown 代码块。格式：
-{{"facts":[{{"kind":"爱好","content":"喜欢打篮球"}}],"group":[]}}
+{{"facts":[{{"kind":"偏好","content":"更喜欢短回复","confidence":0.9,"evidence":[123],"occurred_at":null,"expires_at":null,"supersedes":""}}],"group":[]}}
 
-facts 里每条是关于目标对象的稳定信息，kind 只能是这几种之一：
-称呼(他希望被怎么叫)、身份(职业/在群里的角色)、爱好、习惯(说话或作息习惯)、
-梗(和他有关的群内笑料)、忌讳(他明确不喜欢的话题或做法)、其他。
+facts 里每条是关于目标对象的可复用记忆，kind 只能是这几种之一：
+称呼(他希望被怎么叫)、身份(职业/在群里的角色)、爱好、习惯、偏好(选择与交流偏好)、
+关系(与群友的明确关系，不猜亲疏)、经历(已经发生且以后可能会提到的共同事件)、
+承诺(明确答应/计划后续要做的事)、纠正(他明确纠正过的事实或机器人错误)、
+梗、忌讳、其他。
+每条还要给：confidence 0~1；evidence 为支撑该结论的 ★ 行消息编号数组；
+occurred_at/expires_at 使用记录中提供的 Unix 时间戳，未知填 null；
+supersedes 只在这条明确推翻「已经记住的」某条时填旧内容，否则填空串。
 group 里每条是**整个群**的共同记忆，格式 {{"kind":"梗","content":"..."}}，
 比如群里公认的梗、约定、共同经历。没有就给空数组。
 **group 里绝对不许出现任何群成员的名字。**"某某说过什么""某某喜欢什么"
@@ -1160,9 +1387,10 @@ group 只写「群里」层面的事：群里公认的梗、群里的约定、�
 
 硬性要求：
 - 每条不超过 {maxlen} 个字，用第三人称陈述句，不要引号。
+- 稳定特点只在下次聊天仍有用时记录；但**明确的共同经历、承诺、纠正也要记**，
+  不要把它们误当成“一次性情绪”扔掉。经历必须说清发生了什么，承诺必须说清谁答应做什么。
+- 当下短暂状态（正在吃饭、刚发图、此刻生气）不记；有后续价值的事件才归经历。
 - 最多 {maxn} 条 facts。宁可少写也不要凑数。
-- 只记**稳定、下次聊天还用得上**的信息。一次性的情绪、当下在干什么、
-  谁刚发了张图，都不要记。
 - 只记从这段记录里**真的能看出来**的。不确定就不写，绝对不要推测或编造。
 - **一句话本身没说出什么，就不能从它得出任何 facts。**下面这些 ★ 行属于
   「没内容」，单独或凑在一起都不足以支撑任何一条：
@@ -1251,8 +1479,25 @@ def _parse_extract(raw: str) -> tuple[list[dict], list[dict]]:
             content = str(it.get("content") or "").strip()
             if kind not in VALID_KINDS:
                 kind = "其他"
+            try:
+                confidence = max(0.05, min(float(it.get("confidence", 0.7)), 1.0))
+            except (TypeError, ValueError):
+                confidence = 0.7
+            evidence = it.get("evidence") if isinstance(it.get("evidence"), list) else []
+            evidence = [int(x) for x in evidence[:8] if str(x).isdigit()]
+            def ts(key):
+                try:
+                    v = it.get(key)
+                    return float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
             if content:
-                out.append({"kind": kind, "content": content})
+                out.append({
+                    "kind": kind, "content": content, "confidence": confidence,
+                    "evidence": evidence, "occurred_at": ts("occurred_at"),
+                    "expires_at": ts("expires_at"),
+                    "supersedes": str(it.get("supersedes") or "").strip(),
+                })
         return out
 
     return norm(obj.get("facts")), norm(obj.get("group"))
@@ -1277,31 +1522,42 @@ INJECT_HEADER = (
 INJECT_FOOTER = "</member_memory>"
 
 
+def _xml(s) -> str:
+    return html.escape(str(s or ""), quote=True)
+
+
 def _render(name: str, uid: str, facts: list[dict], group_facts: list[dict],
             others: list[tuple], budget: int) -> str:
-    """拼注入块，边拼边扣预算。预算是硬上限，宁可少注入。"""
+    """拼注入块，边拼边扣预算；固定说明和标签也计入硬上限。"""
+    # 旧实现只给资料正文扣预算，约 280 字的固定说明完全没算进去，
+    # DSH_MEM_INJECT_BUDGET=520 时真日志经常达到 800 字。预算名义与实际不一致
+    # 会让每轮提示词悄悄膨胀；这里先预扣不可省的外壳，宁可少带低权重资料。
+    shell = len(INJECT_HEADER) + len(INJECT_FOOTER) + 1
+    content_budget = max(0, int(budget) - shell)
     lines = []
     used = 0
 
     def push(s: str) -> bool:
         nonlocal used
-        if used + len(s) > budget:
+        # 每一行还会多一个换行符，也必须计入总量。
+        cost = len(s) + 1
+        if used + cost > content_budget:
             return False
         lines.append(s)
-        used += len(s)
+        used += cost
         return True
 
     if facts:
-        push("【正在和你说话的人：%s（%s）】" % (name or uid, uid))
+        push("【正在和你说话的人：%s（%s）】" % (_xml(name or uid), _xml(uid)))
         for f in facts:
-            if not push("- %s：%s" % (f["kind"], f["content"])):
+            if not push("- %s：%s" % (_xml(f["kind"]), _xml(f["content"]))):
                 break
     else:
         # 没有这个人的任何资料时必须明说。留空的话模型会自己编
         # （实测「你还记得我吗」→「你上次让我画猫娘」，那件事根本没发生过）。
         # 人格里写「没递给你就说印象不深」不够用：模型分不清「没递」和「我没看见」，
         # 得给它一个能指着说的事实。
-        push("【正在和你说话的人：%s（%s）】" % (name or uid, uid))
+        push("【正在和你说话的人：%s（%s）】" % (_xml(name or uid), _xml(uid)))
         push("- 关于他你手里**没有任何资料**。他要是问你记不记得他、"
              "问你知道他什么，就说印象不深/想不起来——别编一件他没做过的事。")
 
@@ -1310,13 +1566,13 @@ def _render(name: str, uid: str, facts: list[dict], group_facts: list[dict],
         for oname, ouid, brief in others:
             # 带 QQ 后四位：这个群里有两个「群主」，光看名字分不开谁是谁。
             nm = (oname or ouid).strip()
-            tag = "%s(%s)" % (nm, str(ouid)[-4:])
+            tag = "%s(%s)" % (_xml(nm), _xml(str(ouid)[-4:]))
             # ★ 有人把群名片改成了机器人自己的名字 ★
             # 实测 1493202695 反复把名片改成「大肥鱼」（机器人的群名片），
             # 不注明的话机器人会看到一个叫「大肥鱼」的"别人"而懵掉。
             if nm in _SELF_NAMES:
                 tag += "＝群友改的名，不是你"
-            chunk.append("- %s：%s" % (tag, brief))
+            chunk.append("- %s：%s" % (tag, _xml(brief)))
         for s in chunk:
             if not push(s):
                 break
@@ -1324,14 +1580,17 @@ def _render(name: str, uid: str, facts: list[dict], group_facts: list[dict],
     if group_facts:
         chunk = ["【这个群的共同记忆】"]
         for f in group_facts:
-            chunk.append("- %s" % f["content"])
+            chunk.append("- %s" % _xml(f["content"]))
         for s in chunk:
             if not push(s):
                 break
 
     if not lines:
         return ""
-    return INJECT_HEADER + "\n".join(lines) + "\n" + INJECT_FOOTER
+    body = "\n".join(lines)
+    block = INJECT_HEADER + body + "\n" + INJECT_FOOTER
+    # 防守性断言：以后固定说明继续变长时，也不能再次把“硬预算”变成摆设。
+    return block if len(block) <= budget else ""
 
 
 # ---------------------------------------------------------------- 插件主体
@@ -1433,6 +1692,7 @@ class Main(star.Star):
                             "[memory] 群 %s 只收语料、不抽群员轮廓（省一次 LLM 调用）", gid
                         )
                 else:
+                    # _extract 内部原子领取租约；即使高并发多次排队也只有一个会工作。
                     self._spawn(self._extract(gid, uid, name, event.unified_msg_origin))
 
             # 顺手做过期清理，一天最多一次
@@ -1466,8 +1726,12 @@ class Main(star.Star):
             if await self.store.is_opted_out(gid, uid):
                 return
 
-            facts = await self.store.facts(gid, uid)
-            group_facts = await self.store.facts(gid, "")
+            facts = _rank_for_query(
+                await self.store.facts(gid, uid), event.get_message_str() or ""
+            )
+            group_facts = _rank_for_query(
+                await self.store.facts(gid, ""), event.get_message_str() or ""
+            )
             others = await self.store.briefs(gid, uid, MAX_OTHERS)
             # 原来这里三样全空就 return。现在不 return 了：_render 会在没有
             # 本人资料时注入一行「关于他你没有任何资料，别编」——那正是最需要
@@ -1501,11 +1765,16 @@ class Main(star.Star):
         return tuple(n for n in names if len(n) >= 2)
 
     async def _extract(self, gid: str, uid: str, name: str, umo: str) -> None:
-        """真正的抽取。任何一步失败都只打日志，绝不往外抛。"""
+        """原子领取、成功提交；失败保留 pending 供后续重试。"""
+        claim = None
+        completed = False
+        error = ""
         try:
-            # 先等一会儿再动手。这条消息很可能同时正在触发一次面向用户的回复，
-            # 两个请求撞在一起容易吃渠道 429（这个渠道之前就 429 过）。
-            # 记忆晚十秒钟成型没人看得出来，回复被拖慢立刻能感觉到。
+            claim = await self.store.claim_extract(gid, uid)
+            if not claim:
+                return
+            run_id, window_max_id = claim
+            # 领取后再等，防止等待期间更多事件重复领取同一个人。
             await asyncio.sleep(EXTRACT_DELAY)
 
             if not await self.store.take_quota():
@@ -1516,13 +1785,12 @@ class Main(star.Star):
                     "（想放宽调 DSH_MEM_DAILY_CAP）",
                     DAILY_EXTRACT_CAP,
                 )
+                error = "今日抽取额度已用完"
                 return
-            # 先记账再干活：即使抽取失败也占额度且推进 last_extract。
-            # 否则渠道一直报错就会变成每条消息都重试，把钱烧光。
-            await self.store.mark_extracted(gid, uid)
-
-            rows = await self.store.window(gid, EXTRACT_WINDOW)
+            # pending 直到完整成功才推进。渠道故障、解析失败均不会丢批次。
+            rows = await self.store.window_claimed(gid, window_max_id, EXTRACT_WINDOW)
             if len(rows) < EXTRACT_MIN_MSGS:
+                completed = True
                 return
             # ★ 说话人必须带 QQ 号后四位 ★
             # 真群里有两个号都叫「群主」（群主 2774000001 和另一个人
@@ -1540,10 +1808,11 @@ class Main(star.Star):
             # 改成行首单字符标记 + 提示词明确「facts 只能来自 ★ 开头的行」，
             # 把「算匹配」换成「看标记」——又一次「结构判断优于让模型自己推」。
             lines = []
-            for ruid, rname, rtext, _ts in rows:
+            for message_id, ruid, rname, rtext, rts in rows:
                 who = "%s(%s)" % (rname or ruid, str(ruid)[-4:])
                 mark = "★" if str(ruid) == uid else "·"
-                lines.append("%s %s: %s" % (mark, who, rtext))
+                lines.append("%s [%d @ %d] %s: %s" %
+                             (mark, int(message_id), int(rts), who, rtext))
             transcript = "\n".join(lines)
 
             # get_current_chat_provider_id 是**协程**，必须 await。
@@ -1557,10 +1826,12 @@ class Main(star.Star):
             try:
                 provider_id = await self.context.get_current_chat_provider_id(umo)
             except BaseException as e:
-                logger.warning("[memory] 取 provider 失败，抽取跳过: %s", e)
+                error = "取 provider 失败: %s" % e
+                logger.warning("[memory] 取 provider 失败，保留待抽取消息: %s", e)
                 return
             if not provider_id:
-                logger.warning("[memory] 没有可用 provider，抽取跳过")
+                error = "没有可用 provider"
+                logger.warning("[memory] 没有可用 provider，保留待抽取消息")
                 return
 
             known = _known_block(
@@ -1584,7 +1855,8 @@ class Main(star.Star):
             raw = (getattr(resp, "completion_text", "") or "").strip()
             facts, gfacts = _parse_extract(raw)
             if not facts and not gfacts:
-                logger.info("[memory] 抽取 %s：没抽出东西（正常，闲聊里常常没料）", name or uid)
+                error = "没有抽出有效记忆"
+                completed = True
                 return
 
             kept = dropped = gkept = 0
@@ -1603,8 +1875,16 @@ class Main(star.Star):
                     dropped += 1
                     reasons.append(val)
                     continue
-                await self.store.put_fact(gid, uid, f["kind"], val, "auto", 1.0)
-                kept += 1
+                valid_to = f.get("expires_at")
+                if f["kind"] == "经历" and not valid_to:
+                    valid_to = time.time() + EPISODE_TTL_DAYS * 86400
+                act = await self.store.put_fact(
+                    gid, uid, f["kind"], val, "auto", 1.0,
+                    f.get("confidence", 0.7), f.get("evidence", []),
+                    f.get("occurred_at"), valid_to, f.get("supersedes", ""),
+                )
+                if act != "skip":
+                    kept += 1
             mnames = await self._member_names(gid)
             for f in gfacts[:MAX_GROUP_FACTS]:
                 ok, val = fact_ok(f["content"])
@@ -1621,20 +1901,37 @@ class Main(star.Star):
                     dropped += 1
                     reasons.append("群记忆点了「%s」的名字" % bad)
                     continue
-                await self.store.put_fact(gid, "", f["kind"], val, "auto", 1.0)
-                gkept += 1
+                act = await self.store.put_fact(
+                    gid, "", f["kind"], val, "auto", 1.0,
+                    f.get("confidence", 0.7), f.get("evidence", []),
+                    f.get("occurred_at"), f.get("expires_at"), f.get("supersedes", ""),
+                )
+                if act != "skip":
+                    gkept += 1
 
+            completed = True
             logger.info(
                 "[memory] 抽取 %s(%s)：收 %d 条个人 / %d 条群记忆，丢 %d 条%s",
                 name or uid, uid, kept, gkept, dropped,
                 ("（%s）" % "；".join(reasons[:4])) if reasons else "",
             )
         except asyncio.CancelledError:
+            error = "cancelled"
             raise
         except asyncio.TimeoutError:
-            logger.warning("[memory] 抽取超时 %.0fs，放弃这一轮", EXTRACT_TIMEOUT)
+            error = "抽取超时"
+            logger.warning("[memory] 抽取超时 %.0fs，保留待抽取消息", EXTRACT_TIMEOUT)
         except BaseException as e:
-            logger.warning("[memory] 抽取失败: %s", e)
+            error = "%s: %s" % (type(e).__name__, e)
+            logger.warning("[memory] 抽取失败，保留待抽取消息: %s", e)
+        finally:
+            if claim:
+                try:
+                    await self.store.finish_extract(
+                        gid, uid, claim[0], claim[1], completed, error
+                    )
+                except BaseException as e:
+                    logger.warning("[memory] 提交抽取状态失败: %s", e)
 
     # ---------------------------------------------------------- 指令
     #

@@ -42,6 +42,7 @@ from astrbot.api.message_components import Plain, Video
 from astrbot.core import logger
 from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.platform.message_type import MessageType
 
 # ---------------------------------------------------------------- 通用泄漏清理
 #
@@ -323,7 +324,10 @@ VIS_MODEL = os.environ.get("DSH_VID_VIS_MODEL", "GLM-4.6V-Flash")
 # 同一个站上的备用模型（逗号分隔），主用挂了按顺序试。
 # 跟 dsh-voice / dsh-imagegen 的 fallback 列表是同一个形状。
 VIS_MODEL_FALLBACKS = [
-    s.strip() for s in os.environ.get("DSH_VID_VIS_MODEL_FALLBACKS", "").split(",") if s.strip()
+    s.strip() for s in (
+        os.environ.get("DSH_VID_VIS_MODEL_FALLBACKS", "")
+        or "GLM-4.1V-Thinking-Flash,GLM-4V-Flash"
+    ).split(",") if s.strip()
 ]
 # 换一个站的最后兜底（三个都填才生效）。
 # 留着智谱当兜底的意义：主站在 Cloudflare 后面，偶发整片 403 时还有一条独立线路。
@@ -336,15 +340,20 @@ VIS_RETRY = int(os.environ.get("DSH_VID_VIS_RETRY", "2"))
 
 
 def _vis_targets() -> list[tuple[str, str, str]]:
-    """识别链：[(base, key, model), ...] 前面的优先。"""
+    """识别链：[(base, key, model), ...] 前面的优先；自动去掉重复目标。"""
     out: list[tuple[str, str, str]] = []
-    if VIS_BASE and VIS_KEY and VIS_MODEL:
-        out.append((VIS_BASE, VIS_KEY, VIS_MODEL))
+    seen: set[tuple[str, str]] = set()
+
+    def add(base: str, key: str, model: str) -> None:
+        target = (base.rstrip("/"), model.lower())
+        if base and key and model and target not in seen:
+            seen.add(target)
+            out.append((base, key, model))
+
+    add(VIS_BASE, VIS_KEY, VIS_MODEL)
     for m in VIS_MODEL_FALLBACKS:
-        if VIS_BASE and VIS_KEY:
-            out.append((VIS_BASE, VIS_KEY, m))
-    if ALT_BASE and ALT_KEY and ALT_MODEL:
-        out.append((ALT_BASE, ALT_KEY, ALT_MODEL))
+        add(VIS_BASE, VIS_KEY, m)
+    add(ALT_BASE, ALT_KEY, ALT_MODEL)
     return out
 # 抽几帧。4 帧够描述一个短片，再多就是浪费 token
 FRAMES = int(os.environ.get("DSH_VID_FRAMES", "4"))
@@ -374,6 +383,26 @@ GEN_STYLE = os.environ.get(
     "anime style, cute, clean line art, soft colors, simple background",
 )
 
+# 主动理解式视频：群友不是在显式“做视频”，而是在描述一个明确且动态的
+# 视觉片段时，可主动做成概念短片并询问理解是否正确。视频成本和等待都明显
+# 高于图片，因此门槛更高、冷却更长、触发概率更低，且默认只处理未被点名的闲聊。
+AUTO_CONCEPT = os.environ.get("DSH_VID_CONCEPT_AUTO", "1") not in ("0", "false", "False")
+CONCEPT_MIN_CHARS = max(16, int(os.environ.get("DSH_VID_CONCEPT_MIN_CHARS", "22")))
+CONCEPT_COOLDOWN = max(600, int(os.environ.get("DSH_VID_CONCEPT_COOLDOWN", "7200")))
+CONCEPT_RATE = max(0.0, min(1.0, float(os.environ.get("DSH_VID_CONCEPT_RATE", "0.25"))))
+CONCEPT_GROUPS = {
+    x.strip() for x in os.environ.get("DSH_VID_CONCEPT_GROUPS", "").split(",") if x.strip()
+}
+CONCEPT_ONLY_WHEN_NOT_REPLIED = os.environ.get(
+    "DSH_VID_CONCEPT_ONLY_WHEN_NOT_REPLIED", "1"
+) not in ("0", "false", "False")
+CONCEPT_ACK = os.environ.get(
+    "DSH_VID_CONCEPT_ACK", "这个画面挺适合动起来，我先按你的描述做个短片试试。"
+).strip()
+CONCEPT_CONFIRM = os.environ.get(
+    "DSH_VID_CONCEPT_CONFIRM", "做出来了，是不是你说的这种动态感觉？"
+).strip()
+
 TMP_DIR = os.environ.get("DSH_VID_TMP", "/AstrBot/data/video")
 # base64 之后的上限。5s 720p 约 1.8MB，留足余量；再大就是别的问题了
 MAX_SEND_B64 = int(os.environ.get("DSH_VID_MAX_SEND", str(24 * 1024 * 1024)))
@@ -398,8 +427,26 @@ def _raw_has_video(event) -> bool:
 
 
 ATTACH_RE = re.compile(
-    r"\[Video Attachment(?: in quoted message)?:\s*name\s+([^,\]]+),\s*path\s+([^\]]+)\]"
+    r"\[Video Attachment(?P<quoted> in quoted message)?:\s*name\s+"
+    r"(?P<name>[^,\]]+),\s*path\s+(?P<path>[^\]]+)\]"
 )
+
+
+def _video_attachment_hits(parts) -> list[tuple[int, str, str, bool]]:
+    """提取视频附件，并保留它是否来自被引用消息。"""
+    hits: list[tuple[int, str, str, bool]] = []
+    for i, part in enumerate(parts or []):
+        text = getattr(part, "text", "") or ""
+        for match in ATTACH_RE.finditer(text):
+            hits.append(
+                (
+                    i,
+                    match.group("name").strip(),
+                    match.group("path").strip(),
+                    bool(match.group("quoted")),
+                )
+            )
+    return hits
 
 # path -> 描述。同一个视频不重复识别（群友爱重复转发）
 _cache: dict[str, str] = {}
@@ -409,6 +456,8 @@ _gen_last_session: dict[str, float] = {}
 _gen_lock = asyncio.Lock()
 # 正在跑的后台出片任务，防止插件重载时野任务乱飞
 _gen_tasks: set[asyncio.Task] = set()
+_concept_last: dict[str, float] = {}
+_concept_inflight: set[str] = set()
 
 # ---------------------------------------------------------------- 意图与泄漏
 #
@@ -579,6 +628,71 @@ COMMENT_HEAD_RE = re.compile(
     r"^\s*(好像|应该|大概|可能|似乎|估计|貌似|说不定|恐怕|反正|其实|不过|但是"
     r"|感觉|觉得|听说|据说|是不是|要不要|能不能|可不可以)"
 )
+
+# ---------------------------------------------------------------- 主动动态概念判定
+# 图片概念只需外观和构图；视频还必须有明确动作/变化/镜头推进，防止静态角色
+# 描述同时触发图和视频。显式视频请求继续走原工具/兜底，不占主动额度。
+_CONCEPT_SUBJECT_RE = re.compile(
+    r"(?:^|[，。；;、\s]|这个)(?:我想要|我想做|设想|想象|构思|设计|成品|制品|片段|镜头|"
+    r"角色|人物|动物|机甲|机器人|怪物|场景|画面|动画|短片)"
+)
+_CONCEPT_VISUAL_RE = re.compile(
+    r"(配色|颜色|风格|造型|外观|构图|背景|材质|光线|姿势|表情|镜头|"
+    r"蓝色|红色|白色|黑色|金色|银色|透明|发光|机械|可爱|赛博|古风|二次元|"
+    r"海边|森林|城市|夜景|天空|房间|舞台)"
+)
+_CONCEPT_MOTION_RE = re.compile(
+    r"(走|跑|跳|舞|飞|游|追|转身|回头|抬头|低头|挥手|甩尾|翻身|落下|升起|"
+    r"爆炸|坍塌|燃烧|闪烁|流动|旋转|变形|展开|关闭|打开|消失|出现|靠近|远去|"
+    r"推进|拉远|环绕|跟拍|摇镜|切换|慢慢|逐渐|突然|一边[^，。]{0,12}一边)"
+)
+_CONCEPT_SEQUENCE_RE = re.compile(
+    r"(然后|接着|随后|最后|先[^，。]{0,18}再|从[^，。]{0,18}变成|越来越)"
+)
+_CONCEPT_NEGATIVE_RE = re.compile(
+    r"(不要|别|不用|无需|不需要|不做视频|不要视频|别做|不用做|只是说说)"
+)
+_CONCEPT_NONVISUAL_RE = re.compile(
+    r"(代码|程序|插件|接口|配置|部署|服务器|模型|提示词|prompt|表格|文档|报告|方案|"
+    r"计划|教程|规则|功能|机制|语音|音乐|歌曲|小说|论文|数据|播放量|点赞|链接|网页)"
+)
+_CONCEPT_STATIC_PRODUCT_RE = re.compile(r"(头像|海报|封面|壁纸|logo|LOGO|标志|插画|照片|图片)")
+_CONCEPT_QUESTION_ONLY_RE = re.compile(r"^(?:为什么|怎么|如何|能不能|可以吗|是不是|有没有)")
+
+
+def detect_motion_concept(text: str) -> tuple[bool, str]:
+    """判断是否为适合主动做成短片确认的具体动态描述。纯函数，便于回测。"""
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(raw) < CONCEPT_MIN_CHARS or len(raw) > 260:
+        return False, "长度不合适"
+    if raw.startswith("/") or _CONCEPT_NEGATIVE_RE.search(raw):
+        return False, "显式否定"
+    if VIDEO_MAKE_RE.search(raw):
+        return False, "显式视频请求归原链路"
+    if VIDEO_WATCH_RE.search(raw):
+        return False, "已有视频理解请求"
+    if _CONCEPT_STATIC_PRODUCT_RE.search(raw):
+        return False, "静态制品归图片"
+    if _CONCEPT_NONVISUAL_RE.search(raw):
+        return False, "非动态视觉制品"
+    if _CONCEPT_QUESTION_ONLY_RE.search(raw) and not _CONCEPT_SUBJECT_RE.search(raw):
+        return False, "纯提问"
+    subject = bool(_CONCEPT_SUBJECT_RE.search(raw))
+    visual = bool(_CONCEPT_VISUAL_RE.search(raw))
+    motion = bool(_CONCEPT_MOTION_RE.search(raw))
+    sequence = bool(_CONCEPT_SEQUENCE_RE.search(raw))
+    # 视频主动触发比图片多一道硬条件：必须存在动作，且有主体/镜头结构；
+    # 有两段时序动作时可不依赖颜色/风格词，真实事件描述也能成为短片。
+    if subject and visual and motion:
+        return True, "主体+视觉属性+动作"
+    if subject and motion and sequence:
+        return True, "主体+连续动作"
+    return False, "动态描述不够具体"
+
+
+def _concept_prompt(text: str) -> str:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    return "把下面描述做成一段连贯的概念短片，用于让描述者确认动态理解是否正确：" + raw[:260]
 
 
 def _imperative_gain(user_text: str, prompt: str) -> int:
@@ -963,13 +1077,70 @@ class Main(star.Star):
         os.makedirs(TMP_DIR, exist_ok=True)
         logger.info(
             "[video] 已加载：看视频=%s(%s 抽%d帧) 生成=%s(%s %ss %s) "
-            "全局间隔%.0fs 会话冷却%.0fs",
+            "全局间隔%.0fs 会话冷却%.0fs 主动概念=%s/%.0f%%/%.0fs",
             "开" if UNDERSTAND and _vis_targets() else "关",
             "→".join(t[2] for t in _vis_targets()) or "无", FRAMES,
             "开" if GEN and GEN_KEY else "关",
             GEN_MODEL, GEN_SECONDS, GEN_SIZE,
             GEN_INTERVAL, GEN_COOLDOWN,
+            "开" if AUTO_CONCEPT else "关", CONCEPT_RATE * 100, CONCEPT_COOLDOWN,
         )
+
+    # ------------------------------------------ 描述明确动态片段时主动可视化
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    async def auto_concept(self, event: AstrMessageEvent) -> None:
+        """群友描述明确动态场景时，后台做概念短片并在完成后询问是否如此。"""
+        if not (AUTO_CONCEPT and GEN and GEN_KEY):
+            return
+        try:
+            if event.get_message_type() != MessageType.GROUP_MESSAGE:
+                return
+            if event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive"):
+                return
+            if CONCEPT_ONLY_WHEN_NOT_REPLIED and bool(event.is_at_or_wake_command):
+                return
+            gid = str(event.get_group_id() or "")
+            uid = str(event.get_sender_id() or "")
+            if not gid or not uid or uid == str(event.get_self_id() or ""):
+                return
+            if CONCEPT_GROUPS and gid not in CONCEPT_GROUPS:
+                return
+            text = str(event.get_message_str() or "").strip()
+            ok, why = detect_motion_concept(text)
+            if not ok:
+                return
+
+            sid = event.unified_msg_origin or ("group:" + gid)
+            now = time.time()
+            left = CONCEPT_COOLDOWN - (now - _concept_last.get(sid, 0.0))
+            if left > 0:
+                logger.info("[video] 主动概念短片命中但在冷却中（%ds）：%.60s", int(left), text)
+                return
+            gleft = GEN_INTERVAL - (now - _gen_last_global)
+            if gleft > 0 or sid in _concept_inflight:
+                logger.info("[video] 主动概念短片命中但接口/任务正忙：%.60s", text)
+                return
+            if random.random() >= CONCEPT_RATE:
+                logger.info("[video] 主动概念短片命中但概率未中：%.60s", text)
+                return
+
+            _concept_last[sid] = now
+            _gen_last_session[sid] = now
+            _concept_inflight.add(sid)
+            event.set_extra("video_done", True)
+            prompt = _concept_prompt(text)
+            logger.info("[video] 主动概念短片（%s）：%.120s", why, text)
+            if CONCEPT_ACK:
+                await event.send(MessageChain(chain=[Plain(CONCEPT_ACK)]))
+            event.stop_event()
+            task = asyncio.create_task(self._gen_and_send(
+                event, prompt, confirm=CONCEPT_CONFIRM, concept_sid=sid
+            ))
+            _gen_tasks.add(task)
+            task.add_done_callback(_gen_tasks.discard)
+        except BaseException as exc:
+            logger.error("[video] 主动概念短片异常：%s", exc)
 
     # ------------------------------------------------ 看视频（自动）
 
@@ -980,11 +1151,7 @@ class Main(star.Star):
             return
         try:
             parts = getattr(req, "extra_user_content_parts", None) or []
-            hits: list[tuple[int, str, str]] = []
-            for i, part in enumerate(parts):
-                text = getattr(part, "text", "") or ""
-                for m in ATTACH_RE.finditer(text):
-                    hits.append((i, m.group(1).strip(), m.group(2).strip()))
+            hits = _video_attachment_hits(parts)
             if not hits:
                 # ★ 这里必须出声：看视频功能实测从上线起一次都没成功过 ★
                 # 2026-09-03 真群有人发视频，本插件全程零日志；24h 内
@@ -1014,15 +1181,16 @@ class Main(star.Star):
     async def _run_understand(self, req, hits) -> None:
         lines: list[str] = []
         drop: set[int] = set()
-        for idx, name, path in hits:
+        for idx, name, path, quoted in hits:
             cap, err = await _describe_video(path)
+            subject = "用户引用的旧消息里有人发了个视频" if quoted else "有人发了个视频"
             if cap:
-                lines.append(f"- 有人发了个视频，内容是：{cap}")
+                lines.append(f"- {subject}，内容是：{cap}")
                 drop.add(idx)
                 logger.info("[video] 识别成功 %s -> %s", os.path.basename(path), cap[:40])
             else:
                 lines.append(
-                    f"- 有人发了个视频（{name}），但你看不了它的内容（{err}）。"
+                    f"- {subject}（{name}），但你看不了它的内容（{err}）。"
                     "就说你看不了，别编里面有什么。"
                 )
                 drop.add(idx)
@@ -1106,7 +1274,8 @@ class Main(star.Star):
             "不要说你做不了，也不要再调用工具。"
         )
 
-    async def _gen_and_send(self, event: AstrMessageEvent, prompt: str) -> None:
+    async def _gen_and_send(self, event: AstrMessageEvent, prompt: str,
+                            confirm: str = "", concept_sid: str = "") -> None:
         """后台出片。绝不能在工具里等——会话锁会把整个群卡住几分钟。"""
         global _gen_last_global
         sid = event.unified_msg_origin or "global"
@@ -1120,6 +1289,8 @@ class Main(star.Star):
             if not tid:
                 logger.error("[video] 提交失败：%s", err)
                 _gen_last_session[sid] = 0.0
+                if concept_sid:
+                    _concept_last[concept_sid] = 0.0
                 await event.send(MessageChain(chain=[Plain("视频没做出来，接口那边出问题了")]))
                 return
 
@@ -1129,12 +1300,17 @@ class Main(star.Star):
             if not url:
                 logger.error("[video] 出片失败：%s", err)
                 _gen_last_session[sid] = 0.0
+                if concept_sid:
+                    _concept_last[concept_sid] = 0.0
                 await event.send(MessageChain(chain=[Plain("视频翻车了，没做出来")]))
                 return
 
             path, err = await _download(url)
             if not path:
                 logger.error("[video] 下载失败：%s", err)
+                if concept_sid:
+                    _gen_last_session[sid] = 0.0
+                    _concept_last[concept_sid] = 0.0
                 await event.send(MessageChain(chain=[Plain("视频做好了但下不下来")]))
                 return
 
@@ -1145,12 +1321,22 @@ class Main(star.Star):
             # 视频必须单独一条发。混进正常回复里会被
             # completion_text 的重新推导抹掉（get_plain_text 只留文字）。
             await self._send_video(event, path)
+            if confirm:
+                await event.send(MessageChain(chain=[Plain(confirm)]))
             await _cleanup_old()
         except asyncio.CancelledError:
+            if concept_sid:
+                _gen_last_session[sid] = 0.0
+                _concept_last[concept_sid] = 0.0
             raise
         except BaseException as e:  # noqa: BLE001
             logger.error("[video] 后台出片异常：%s", e)
             _gen_last_session[sid] = 0.0
+            if concept_sid:
+                _concept_last[concept_sid] = 0.0
+        finally:
+            if concept_sid:
+                _concept_inflight.discard(concept_sid)
 
     # ------------------------------------------------ 真正把视频发出去
 

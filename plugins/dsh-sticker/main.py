@@ -49,7 +49,9 @@
 #   避免「工具图 + 贴纸」一次刷两张。
 
 import os
+import random
 import re
+import time
 from collections import deque
 from datetime import datetime
 
@@ -74,6 +76,22 @@ WINDOW = max(1, int(os.environ.get("DSH_STICKER_WINDOW", "2")))
 MAX_IN_WINDOW = max(1, int(os.environ.get("DSH_STICKER_MAX_IN_WINDOW", "1")))
 # 一条回复最多发几张（人格也是这么写的）
 MAX_PER_REPLY = max(1, int(os.environ.get("DSH_STICKER_MAX_PER_REPLY", "1")))
+# 模型没主动写标记时，给纯聊天回复一个很低的自动补图概率。旧逻辑完全依赖模型
+# 自觉写 [贴纸:x]，换模型后近 6 小时 700+ 条回复只发 1 张，体感几乎消失。
+# 自动补图仍受冷却、仅限短口语回复、且一轮已有媒体时不发，避免回到 91% 刷屏。
+AUTO_RATE = min(1.0, max(0.0, float(os.environ.get("DSH_STICKER_AUTO_RATE", "0.22"))))
+AUTO_COOLDOWN = max(0, int(os.environ.get("DSH_STICKER_AUTO_COOLDOWN", "180")))
+AUTO_MAX_CHARS = max(1, int(os.environ.get("DSH_STICKER_AUTO_MAX_CHARS", "28")))
+_AUTO_TAG_RULES = (
+    (re.compile(r"笑死|哈哈|绷不住|(?:^|[，。！？!?、\s])(?:乐|草|6)(?:$|[，。！？!?、\s])|离谱|逆天|抽象"), ("嘲笑", "小丑")),
+    (re.compile(r"可爱|好乖|真棒|厉害|可以的|有点实力|谢谢|感谢|爱了"), ("装萌", "送花")),
+    (re.compile(r"委屈|伤心|难受|哭|欺负|可怜|不理我"), ("装可怜", "假装没伤心")),
+    (re.compile(r"困|熬夜|睡不着|通宵"), ("熬夜",)),
+    (re.compile(r"想想|让我想|不懂|不知道|怎么回事|为啥|为什么|\?{1,3}|？{1,3}"), ("思考",)),
+    (re.compile(r"看看|瞅瞅|来了|在吗|干嘛|冒泡"), ("探头",)),
+    (re.compile(r"帅|稳|拿下|搞定|那必须|豪横"), ("装酷",)),
+)
+_AUTO_FALLBACK_TAGS = ("思考", "探头", "装萌", "装酷")
 # [patch:dedup-v2 同一张贴纸的冷却]
 # 同一张贴纸的冷却。只记「上一张真发出去的贴纸名」+「距那次过了几拍放行」，
 # 同名且不满 COOLDOWN 拍就不发。实测群记录里连着 5 张「假装没伤心」，
@@ -97,9 +115,12 @@ MAX_PER_REPLY = max(1, int(os.environ.get("DSH_STICKER_MAX_PER_REPLY", "1")))
 DEDUP_COOLDOWN = max(0, int(os.environ.get("DSH_STICKER_DEDUP_COOLDOWN", "3")))
 
 # 这一轮已经出过慢媒体，就别再叠贴纸
-MEDIA_FLAGS = ("imagegen_done", "voice_done", "video_done")
+MEDIA_FLAGS = ("imagegen_done", "voice_done", "video_done", "steal_done")
 # on_llm_response 处理过这一步的记号，防同一步被兜底钩子二次发送
 STEP_FLAG = "dsh_sticker_step_done"
+# 只有真正经过 LLM 最终回复钩子的无标记文本，才允许在装饰出口自动补图；
+# 防止 /状态 等普通命令也被随机附上表情包。
+AUTO_FLAG = "dsh_sticker_auto_candidate"
 
 # 最近一次解析的记录，方便排查
 _LAST_USED: dict[str, list[str]] = {}
@@ -108,9 +129,12 @@ _attempts: dict[str, deque] = {}
 # gid -> (上一张真发出去的贴纸名, 距今过了几次放行)。见 patch:dedup-v2。
 # 只在真发出去时更新：被配额挡掉的那次群里根本没看见，不算「间隔拉开了」。
 _last_tag: dict[str, tuple] = {}
+# gid -> 上一次自动补贴纸时间；模型主动标记走原配额，不受该时间冷却。
+_last_auto: dict[str, float] = {}
 # 统计：/贴纸状态 用
 _stat = {"attempt": 0, "sent": 0, "quota_drop": 0, "media_drop": 0, "unknown": 0,
-         "inter_step": 0, "dedup_drop": 0}
+         "inter_step": 0, "dedup_drop": 0, "auto_attempt": 0,
+         "auto_sent": 0, "auto_cooldown_drop": 0}
 
 
 def _resolve_sticker(tag: str):
@@ -181,6 +205,54 @@ def _cooldown_tick(gid: str) -> None:
     last, since = _last_tag.get(gid, (None, 10 ** 9))
     if last is not None:
         _last_tag[gid] = (last, since + 1)
+
+
+def _auto_tag(text: str) -> str:
+    """给适合用表情回应的短口语挑一个已有贴纸标签；不适合则返回空。"""
+    plain = (text or "").strip()
+    if not plain or len(plain) > AUTO_MAX_CHARS or "\n" in plain:
+        return ""
+    # 正经说明、拒绝、安全/健康提醒和工具状态不自动配梗图。
+    if re.search(r"https?://|因为|建议|注意|不能|无法|抱歉|出不了|失败|错误|风险|观察下|医院|医生|报警", plain):
+        return ""
+    for pattern, tags in _AUTO_TAG_RULES:
+        if pattern.search(plain):
+            return random.choice(tags)
+    # 无明显情绪的短回复只以很低概率补中性贴纸，随机闸由调用方统一处理。
+    return random.choice(_AUTO_FALLBACK_TAGS)
+
+
+async def _maybe_auto_send(event: AstrMessageEvent, text: str) -> bool:
+    """模型没有主动贴纸标记时，低频补一张；返回是否真发成功。"""
+    if AUTO_RATE <= 0 or _has_media(event):
+        return False
+    tag = _auto_tag(text)
+    if not tag:
+        return False
+    gid = _gid(event)
+    now = time.time()
+    # 先挡群级冷却再抽样，避免把冷却期内大量回复计成「尝试」，状态更好读。
+    if now - _last_auto.get(gid, 0.0) < AUTO_COOLDOWN:
+        _stat["auto_cooldown_drop"] += 1
+        return False
+    if random.random() >= AUTO_RATE:
+        return False
+    _stat["auto_attempt"] += 1
+    _cooldown_tick(gid)
+    if not _cooldown_allows(gid, tag):
+        _stat["dedup_drop"] += 1
+        return False
+    path = _resolve_sticker(tag)
+    if not path:
+        _stat["unknown"] += 1
+        return False
+    await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
+    _last_auto[gid] = now
+    _cooldown_remember(gid, tag)
+    _stat["sent"] += 1
+    _stat["auto_sent"] += 1
+    logger.info("[贴纸] 自动补发 1 张 tag=%r gid=%s text=%r", tag, gid, text[:30])
+    return True
 
 
 async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
@@ -261,6 +333,10 @@ class Main(star.Star):
             text = response.completion_text or ""
             cleaned = await _handle(event, text, "llm_response")
             if cleaned is None:
+                try:
+                    event.set_extra(AUTO_FLAG, True)
+                except BaseException:
+                    pass
                 return
             # 只要出现过标记，就把回复文字换成去标记后的文本（即使没发成任何贴纸）
             if cleaned != text:
@@ -284,7 +360,22 @@ class Main(star.Star):
         """
         try:
             result = event.get_result()
-            if result is None or not result.chain:
+            if result is None:
+                return
+
+            # chain_result() 收的是组件 list；上游若误传 MessageChain 会形成
+            # 嵌套结构。钩子顺序不保证，故本插件也独立拆平并 fail-open。
+            chain = getattr(result, "chain", None)
+            if chain is not None and not isinstance(chain, list):
+                inner = getattr(chain, "chain", None)
+                if isinstance(inner, list):
+                    result.chain = inner
+                    logger.warning("[贴纸] 检测到嵌套 MessageChain，已拆平")
+                else:
+                    logger.error("[贴纸] result.chain 类型异常: %r", type(chain))
+                    return
+
+            if not result.chain:
                 return
 
             # 上面已经处理过这一步：只剥不发，避免同一步发两张
@@ -314,6 +405,22 @@ class Main(star.Star):
                 for c in result.chain
                 if not (isinstance(c, Plain) and not (c.text or "").strip())
             ]
+
+            # 无显式标记的最终纯文本回复走低频自动补图。放在装饰出口而不是
+            # on_llm_response：即使别的插件改写了最终文案，也按群里真正看到的文本选图。
+            auto_candidate = False
+            try:
+                auto_candidate = bool(event.get_extra(AUTO_FLAG))
+            except BaseException:
+                pass
+            if auto_candidate and not already and not any(
+                isinstance(c, Image) for c in result.chain
+            ):
+                plain_text = "".join(
+                    (c.text or "") for c in result.chain if isinstance(c, Plain)
+                ).strip()
+                if plain_text and not MARKER_RE.search(plain_text):
+                    await _maybe_auto_send(event, plain_text)
         except BaseException as e:
             logger.error(f"[贴纸] 兜底处理失败: {e}")
 
@@ -321,11 +428,13 @@ class Main(star.Star):
     async def cmd_status(self, event: AstrMessageEvent):
         gid = _gid(event)
         win = [int(x) for x in _attempts.get(gid, [])]
-        rate = (_stat["sent"] / _stat["attempt"] * 100) if _stat["attempt"] else 0.0
+        explicit_sent = max(0, _stat["sent"] - _stat["auto_sent"])
+        rate = (explicit_sent / _stat["attempt"] * 100) if _stat["attempt"] else 0.0
         yield event.plain_result(
             "贴纸配额：{}（窗口 {} 次里最多 {} 次，单条最多 {} 张）\n"
             "本群窗口：{}\n"
             "累计：想发 {} / 真发 {} = {:.0f}%\n"
+            "自动补图：概率 {:.0f}% / 冷却 {}秒 / 尝试 {} / 真发 {} / 冷却拦下 {}\n"
             "拦下：配额 {} 次、本轮已有媒体 {} 次、未知贴纸名 {} 次\n"
             "兜底钩子在中间步剥掉标记 {} 次".format(
                 "开" if QUOTA_ON else "关",
@@ -334,8 +443,13 @@ class Main(star.Star):
                 MAX_PER_REPLY,
                 win or "空",
                 _stat["attempt"],
-                _stat["sent"],
+                explicit_sent,
                 rate,
+                AUTO_RATE * 100,
+                AUTO_COOLDOWN,
+                _stat["auto_attempt"],
+                _stat["auto_sent"],
+                _stat["auto_cooldown_drop"],
                 _stat["quota_drop"],
                 _stat["media_drop"],
                 _stat["unknown"],

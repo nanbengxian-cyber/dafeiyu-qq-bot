@@ -10,8 +10,11 @@
 # 为什么要单独测匹配：门卫的匹配规则必须和框架逐字一致，否则会出现
 # 「门卫认为不是指令 → 放行 → 框架认为是指令 → 越权执行」这种漏放。
 
+import ast
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 fails = []
 
@@ -226,6 +229,48 @@ check("E7 OWNERS 为空：role==owner 仍放行",
       allowed("owner", "111", "owner", set()), True)
 check("E8 OWNERS 为空：普通成员不行",
       allowed("owner", "111", "member", set()), False)
+
+# ---------------------------------------------------------------- F 动态目录扫描
+print("\nF 动态目录扫描")
+
+
+def scan_commands(root):
+    commands = set()
+    for path in Path(root).rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "command"
+                    and decorator.args
+                ):
+                    continue
+                try:
+                    command = ast.literal_eval(decorator.args[0])
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(command, str) and command.strip():
+                    commands.add(command.strip())
+    return commands
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    (root / "plugin.py").write_text(
+        '@filter.command("新指令")\nasync def command(event):\n    pass\n',
+        encoding="utf-8",
+    )
+    (root / "broken.py").write_text("def broken(", encoding="utf-8")
+    found = scan_commands(root)
+    check("F1 自动发现后加的指令", found, {"新指令"})
+    check("F2 未手工分档的新指令默认所有人", level_of("新指令"), "all")
 
 # ---------------------------------------------------------------- 汇总
 print()

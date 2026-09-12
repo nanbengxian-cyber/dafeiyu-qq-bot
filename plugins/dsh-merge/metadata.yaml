@@ -1,5 +1,5 @@
 name: dsh-merge
-desc: 艾特风暴聚合回复 —— 短时间内被@太多次时，把这一波内容整合成一条统一回复（不点名不@），而不是逐条回刷屏。
-version: 1.1.0
+desc: 艾特风暴上下文重扫 —— 被连续@时先静默等待，停喊后重读最新群聊上下文，只接当前核心话头，不逐条堆砌。
+version: 2.0.0
 author: 大肥鱼
 repo: https://example.com/dsh-merge

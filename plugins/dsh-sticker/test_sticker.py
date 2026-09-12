@@ -5,11 +5,35 @@
 #   B. 标记正则的剥离行为（标记必须无条件剥掉，未知贴纸名也不能漏）
 # 钩子接线、event.send、result.chain 操作依赖框架，放到真群 e2e 验。
 
+import random
 import re
 import sys
 from collections import deque
 
 MARKER_RE = re.compile(r"[\[【]\s*(?:贴纸|貼紙|sticker)\s*[:：]\s*([^\]】]+?)\s*[\]】]")
+AUTO_MAX_CHARS = 28
+_AUTO_TAG_RULES = (
+    (re.compile(r"笑死|哈哈|绷不住|(?:^|[，。！？!?、\s])(?:乐|草|6)(?:$|[，。！？!?、\s])|离谱|逆天|抽象"), ("嘲笑", "小丑")),
+    (re.compile(r"可爱|好乖|真棒|厉害|可以的|有点实力|谢谢|感谢|爱了"), ("装萌", "送花")),
+    (re.compile(r"委屈|伤心|难受|哭|欺负|可怜|不理我"), ("装可怜", "假装没伤心")),
+    (re.compile(r"困|熬夜|睡不着|通宵"), ("熬夜",)),
+    (re.compile(r"想想|让我想|不懂|不知道|怎么回事|为啥|为什么|\?{1,3}|？{1,3}"), ("思考",)),
+    (re.compile(r"看看|瞅瞅|来了|在吗|干嘛|冒泡"), ("探头",)),
+    (re.compile(r"帅|稳|拿下|搞定|那必须|豪横"), ("装酷",)),
+)
+_AUTO_FALLBACK_TAGS = ("思考", "探头", "装萌", "装酷")
+
+
+def auto_tag(text):
+    plain = (text or "").strip()
+    if not plain or len(plain) > AUTO_MAX_CHARS or "\n" in plain:
+        return ""
+    if re.search(r"https?://|因为|建议|注意|不能|无法|抱歉|出不了|失败|错误|风险|观察下|医院|医生|报警", plain):
+        return ""
+    for pattern, tags in _AUTO_TAG_RULES:
+        if pattern.search(plain):
+            return tags[0]
+    return _AUTO_FALLBACK_TAGS[0]
 
 fails = []
 
@@ -91,6 +115,29 @@ for src, want_tags, want_clean in CASES:
 # B11 不该误伤的方括号
 for src in ["[图片]", "[CQ:at,qq=123]", "看这个 [1] 注释", "【公告】明天放假"]:
     check(f"B11 不误伤 {src!r}", MARKER_RE.findall(src), [])
+
+print("C. 无标记回复自动补图选型")
+for src, want in [
+    ("笑死我了", "嘲笑"),
+    ("你真厉害", "装萌"),
+    ("有点委屈", "装可怜"),
+    ("今晚通宵", "熬夜"),
+    ("这怎么回事？", "思考"),
+    ("我来看看", "探头"),
+    ("稳，拿下", "装酷"),
+]:
+    check(f"C 语义选型 {src!r}", auto_tag(src), want)
+
+for src in [
+    "建议你先去医院看看", "抱歉，这个无法处理", "https://example.com",
+    "这是一条超过自动贴纸最大长度限制的正经说明文字，不应该自动配上任何表情包",
+    "第一行\n第二行",
+]:
+    check(f"C 安全放过 {src!r}", auto_tag(src), "")
+
+# 单字规则必须有边界，不能把「乐」误命中在「快乐」中，也不能把版本号里的 6 当梗。
+check("C 快乐不当嘲笑", auto_tag("祝你快乐") == "嘲笑", False)
+check("C 版本号不当嘲笑", auto_tag("升级到6.1版本") == "嘲笑", False)
 
 print()
 if fails:

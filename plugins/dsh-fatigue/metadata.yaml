@@ -1,0 +1,5 @@
+name: dsh-fatigue
+desc: 话题疲劳系统。同一人无新增信息地反复追问同一件事时，机器人逐级变短、转开或自然拒绝；不使用固定“刚聊过”话术。联动 clarify 复用语境分类，并阻止 proactive/initiate 自己翻出高疲劳话题。
+version: 1.0.0
+author: 大肥鱼
+repo: local

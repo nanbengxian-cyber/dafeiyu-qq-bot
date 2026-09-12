@@ -82,7 +82,7 @@
 #
 # 旋钮：
 #   DSH_ACL              1/0 总开关（默认 1）
-#   DSH_ACL_OWNER        QQ 号，逗号分隔（默认 2774000001）
+#   DSH_ACL_OWNER        QQ 号，逗号分隔（默认 2774067216）
 #   DSH_ACL_OWNER_CMDS   追加 owner 级指令，逗号分隔
 #   DSH_ACL_ADMIN_CMDS   追加 admin 级指令
 #   DSH_ACL_ALL_CMDS     降级为所有人可用（优先级最高，用来放开默认限制）
@@ -91,9 +91,11 @@
 #   DSH_ACL_COOLDOWN     同一人拒绝提示的冷却秒数（默认 30，防刷屏）
 # 指令：/权限（看自己能用什么）
 
+import ast
 import os
 import re
 import time
+from pathlib import Path
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -107,7 +109,7 @@ ENABLED = os.environ.get("DSH_ACL", "1") != "0"
 # 群主的 QQ 号。默认值是本群群主，换群改这个 env 就行。
 OWNERS = {
     u.strip()
-    for u in os.environ.get("DSH_ACL_OWNER", "2774000001").split(",")
+    for u in os.environ.get("DSH_ACL_OWNER", "2774067216").split(",")
     if u.strip()
 }
 
@@ -202,6 +204,10 @@ OWNER_CMDS = {
     "关系标签",
     # dsh-selfaware 自我认知注入统计。
     "自我认知状态",
+    # dsh-desire 持续欲望：内部强度、事件与模式属于整群行为策略。
+    "欲望状态",
+    # dsh-agency 自主意志：逆反压力、判据与行为模式属于整群行为策略。
+    "自主状态",
     # dsh-selfworth 自身利益：模式/状态/账本都是整群行为策略。
     "利益状态",
     "利益模式",
@@ -311,6 +317,53 @@ _stat = {
 _last_refuse: dict[str, float] = {}
 _recent: list[str] = []
 
+# 目录不再只依赖上面的手工表。启动时扫描实际安装插件和 AstrBot 内置命令，
+# 后续新增公开指令会自动出现在 /权限；手工表只负责分档。
+_COMMAND_ROOTS = (
+    Path("/AstrBot/data/plugins"),
+    Path("/AstrBot/astrbot/builtin_stars"),
+)
+
+
+def _scan_installed_commands(roots=None) -> set[str]:
+    commands: set[str] = set()
+    for root in roots or _COMMAND_ROOTS:
+        try:
+            files = Path(root).rglob("*.py")
+        except OSError:
+            continue
+        for path in files:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, SyntaxError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for decorator in node.decorator_list:
+                    if not (
+                        isinstance(decorator, ast.Call)
+                        and isinstance(decorator.func, ast.Attribute)
+                        and decorator.func.attr == "command"
+                        and decorator.args
+                    ):
+                        continue
+                    try:
+                        command = ast.literal_eval(decorator.args[0])
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(command, str) and command.strip():
+                        commands.add(command.strip())
+    return commands
+
+
+INSTALLED_CMDS = _scan_installed_commands()
+# 这三条还受 AstrBot 原生 WebUI 管理员身份限制，QQ群身份无法通过，不能冒充
+# “群主可用”列进群目录。其余指令按当前实际安装结果展示；扫描失败才退静态表。
+_WEBUI_ONLY_CMDS = {"name", "provider", "dashboard_update"}
+INSTALLED_CMDS -= _WEBUI_ONLY_CMDS
+KNOWN_CMDS = INSTALLED_CMDS or (OWNER_CMDS | ADMIN_CMDS | PUBLIC_CMDS)
+
 
 # ---------------------------------------------------------------- 纯函数区
 # 这一段不碰 event、不碰 astrbot，可以单测（见 test_acl.py）。
@@ -394,12 +447,13 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[acl] 已加载：%s 群主=%s 作用域=%s owner级%d条 admin级%d条 %s",
+            "[acl] 已加载：%s 群主=%s 作用域=%s owner级%d条 admin级%d条 目录%d条%s",
             "开" if ENABLED else "关",
             "、".join(sorted(OWNERS)) or "未设置",
             SCOPE,
             len(OWNER_CMDS),
             len(ADMIN_CMDS),
+            len(INSTALLED_CMDS),
             "（静默模式）" if QUIET else "",
         )
         if not OWNERS:
@@ -510,17 +564,21 @@ class Main(star.Star):
         who = "群主" if is_owner else ("管理员" if is_admin else "群成员")
         lines = ["你是%s（QQ %s），可以用：" % (who, uid)]
 
-        # 人人可用的那批：只列真实存在的，别把 env 里瞎填的名字也念出来。
-        pub = sorted(PUBLIC_CMDS - OWNER_CMDS - ADMIN_CMDS)
-        lines.append("　所有人：" + "、".join("/" + c for c in pub))
+        # 以实际安装的 @filter.command 为目录；分档表只负责权限等级。
+        # 若扫描异常则退回静态表，绝不能让 /权限 变成空目录。
+        known = KNOWN_CMDS
+        public = sorted(c for c in known if level_of(c) == "all")
+        admin = sorted(c for c in known if level_of(c) == "admin")
+        owner = sorted(c for c in known if level_of(c) == "owner")
+        lines.append("　所有人：" + "、".join("/" + c for c in public))
         if is_admin:
-            lines.append("　管理员：" + "、".join("/" + c for c in sorted(ADMIN_CMDS)))
+            lines.append("　管理员：" + "、".join("/" + c for c in admin))
         if is_owner:
-            lines.append("　群主：" + "、".join("/" + c for c in sorted(OWNER_CMDS)))
+            lines.append("　群主：" + "、".join("/" + c for c in owner))
         if not is_admin:
             lines.append(
                 "另外 %d 条状态查询要管理员、%d 条要群主。"
-                % (len(ADMIN_CMDS), len(OWNER_CMDS))
+                % (len(admin), len(owner))
             )
         lines.append("不用指令也行：直接说「画个猫」「用语音说」，发链接我会自己去看。")
         yield event.plain_result("\n".join(lines))
@@ -541,8 +599,12 @@ class Main(star.Star):
             "放行 %d 次（owner级 %d／admin级 %d）"
             % (s["pass_owner"] + s["pass_admin"], s["pass_owner"], s["pass_admin"]),
             "拦下 %d 次（其中 %d 次因冷却没出声）" % (s["denied"], s["quiet_denied"]),
-            "分档：owner %d 条｜admin %d 条｜其余人人可用"
-            % (len(OWNER_CMDS), len(ADMIN_CMDS)),
+            "分档：owner %d 条｜admin %d 条｜目录共 %d 条"
+            % (
+                len([c for c in KNOWN_CMDS if level_of(c) == "owner"]),
+                len([c for c in KNOWN_CMDS if level_of(c) == "admin"]),
+                len(KNOWN_CMDS),
+            ),
         ]
         if _recent:
             lines.append("最近几次拦下：")

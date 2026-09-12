@@ -7,7 +7,7 @@ def check(n,g,w):
     if g==w: print(f"  PASS {n}")
     else: print(f"  FAIL {n}\n       got={g!r}\n       want={w!r}"); fails.append(n)
 
-_BOOLS=("arrange","venting","stop","ack","banter","open","about_bot")
+_BOOLS=("arrange","venting","stop","ack","banter","open","about_bot","replying_to_bot")
 _STRS=("topic","to","tone","avoid")
 _CAP_RE=re.compile(r"别(真)?(画|发|生成|搜|查|做图|出图|语音|视频|唱|放)|不要(画|发|生成|搜|查|放)|别调用|别用工具")
 _ASK_RE=re.compile(r"(画|生成|做|发|来|整|录|唱)(一|几|多)?(张|个|段|条|首|遍|次)?"
@@ -52,6 +52,7 @@ def _parse(raw):
     return r
 def verdict(f):
     if f["stop"]: return "沉默","有人叫别插话"
+    if f.get("replying_to_bot") and not f["ack"]: return "回话","在回你"
     if f["venting"]: return "沉默","有人在诉苦"
     if f["arrange"] and not f["banter"]: return "沉默","两人在谈具体安排"
     if f["ack"] and not f["open"]: return "沉默","只是一句应答"
@@ -113,6 +114,8 @@ check("B11 stop 压过 banter(硬否决)", verdict(F(stop=True,banter=True))[0],
 check("B12 venting 压过 banter", verdict(F(venting=True,banter=True))[0], "沉默")
 check("B13 理由可读", verdict(F(venting=True))[1], "有人在诉苦")
 check("B14 无信号时理由标注清楚", verdict(F())[1], "回话（无否决信号）".replace("回话（","可接（"))
+check("B15 在回你压过诉苦", verdict(F(replying_to_bot=True, venting=True))[0], "回话")
+check("B16 在回你但只是应答仍沉默", verdict(F(replying_to_bot=True, ack=True))[0], "沉默")
 
 print("C. 注入块形状")
 def _render(f):

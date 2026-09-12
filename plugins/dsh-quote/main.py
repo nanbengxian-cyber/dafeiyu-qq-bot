@@ -45,7 +45,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.core import logger
 from astrbot.core.agent.message import TextPart
-from astrbot.core.message.components import At, Reply
+from astrbot.core.message.components import At, Image, Reply, Video
 from astrbot.core.platform.message_type import MessageType
 
 ENABLED = os.environ.get("DSH_QUOTE", "1").lower() not in {"0", "false", "off"}
@@ -84,6 +84,28 @@ def _chain_text(chain) -> str:
     return " ".join(out).strip()
 
 
+def _media_labels(chain) -> tuple[str, ...]:
+    """返回被引用消息中的媒体类型；不把附件占位文字误当正文。"""
+    labels: list[str] = []
+    for comp in chain or ():
+        cls = type(comp).__name__.lower()
+        if isinstance(comp, Image) or cls == "image":
+            label = "图片"
+        elif isinstance(comp, Video) or cls == "video":
+            label = "视频"
+        else:
+            continue
+        if label not in labels:
+            labels.append(label)
+    return tuple(labels)
+
+
+def _media_summary(labels: tuple[str, ...]) -> str:
+    if not labels:
+        return ""
+    return "和".join(labels)
+
+
 def _who(name: str, uid: str) -> str:
     """统一的人物写法：昵称 + QQ 号。群里有重名，只有 QQ 号是可靠凭证。"""
     name = (name or "").strip()
@@ -104,6 +126,7 @@ def build_block(
     self_id: str,
     at_uids: tuple[str, ...] = (),
     at_names: tuple[str, ...] = (),
+    media_labels: tuple[str, ...] = (),
 ) -> str:
     """拼出替换用的引用说明块。纯函数，便于断言。
 
@@ -112,7 +135,16 @@ def build_block(
     self_id = (self_id or "").strip()
     quoted_uid = (quoted_uid or "").strip()
     speaker_uid = (speaker_uid or "").strip()
-    text = _strip_at_prefix(quoted_text)[:MAX_QUOTE] or "（空消息）"
+    raw_text = _strip_at_prefix(quoted_text)[:MAX_QUOTE]
+    media = _media_summary(media_labels)
+    if raw_text and media:
+        text = "%s（这条旧消息还带有%s，具体内容见单独的媒体分析。）" % (raw_text, media)
+    elif raw_text:
+        text = raw_text
+    elif media:
+        text = "（这是一条只含%s的旧消息，具体内容见单独的媒体分析。）" % media
+    else:
+        text = "（空消息）"
 
     lines = ["<quoted_message>",
              "这条消息引用了之前的一句话。引用的内容是**旧的**，不是刚刚发生的新消息。",
@@ -193,6 +225,7 @@ class Main(star.Star):
                 self_id=str(event.get_self_id() or ""),
                 at_uids=at_uids,
                 at_names=at_names,
+                media_labels=_media_labels(getattr(quote, "chain", None)),
             )
             parts = getattr(req, "extra_user_content_parts", None)
             if not isinstance(parts, list):

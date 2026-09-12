@@ -57,7 +57,7 @@
 倍数）、病友（漏掉是群名自嘲）。
 
 所以释义本身大半是冗余，真正不可替代的是三样：**答错词的纠正**、
-**模型推不出的本群语用**（杂鱼是玩梗不是攻击、人机是拿它开玩笑、
+**模型推不出的本群语用**（杂鱼是玩梗不是攻击、人机多指别的 AI 账号、
 破甲不许照做）、以及**例句**。已按这个结论把「模型本来就懂」的释义
 压到最短，只在它答错处写明「不是 X，是 Y」。
 
@@ -98,6 +98,21 @@ BUDGET = max(60, int(os.environ.get("DSH_GLOSSARY_USAGE_BUDGET", "260")))
 # 链接整段不参与匹配：域名里带 token / pro / ds 这类字符串太常见。
 _URL_RE = re.compile(r"https?://\S+|www\.\S+|\S+\.(?:com|cn|net|org|studio|tv|io)\S*")
 _LATIN_ONLY_RE = re.compile(r"^[A-Za-z0-9+.#-]+$")
+# 「这句是不是在说你」：第二人称。被 @/唤醒由框架标志判断，见 _addressed。
+_SECOND_PERSON_RE = re.compile(r"你|您")
+# 自指类词条没被点名时补的一句。写成加粗的硬提示，是因为模型更容易照抄
+# 注入块里的结论（实测：只改释义、不加这句，仍会把第三人称读成冲自己）。
+_SELFREF_NOTE = "｜**这句没 @你、也没用「你」说你：是在说别人，别接成自己的事**"
+
+
+def _addressed(event) -> bool:
+    """这条消息是不是冲着机器人来的：被 @/唤醒，或者句子里出现第二人称。
+
+    只给自指类词条做降级用，不改变命中与否，也不影响任何别的插件。
+    """
+    if bool(getattr(event, "is_at_or_wake_command", False)):
+        return True
+    return bool(_SECOND_PERSON_RE.search(event.message_str or ""))
 
 
 @dataclass(frozen=True)
@@ -108,6 +123,8 @@ class Entry:
     avoid: tuple[str, ...] = field(default=())
     # 真语料原话，示范这词平时怎么用。留空＝这条只给释义（见文件头的取舍）
     usage: tuple[str, ...] = field(default=())
+    # 词条本身涉及「是不是在说你」：没被点名时由 render 显式降级（见 _addressed）
+    selfref: bool = False
 
 
 # 回测淘汰名单：看着像梗，但在**本群语料**里一次真命中都没有。
@@ -163,7 +180,7 @@ GLOSSARY: tuple[Entry, ...] = (
     Entry(("抽卡",), "从随机池里抽角色、武器或道具。", usage=("得抽卡",)),
     Entry(("白嫖", "白票"), "不花钱或几乎不花钱拿到资源、服务、奖励。",
           usage=("谁叫你平时不白嫖",)),
-    Entry(("元气骑士",), "像素地牢射击手游，群 225400545 的主题。",
+    Entry(("元气骑士",), "像素地牢射击手游，群 100000001 的主题。",
           usage=("这里是元气骑士",)),
     Entry(("明日方舟",), "塔防手游，稀有度用五星、六星表示。",
           usage=("玩一辈子明日方舟",)),
@@ -229,11 +246,15 @@ GLOSSARY: tuple[Entry, ...] = (
     Entry(("神了",), "感叹离谱或厉害到没话说，**常带反讽**；多垫在句首，不是在说神仙。",
           avoid=("神经", "神奇", "精神", "神仙"),
           usage=("神了，这是谁的小号？",)),
-    # 两条例句：都是冲着机器人自己来的，这个语用点需要两个形状才立得住
-    Entry(("人机",), "①吐槽人反应机械；②问对面是不是 AI。"
-                    "群里冲你说这个多半是拿你是机器人打趣，别当成质问。",
+    # 2026-09-09 误判复盘：旧释义写「群里冲你说这个多半是拿你是机器人打趣」、
+    # 例句又全是第二人称，模型就把群主第三人称的「主要是那些都是人机啊」
+    # （在说别的 AI 账号）接成了对自己的攻击，回了「人机咋了 人机也是你亲手
+    # 装出来的」。所以释义改成中性、例句换第三人称原话，并标 selfref。
+    Entry(("人机",), "AI／机器人账号（相对真人）。说「那些都是人机」＝在说别的 AI 账号或机器人号，"
+                    "通常不是说你；只有明确冲你（@你、或用「你」问你）才是拿你是机器人打趣。",
           avoid=("人机交互", "人机对话", "人机界面", "人机验证", "人机大战"),
-          usage=("你是真人还是人机？", "你不是人机吗？")),
+          usage=("主要是那些都是人机啊",),
+          selfref=True),
     Entry(("乐子",), "以看热闹、起哄为乐的人或事，略带贬义。",
           usage=("你这个乐子别说话了",)),
     Entry(("666",), "起哄、捧场或阴阳一下；多单独成句，不是数字或价格。",
@@ -258,7 +279,7 @@ GLOSSARY: tuple[Entry, ...] = (
           usage=("原来大肥鱼也喜欢废萌",)),
     Entry(("何意味",), "拿日式汉文腔说「什么意思」，多带戏谑。",
           usage=("何意味？为什么要中止？",)),
-    # ---- AI / 模型圈（群 1048435041 的主要话题）----
+    # ---- AI / 模型圈（群 100000001 的主要话题）----
     Entry(("降智",), "吐槽模型或产品变笨、质量下滑。", usage=("官方最近有降智吧",)),
     Entry(("车轱辘废话", "车轱辘"), "反复兜圈、没有新信息的冗长表述。",
           usage=("还全是车轱辘废话，水平很差",)),
@@ -328,8 +349,12 @@ def matched_entries(text: str, entries: tuple[Entry, ...] = GLOSSARY,
 
 
 def render(entries: list[Entry], with_usage: bool = None,
-           budget: int = BUDGET) -> str:
-    """渲染注入块。超预算就整体退化为只有释义——宁可少给，不能挤爆上下文。"""
+           budget: int = BUDGET, addressed: bool = True) -> str:
+    """渲染注入块。超预算就整体退化为只有释义——宁可少给，不能挤爆上下文。
+
+    addressed=False 时给自指类词条补一句「这是在说别人」：这是 9-09 那轮
+    误判的兜底，释义改了也可能被模型忽略，硬提示更稳。
+    """
     if with_usage is None:
         with_usage = USAGE
     shown = [e for e in entries if e.usage] if with_usage else []
@@ -343,12 +368,15 @@ def render(entries: list[Entry], with_usage: bool = None,
         line = "- %s：%s" % (" / ".join(entry.terms), entry.meaning)
         if entry in shown:
             line += "｜这么用：%s" % "、".join("「%s」" % u for u in entry.usage)
+        if entry.selfref and not addressed:
+            line += _SELFREF_NOTE
         lines.append(line)
     lines.append("</group_glossary>")
     return "\n".join(lines)
 
 
-_stat = {"seen": 0, "injected": 0, "hits": 0, "skip_group": 0, "usage": 0}
+_stat = {"seen": 0, "injected": 0, "hits": 0, "skip_group": 0, "usage": 0,
+         "selfref_muted": 0}
 _last: list[str] = []
 
 
@@ -375,18 +403,22 @@ class Main(star.Star):
             hits = matched_entries(event.message_str or "")
             if not hits:
                 return
-            block = render(hits)
+            aimed = _addressed(event)
+            block = render(hits, addressed=aimed)
             req.extra_user_content_parts.append(TextPart(text=block))
             _stat["injected"] += 1
             _stat["hits"] += len(hits)
             has_usage = "这么用" in block
             if has_usage:
                 _stat["usage"] += 1
+            if not aimed and any(e.selfref for e in hits):
+                _stat["selfref_muted"] += 1
             words = "、".join("/".join(x.terms) for x in hits)
             _last.append(words)
             del _last[:-8]
-            logger.info("[glossary] gid=%s 命中：%s%s", gid, words,
-                        "（带例句）" if has_usage else "")
+            logger.info("[glossary] gid=%s 命中：%s%s%s", gid, words,
+                        "（带例句）" if has_usage else "",
+                        "（第三人称降级）" if not aimed and any(e.selfref for e in hits) else "")
         except BaseException as exc:
             # 词表只是帮理解，出任何问题都不许影响正常回复
             logger.warning("[glossary] 注入失败，跳过: %r", exc)
@@ -398,11 +430,13 @@ class Main(star.Star):
         rate = _stat["injected"] / max(1, _stat["seen"]) * 100
         yield event.plain_result(
             "黑话词表：%s｜作用群：%s｜词条 %d（带例句 %d，例句开关：%s）\n"
-            "本次启动后过了 %d 轮，命中注入 %d 轮（%.0f%%），共 %d 条，其中带例句 %d 轮\n"
+            "本次启动后过了 %d 轮，命中注入 %d 轮（%.0f%%），共 %d 条，其中带例句 %d 轮"
+            "（第三人称降级 %d 轮）\n"
             "最近命中：%s"
             % ("开" if ENABLED else "关", "、".join(sorted(GROUPS)) or "无",
                len(GLOSSARY), sum(1 for e in GLOSSARY if e.usage),
                "开" if USAGE else "关",
                _stat["seen"], _stat["injected"], rate, _stat["hits"], _stat["usage"],
+               _stat["selfref_muted"],
                "｜".join(_last[-5:]) or "还没有")
         )

@@ -109,9 +109,11 @@ _FRAMEWORK_OK_MARKERS = (
 # 因为它只调 compress_image，而那个函数对 GIF 原样返回。
 # 群里图片以动图为主，所以这条分支恰恰是最常走到的。
 _FRAMEWORK_FAIL_MARKER = "[Image Captioning Failed]"
-# 框架把当前消息的图落盘后会留下 [Image Attachment: path /xxx.jpg]，
-# 兜底时直接读这个本地文件，省掉一次下载、也不怕 rkey 过期。
-_ATTACH_PATH_RE = re.compile(r"\[Image Attachment(?:[^\]]*?)path ([^\]]+?)\]")
+# 框架把当前消息或引用消息的图落盘后会留下附件标记；兜底时直接读本地文件，
+# 省掉一次下载，也不怕 rkey 过期。
+_ATTACH_PATH_RE = re.compile(
+    r"\[Image Attachment(?P<quoted> in quoted message)?(?:[^\]]*?)path (?P<path>[^\]]+?)\]"
+)
 
 
 def _cache_put(key: str, value: str) -> None:
@@ -176,11 +178,26 @@ def _prepare_for_vision(raw: bytes) -> tuple[bytes, int]:
 
 
 def _framework_failed(req) -> bool:
-    """框架尝试转述当前消息的图片但失败了（几乎总是因为那是张动图）。"""
+    """框架尝试转述图片但失败了。"""
     for part in getattr(req, "extra_user_content_parts", None) or []:
         if _FRAMEWORK_FAIL_MARKER in (getattr(part, "text", "") or ""):
             return True
     return False
+
+
+def _quoted_images_need_context(req) -> bool:
+    """被引用图片只有附件路径、没有成功描述时，需要本插件接管。
+
+    AstrBot 会把引用图放进 req.image_urls，但文本主模型读不了二进制；而核心
+    转述在当前消息也带图时会整批跳过。不能把「有 image_urls」误当成已经看见。
+    """
+    if not _quoted_image_paths(req):
+        return False
+    for part in getattr(req, "extra_user_content_parts", None) or []:
+        text = getattr(part, "text", "") or ""
+        if "[Image Caption in quoted message]" in text:
+            return False
+    return True
 
 
 def _file_key(path: str) -> str:
@@ -196,22 +213,27 @@ def _file_key(path: str) -> str:
     return f"md5:{h.hexdigest()}"
 
 
-def _framework_image_paths(req) -> list[str]:
-    """从框架留下的 [Image Attachment: path X] 里抠出本地文件路径。
+def _framework_image_paths(req, quoted: bool | None = None) -> list[str]:
+    """从框架留下的图片附件标记中取本地文件路径。
 
-    这是兜底动图时最好的图片来源：框架收消息时已经把图落到本地了
-    （astr_main_agent 里 comp.convert_to_file_path()），这条标记即使
-    转述失败也还留着。用本地文件比回头下载 QQ 的 URL 强得多 ——
-    不花网络时间，也不受 rkey 过期影响。
+    quoted=True 只取被引用消息中的图；False 只取当前消息；None 两者都取。
     """
     paths: list[str] = []
     for part in getattr(req, "extra_user_content_parts", None) or []:
         text = getattr(part, "text", "") or ""
         for match in _ATTACH_PATH_RE.finditer(text):
-            p = match.group(1).strip()
-            if p and os.path.exists(p):
+            is_quoted = bool(match.group("quoted"))
+            if quoted is not None and is_quoted != quoted:
+                continue
+            p = match.group("path").strip()
+            if p and os.path.isfile(p) and p not in paths:
                 paths.append(p)
     return paths
+
+
+def _quoted_image_paths(req) -> list[str]:
+    """只取被引用消息里的图片，防止和当前消息的图混淆。"""
+    return _framework_image_paths(req, quoted=True)
 
 
 def _already_has_image_context(req) -> bool:
@@ -433,10 +455,11 @@ class Main(star.Star):
         if not ENABLED:
             return
         try:
-            # 框架已经把图片处理好了（本条消息自带图 / 引用了带图的消息）——别重复。
-            # 注意：框架转述**失败**不算处理好，那种情况恰恰要我们兜底。
+            # 引用图片优先精确处理：不能回看「最近一张」代替，否则多人刷图时
+            # 很容易看串。框架给了引用图本地路径但没给描述，就由这里直接识别。
+            quote_rescue = _quoted_images_need_context(req)
             rescue = _framework_failed(req)
-            if not rescue and _already_has_image_context(req):
+            if not quote_rescue and not rescue and _already_has_image_context(req):
                 return
             if event.get_message_type() != MessageType.GROUP_MESSAGE:
                 return
@@ -451,7 +474,10 @@ class Main(star.Star):
 
             # 整个流程一个总预算：宁可这次不看图，也不能让回复卡住
             await asyncio.wait_for(
-                self._run(event, req, bot, group_id, provider_id, rescue),
+                self._run(
+                    event, req, bot, group_id, provider_id, rescue,
+                    quote_rescue=quote_rescue,
+                ),
                 timeout=BUDGET,
             )
         except asyncio.TimeoutError:
@@ -463,7 +489,46 @@ class Main(star.Star):
                 "[imgctx] 钩子异常 %s: %s", type(e).__name__, e or "(无消息)"
             )
 
-    async def _run(self, event, req, bot, group_id, provider_id, rescue=False) -> None:
+    async def _run(
+        self, event, req, bot, group_id, provider_id, rescue=False,
+        quote_rescue=False,
+    ) -> None:
+        if quote_rescue:
+            paths = _quoted_image_paths(req)
+            who = ""
+            try:
+                quote = next(
+                    (
+                        c for c in getattr(event.message_obj, "message", None) or ()
+                        if getattr(getattr(c, "type", None), "value", "") == "Reply"
+                    ),
+                    None,
+                )
+                who = str(getattr(quote, "sender_nickname", "") or "").strip()
+            except Exception:
+                pass
+            items = []
+            for p in paths[:MAX_IMAGES]:
+                try:
+                    key = await asyncio.to_thread(_file_key, p)
+                except OSError:
+                    continue
+                items.append(
+                    {
+                        "file": key,
+                        "url": "",
+                        "local": p,
+                        "who": who or "被引用的人",
+                        "age": 0,
+                        "summary": "",
+                        "current": False,
+                        "quoted": True,
+                    }
+                )
+            if items:
+                await self._emit(req, provider_id, items, quote_rescue=True)
+                return
+
         # 兜底路径（框架转述当前消息的图失败，基本都是动图）：
         # 框架已经把图落到本地了，直接读文件就行 —— 不查历史、不发网络请求，
         # 也就不会因为 OneBot 抽风或 rkey 过期而白白丢掉这张图。
@@ -527,7 +592,9 @@ class Main(star.Star):
             return
         await self._emit(req, provider_id, items, rescue=rescue)
 
-    async def _emit(self, req, provider_id, items, rescue=False) -> None:
+    async def _emit(
+        self, req, provider_id, items, rescue=False, quote_rescue=False
+    ) -> None:
         """转述这批图并把结果注入请求。"""
         cached = sum(1 for it in items if it["file"] in _caption_cache)
         await self._caption(provider_id, items)
@@ -536,23 +603,36 @@ class Main(star.Star):
         if not described:
             return
 
-        # 兜底成功了，就得把框架留下的「转述失败」痕迹擦掉。
-        # 不擦的话请求里会同时出现「[Image Captioning Failed]」和我们的描述，
-        # 模型多半听前者的 —— 线上那几句「这图我看不清 / 加载不出来」
-        # 就是这么来的。
-        # 用原地删（del）而不是重新赋值：runner 每次调 provider 时都会重读
-        # self.req.extra_user_content_parts（tool_loop_agent_runner:508/1423），
-        # 两种写法都能生效，但原地改对「谁先拿到了这个 list 的引用」不敏感。
-        if rescue:
+        # 成功接管后清掉框架留下的失败标记或引用图内部路径，避免文本模型
+        # 同时看到「已描述」和「仍有一个打不开的文件」。
+        if rescue or quote_rescue:
             parts = req.extra_user_content_parts
             if parts:
                 for i in range(len(parts) - 1, -1, -1):
-                    if _FRAMEWORK_FAIL_MARKER in (getattr(parts[i], "text", "") or ""):
+                    original = getattr(parts[i], "text", "") or ""
+                    text = original
+                    if rescue:
+                        text = text.replace(_FRAMEWORK_FAIL_MARKER, "")
+                    if quote_rescue:
+                        text = _ATTACH_PATH_RE.sub(
+                            lambda m: "" if m.group("quoted") else m.group(0), text
+                        )
+                    text = text.strip()
+                    if text:
+                        try:
+                            parts[i].text = text
+                        except Exception:
+                            pass
+                    elif text != original.strip():
                         del parts[i]
 
-        # 兜底当前消息的图（框架转述失败），和「回顾历史图」是两件事，
-        # 说辞必须不一样：前者是「用户刚发的这张」，后者是「之前聊到的」。
-        if rescue and any(it.get("current") for it in described):
+        # 兜底当前消息的图、精确引用图和「回顾历史图」是三件事，说辞分开。
+        if quote_rescue:
+            lines = [
+                "下面是当前用户所引用的那条旧消息里的图片内容（不是最近随机一张图）。"
+                "请当作你已经看到了被引用的图片，结合用户现在的话直接回应。"
+            ]
+        elif rescue and any(it.get("current") for it in described):
             lines = [
                 "下面是这条消息里图片的内容（图片本身你看不了，这是转述）。"
                 "请当作你已经看到了这张图，直接就图片内容回应。"
@@ -570,7 +650,9 @@ class Main(star.Star):
                 tag = "表情包（动图）"
             else:
                 tag = "图片"
-            when = "刚刚" if it.get("current") else _describe_age(it["age"])
+            when = "被引用的旧消息里" if it.get("quoted") else (
+                "刚刚" if it.get("current") else _describe_age(it["age"])
+            )
             lines.append(f"- {when} {who} 发了一张{tag}：{it['caption']}")
 
         req.extra_user_content_parts.append(
@@ -579,7 +661,9 @@ class Main(star.Star):
         logger.info(
             "[imgctx] 已附加 %d 张图片%s（缓存命中 %d）：%s",
             len(described),
-            "（兜底当前消息的动图）" if rescue else "的上下文",
+            "（精确识别引用图）" if quote_rescue else (
+                "（兜底当前消息的动图）" if rescue else "的上下文"
+            ),
             cached,
             " | ".join(f"{it['who']}:{it['caption'][:24]}" for it in described),
         )

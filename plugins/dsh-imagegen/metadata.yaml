@@ -1,5 +1,5 @@
 name: dsh-imagegen
-desc: AI 文生图插件。提供 LLM 函数工具 generate_image（模型自动调用）与 /画图 指令，接 Agnes AI 的 /v1/images/generations 渠道，支持主备模型降级、并发限制与冷却。
+desc: AI 文生图插件。仅在用户明确要求创作新图时开放 LLM 工具和承诺兜底，保留 /画图 显式入口；主动概念草图默认关闭，并支持主备模型、冷却和并发限制。
 author: 大肥鱼
-version: 1.0.0
+version: 1.2.0
 repo: local

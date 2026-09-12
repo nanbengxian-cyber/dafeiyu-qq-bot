@@ -17,7 +17,7 @@ _ST_NAME = {ST_IDLE: "空闲", ST_ASKED: "待选支付方式", ST_QR: "待群主
 
 
 def norm(s: str) -> str:
-    """归一：去空白、统一小写。供关键词匹配用。"""
+    """归一：去空白、统一小写。供意图结构匹配用。"""
     return "".join(s.split()).lower() if s else ""
 
 
@@ -25,15 +25,19 @@ def norm(s: str) -> str:
 # 判定
 # --------------------------------------------------------------------------- #
 
-_DEFAULT_INTENT_WORDS = [
-    "赞助", "赞助你", "打赏", "打个赏", "打赏你", "赏你",
-    "投喂", "投喂你", "支持你", "支持一下", "支持下", "支持机器人",
-    "请你吃饭", "请吃饭", "请你吃顿饭", "给钱", "送你钱", "送钱",
-    "发红包", "发个红包", "辛苦费", "赞赏", "意思一下", "心意", "转账", "转你", "转给你",
-    "付款", "付钱", "付费", "扫码", "扫你", "别白嫖", "不白嫖", "白嫖", "免白嫖",
-    "请喝奶茶", "请你喝奶茶", "请你喝杯奶茶", "请喝咖啡", "请你喝咖啡", "请喝水", "请咖啡", "请奶茶",
-    "投币", "氪金", "资助", "支持你搞", "支持你做",
+# 赞助入口必须同时包含「付款人意愿 + 收款对象是机器人」。旧版是宽松子串表，
+# 导致 v4.1、BV1 视频号、白嫖 token、替别人找资助等普通讨论全部误触发。
+# 这里宁可要求对方多说清楚一句，也不能在谈钱时突然跳出收款码。
+_EXPLICIT_INTENT_RES = [
+    re.compile(r"我(?:想|要|愿意|可以|打算|准备|来)?(?:给)?(?:你|大肥鱼)(?:赞助|打赏|投喂|资助|转账|付钱|付款)(?:一下|点|一笔)?"),
+    re.compile(r"我(?:想|要|愿意|可以|打算|准备|来)?(?:赞助|打赏|投喂|资助)(?:一下|点)?(?:你|大肥鱼)"),
+    re.compile(r"(?:赞助|打赏|投喂|资助)(?:一下|点)?(?:你|大肥鱼)"),
+    re.compile(r"给(?:你|大肥鱼)(?:赞助|打赏|投喂|资助)(?:一下|点)?"),
+    re.compile(r"(?:给|送|转给)(?:你|大肥鱼)(?:点|一些|一笔)?(?:钱|红包|辛苦费)"),
+    re.compile(r"(?:我)?请(?:你|大肥鱼)(?:吃饭|吃顿饭|喝奶茶|喝杯奶茶|喝咖啡|喝水)"),
 ]
+# V你50 是给机器人转钱；V我50 是向机器人要钱，方向相反，绝不能触发。
+_V_TO_BOT_RE = re.compile(r"(?:^|[^a-z0-9])v(?:你|大肥鱼)\d+(?:元)?(?:$|[^a-z0-9])", re.I)
 
 _DEFAULT_CONFIRM_PHRASES = [
     "已到账", "到账了", "到账", "已收到", "收到了", "收到赞助", "收到打赏",
@@ -42,31 +46,33 @@ _DEFAULT_CONFIRM_PHRASES = [
 ]
 
 
-# 「V我50」「V50」「v我50」—— 群里要钱打赏的梗（V=微信转账，数字=金额）。
-# 大小写都认；也兼容 V我50 / VME50 这类带“我/me”的写法。
-_V_NUM_RE = re.compile(r"v(?:我|me)?\d+")
-
-
 def detect_intent(text: str, extra_words=None) -> str:
-    """返回命中的意向词，无则返回空串。"""
+    """返回明确的「给机器人赞助」意向；讨论赞助/钱/版本号一律不算。"""
     n = norm(text)
-    # V50 / V我50 / vme50：大小写无关，V 后带数字就算意向
-    m = _V_NUM_RE.search(n)
+    if not n:
+        return ""
+    m = _V_TO_BOT_RE.search(n)
     if m:
-        return m.group(0)
-    words = list(_DEFAULT_INTENT_WORDS) + (list(extra_words) if extra_words else [])
-    for w in words:
-        if "".join(w.split()) in n:
-            return w
+        return m.group(0).strip()
+    for pattern in _EXPLICIT_INTENT_RES:
+        m = pattern.search(n)
+        if m:
+            return m.group(0)
+    # 自定义词属于运维方主动配置，仍按精确归一化后的整句匹配，避免重新引入子串误触发。
+    for word in extra_words or ():
+        w = norm(word)
+        if w and n == w:
+            return word
     return ""
 
 
 def detect_method(text: str) -> str:
-    """识别微信/支付宝。返回 'wechat' | 'alipay'，识别不到返回空串。"""
+    """只接受简短、明确的支付方式选择，普通微信/支付宝讨论不推进状态机。"""
     n = norm(text)
-    if "微信" in n or "wechat" in n:
+    # 允许「微信」「用微信」「我用支付宝」「支付宝吧/支付」，拒绝长句中的偶然提及。
+    if re.fullmatch(r"(?:我)?(?:就)?用?微信(?:吧|支付|付款|转账)?[呀啊呢哦嘛]?[。！!]?", n):
         return "wechat"
-    if "支付宝" in n or "alipay" in n:
+    if re.fullmatch(r"(?:我)?(?:就)?用?支付宝(?:吧|支付|付款|转账)?[呀啊呢哦嘛]?[。！!]?", n):
         return "alipay"
     return ""
 

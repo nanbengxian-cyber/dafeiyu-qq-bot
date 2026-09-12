@@ -34,6 +34,10 @@
   DSH_STEAL_GROUPS           作用群（默认 100000001），逗号分隔
   DSH_STEAL_MIN_COUNT        多发阈值（默认 3 次）
   DSH_STEAL_MAX_STORED       库存上限（默认 200 张，超出按最久未用淘汰）
+  DSH_STEAL_AUTO_RATE        日常短回复自动用图概率（默认 0.18）
+  DSH_STEAL_AUTO_COOLDOWN    日常自动用图群级冷却秒数（默认 300）
+  DSH_STEAL_AUTO_MAX_CHARS   允许自动配图的回复最大长度（默认 36）
+  DSH_STEAL_AUTO_CANDIDATES  每次交给模型挑选的候选数（默认 12）
   DSH_STEAL_PROVIDER         识图 provider（空=用 default_image_caption_provider_id）
   DSH_STEAL_HOME             库存目录（默认 /AstrBot/data/stickerthief）
 
@@ -55,6 +59,7 @@ import PIL.Image as PILImage
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image
+from astrbot.api.provider import LLMResponse
 from astrbot.core import logger
 from astrbot.core.platform.message_type import MessageType
 
@@ -66,6 +71,12 @@ GROUPS = {
 }
 MIN_COUNT = max(2, int(os.environ.get("DSH_STEAL_MIN_COUNT", "3")))
 MAX_STORED = max(10, int(os.environ.get("DSH_STEAL_MAX_STORED", "200")))
+# 模型最终回复里自动使用偷来的表情包。旧版只有 /表情包 和“@机器人来张图”
+# 两条被动入口，库存即使很大也不会参与日常回复，造成“只偷不发”。
+AUTO_RATE = min(1.0, max(0.0, float(os.environ.get("DSH_STEAL_AUTO_RATE", "0.18"))))
+AUTO_COOLDOWN = max(0, int(os.environ.get("DSH_STEAL_AUTO_COOLDOWN", "300")))
+AUTO_MAX_CHARS = max(1, int(os.environ.get("DSH_STEAL_AUTO_MAX_CHARS", "36")))
+AUTO_CANDIDATES = max(1, min(30, int(os.environ.get("DSH_STEAL_AUTO_CANDIDATES", "12"))))
 PROVIDER_ID = os.environ.get("DSH_STEAL_PROVIDER", "").strip()
 HOME = os.environ.get("DSH_STEAL_HOME", "/AstrBot/data/stickerthief")
 DB_PATH = os.path.join(HOME, "stickerthief.db")
@@ -94,7 +105,17 @@ CAPTION_PROMPT_GIF = os.environ.get(
 
 _stat = {"seen": 0, "new": 0, "count_hit": 0, "skip_self": 0, "recheck": 0,
          "cap_ok": 0, "cap_bad": 0, "cap_unfit": 0, "stored": 0,
-         "evicted": 0, "fail": 0, "timeout": 0}
+         "evicted": 0, "fail": 0, "timeout": 0, "auto_try": 0,
+         "auto_sent": 0, "auto_cooldown": 0, "auto_unsuitable": 0}
+
+# gid -> 上一次自动发偷来表情的时间。进程级冷却足够；重启后允许较快发第一张。
+_last_auto: dict[str, float] = {}
+
+# 正经说明、安全提醒、工具状态不适合突然插一张梗图。只对短口语回复自动尝试。
+_AUTO_BLOCK_RE = re.compile(
+    r"https?://|因为|建议|注意|不能|无法|抱歉|失败|错误|风险|医院|医生|报警|"
+    r"政策|政治|违法|犯罪|自杀|死亡|诊断|密码|验证码"
+)
 
 # 进程内防重：正在识别的 file id（避免同一张图计数达阈值的瞬间并发触发两次）
 _inflight: set[str] = set()
@@ -532,6 +553,124 @@ class Main(star.Star):
         except BaseException:
             return None
 
+    def _auto_candidates(self) -> list[tuple[str, str]]:
+        """取一小批最近最少使用的库存，供模型按含义选图。"""
+        try:
+            con = _db()
+            try:
+                rows = con.execute(
+                    "SELECT path, caption FROM stickers "
+                    "WHERE caption IS NOT NULL AND caption<>'' "
+                    "ORDER BY last_use ASC LIMIT ?",
+                    (AUTO_CANDIDATES,),
+                ).fetchall()
+                return [(str(path), str(caption)) for path, caption in rows]
+            finally:
+                con.close()
+        except BaseException:
+            return []
+
+    @staticmethod
+    def _auto_reply_suitable(text: str) -> bool:
+        """只允许简短、非严肃的口语回复进入自动选图。"""
+        plain = (text or "").strip()
+        return bool(
+            plain
+            and len(plain) <= AUTO_MAX_CHARS
+            and "\n" not in plain
+            and not _AUTO_BLOCK_RE.search(plain)
+        )
+
+    async def _select_for_reply(
+        self, reply: str, candidates: list[tuple[str, str]]
+    ) -> str:
+        """让聊天模型按库存 caption 选一张；不合适必须返回 0。"""
+        if not candidates:
+            return ""
+        options = "\n".join(
+            "%d. %s" % (i + 1, caption[:90])
+            for i, (_path, caption) in enumerate(candidates)
+        )
+        prompt = (
+            "你是群聊表情包选择器。根据机器人准备发送的回复，从候选表情中选一张"
+            "真正能表达同样语气/含义的图。宁缺毋滥：不够贴切、严肃话题、只是沾边都选0。"
+            "只输出一个数字，不要解释。\n"
+            "机器人回复：%s\n候选：\n%s\n选择：" % (reply, options)
+        )
+        try:
+            resp = await asyncio.wait_for(
+                self.context.llm_generate(prompt=prompt), timeout=8
+            )
+            answer = (
+                getattr(resp, "completion_text", None)
+                or getattr(resp, "_completion_text", None)
+                or ""
+            )
+            m = re.search(r"\d+", answer)
+            idx = int(m.group(0)) if m else 0
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1][0]
+        except BaseException as exc:
+            logger.debug("[steal] 自动选图失败：%s", exc)
+        return ""
+
+    def _mark_used(self, path: str) -> None:
+        try:
+            con = _db()
+            try:
+                con.execute(
+                    "UPDATE stickers SET last_use=? WHERE path=?", (time.time(), path)
+                )
+                con.commit()
+            finally:
+                con.close()
+        except BaseException:
+            pass
+
+    @filter.on_llm_response()
+    async def auto_serve(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        """日常聊天低频按语义使用偷来的表情；图片独立发送，不附含义文字。"""
+        if (
+            not ENABLED
+            or AUTO_RATE <= 0
+            or event.get_message_type() != MessageType.GROUP_MESSAGE
+            or not self._in_group(event)
+        ):
+            return
+        try:
+            text = (response.completion_text or "").strip()
+            if not self._auto_reply_suitable(text):
+                _stat["auto_unsuitable"] += 1
+                return
+            gid = str(event.get_group_id() or "")
+            now = time.time()
+            if now - _last_auto.get(gid, 0.0) < AUTO_COOLDOWN:
+                _stat["auto_cooldown"] += 1
+                return
+            if random.random() >= AUTO_RATE:
+                return
+            candidates = self._auto_candidates()
+            if not candidates:
+                return
+            _stat["auto_try"] += 1
+            path = await self._select_for_reply(text, candidates)
+            if not path:
+                return
+            full_path = os.path.join(HOME, path)
+            if not os.path.isfile(full_path):
+                return
+            await event.send(MessageChain(chain=[Image.fromFileSystem(full_path)]))
+            try:
+                event.set_extra("steal_done", True)
+            except BaseException:
+                pass
+            self._mark_used(path)
+            _last_auto[gid] = now
+            _stat["auto_sent"] += 1
+            logger.info("[steal] 日常回复自动出图：%s｜回复=%s", path, text[:40])
+        except BaseException as exc:
+            logger.warning("[steal] 日常回复自动发图失败：%s", exc)
+
     @filter.command("表情包")
     async def cmd_sticker(self, event: AstrMessageEvent):
         """随机发一张偷来的表情包。只发图，不配含义注解——图本身就是意思。"""
@@ -604,9 +743,12 @@ class Main(star.Star):
             "偷表情包：%s（阈值 %d 次，库存上限 %d）\n"
             "看过 %d 张图｜新图 %d｜达阈值触发识别 %d（识别成功 %d、"
             "不宜 %d、失败 %d）\n"
-            "现有库存 %d 张｜跟踪中的图 %d 张（累计出现 %d 次）｜淘汰 %d"
+            "现有库存 %d 张｜跟踪中的图 %d 张（累计出现 %d 次）｜淘汰 %d\n"
+            "日常自动用图：概率 %.0f%% / 冷却 %d秒 / 语义选择 %d次 / 真发 %d次 / 冷却拦下 %d次"
             % ("开" if ENABLED else "关", MIN_COUNT, MAX_STORED,
                _stat["seen"], _stat["new"], _stat["count_hit"],
                _stat["cap_ok"], _stat["cap_unfit"], _stat["fail"],
-               total, counts[0], counts[1], _stat["evicted"])
+               total, counts[0], counts[1], _stat["evicted"],
+               AUTO_RATE * 100, AUTO_COOLDOWN, _stat["auto_try"],
+               _stat["auto_sent"], _stat["auto_cooldown"])
         )

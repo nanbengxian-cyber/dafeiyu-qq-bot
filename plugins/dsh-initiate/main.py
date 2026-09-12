@@ -67,6 +67,11 @@ from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, Message
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.filter.custom_filter import CustomFilter
 
+try:
+    from .topic_sources import choose_topic, collect_topics
+except ImportError:  # 允许直接运行/测试 main.py
+    from topic_sources import choose_topic, collect_topics
+
 
 def _flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
@@ -109,6 +114,14 @@ DB_PATH = os.environ.get("DSH_INITIATE_DB", "/AstrBot/data/dsh_memory.db")
 STATE_PATH = Path(
     os.environ.get("DSH_INITIATE_STATE", "/AstrBot/data/dsh_initiate_state.json")
 )
+INTEREST_STATE_PATH = os.environ.get(
+    "DSH_INTEREST_STATE_PATH", "/AstrBot/data/dsh_interest_state.json"
+)
+SELF_DB_PATH = os.environ.get("DSH_SELFAWARE_DB", "/AstrBot/data/dsh_selfaware.db")
+TOPIC_LINK = _flag("DSH_INITIATE_TOPIC_LINK")
+TOPIC_AFTER = max(COLD_AFTER, float(os.environ.get("DSH_INITIATE_TOPIC_AFTER", "2700")))
+TOPIC_TTL = max(3600.0, float(os.environ.get("DSH_INITIATE_TOPIC_TTL", "259200")))
+TOPIC_LIMIT = max(3, min(30, int(os.environ.get("DSH_INITIATE_TOPIC_LIMIT", "16"))))
 PLATFORM_ID = os.environ.get("DSH_INITIATE_PLATFORM", "default")
 # 手动兜底：万一两条自动解析都失效，可以用 env 钉死机器人 QQ
 SELF_ID_ENV = os.environ.get("DSH_INITIATE_SELF_ID", "").strip()
@@ -303,11 +316,13 @@ class Main(star.Star):
         self._self_id: str = SELF_ID_ENV
         logger.info(
             "[initiate] 已加载：%s 影子=%s 冷场%.0f~%.0f分钟 冷启动>%.0f分钟=%s "
-            "每日%d次 冷却%.0f分钟 每%.0f分钟看一次 连续%d次才开口 时段=%s(%s) 群=%s",
+            "每日%d次 冷却%.0f分钟 每%.0f分钟看一次 连续%d次才开口 时段=%s(%s) "
+            "联动话题=%s/%.0f分钟后/去重%.0f小时 群=%s",
             "开" if ENABLED else "关", "开" if SHADOW else "关",
             IDLE_MIN / 60, IDLE_MAX / 60, COLD_AFTER / 60, "开" if COLD_OPEN else "关",
             DAY_MAX, COOLDOWN / 60, PERCEIVE_EVERY / 60, CONFIRM,
-            HOURS, TIMEZONE, ",".join(sorted(GROUPS)) or "无",
+            HOURS, TIMEZONE, "开" if TOPIC_LINK else "关", TOPIC_AFTER / 60,
+            TOPIC_TTL / 3600, ",".join(sorted(GROUPS)) or "无",
         )
 
     @filter.on_astrbot_loaded()
@@ -340,8 +355,10 @@ class Main(star.Star):
         day = _now_tz(now).date().isoformat()
         entry = self._state.get(gid)
         if not isinstance(entry, dict) or entry.get("day") != day:
-            entry = {"day": day, "count": 0, "last": 0.0}
+            old_topics = entry.get("topics", {}) if isinstance(entry, dict) else {}
+            entry = {"day": day, "count": 0, "last": 0.0, "topics": old_topics}
             self._state[gid] = entry
+        entry.setdefault("topics", {})
         return entry
 
     def _skip(self, gid: str, reason: str, key: str | None = None) -> bool:
@@ -401,6 +418,23 @@ class Main(star.Star):
                 # 感知失败不去重日志：这是异常，每次都该看见
                 return self._skip(gid, "感知没结果，保持沉默")
             ok, why = should_initiate(facts, idle)
+            topic_candidate = None
+            if ok and TOPIC_LINK and idle >= TOPIC_AFTER:
+                candidates = collect_topics(
+                    DB_PATH, INTEREST_STATE_PATH, SELF_DB_PATH, gid, TOPIC_LIMIT
+                )
+                topic_candidate = choose_topic(
+                    candidates, state.get("topics", {}), now, TOPIC_TTL
+                )
+                if topic_candidate:
+                    facts["topic_candidate"] = topic_candidate
+                    facts["topic"] = str(topic_candidate.get("topic") or facts.get("topic") or "")[:30]
+                    facts["angle"] = str(topic_candidate.get("hint") or facts.get("angle") or "")[:80]
+                    why += "，从%s候选池取题" % topic_candidate.get("source", "联动")
+                else:
+                    # 起新话题必须有真实候选；池里无安全新鲜内容就别凭空硬编。
+                    ok = False
+                    why = "没有安全且近期没聊过的新话题候选"
             streak = self._streak.get(gid, 0) + 1 if ok else 0
             self._streak[gid] = streak
             logger.info(
@@ -527,9 +561,21 @@ class Main(star.Star):
         event.set_extra("dsh_initiate", True)
         event.set_extra("dsh_initiate_idle", idle)
         event.set_extra("dsh_initiate_facts", facts)
+        candidate = facts.get("topic_candidate") or {}
+        if candidate:
+            event.set_extra("dsh_initiate_topic_source", candidate.get("source", ""))
+            event.set_extra("dsh_initiate_topic_key", candidate.get("key", ""))
         # 配额先落盘再提交：提交后是异步管道，崩了也不能让配额白漏
         state["count"] = int(state.get("count", 0)) + 1
         state["last"] = now
+        if candidate.get("key"):
+            topics = state.setdefault("topics", {})
+            topics[str(candidate["key"])] = now
+            # 状态只留近期键，避免文件无限长。
+            state["topics"] = {
+                k: float(v) for k, v in topics.items()
+                if now - float(v or 0) < TOPIC_TTL * 2
+            }
         _save_state(self._state)
         platform.commit_event(event)
         logger.info(
@@ -567,13 +613,24 @@ class Main(star.Star):
             session_id=event.session_id,
             conversation=conv,
         )
+        candidate = facts.get("topic_candidate") or {}
+        if candidate:
+            req.extra_user_content_parts.append(TextPart(text=(
+                "<initiative_topic>\n"
+                "这是你从现有兴趣、群共同记忆或自身能力状态里筛出的一个真实话题线索：%s。\n"
+                "来源类型：%s。用你自己的口吻自然起头，只说一句；可以抛个轻松问题，"
+                "不要说‘根据记忆/插件/数据库/服务器’，不要点名或暴露任何人的个人档案，"
+                "不要机械播报状态，也不要声称刚刚发生了并无证据的事。\n"
+                "</initiative_topic>"
+            ) % (candidate.get("hint") or candidate.get("topic") or "随便聊点轻松的",
+                 candidate.get("source") or "联动话题")))
         # 必须是 TextPart，放裸 str 会让 openai_source 抛 ValueError（见文件头第 3 条）。
         # 小写标签开头 => 以后 dsh-ctxclean 会按结构把它从历史里清掉，不会累积。
         req.extra_user_content_parts.append(TextPart(text=(
-            "<initiate_context>群里已经安静了 %.0f 分钟，没有人在跟你说话，"
-            "是你自己决定开口的。安静前他们在聊：%s。可以从这里切入：%s。"
+            "<initiative_context>群里已经安静了 %.0f 分钟，没有人在跟你说话，"
+            "是你自己决定开口的。候选话题：%s。自然切入参考：%s。"
             "只说一句短话；不要问「大家在吗」「有人吗」，也不要说你在看群。"
-            "</initiate_context>"
+            "</initiative_context>"
         ) % (idle / 60.0, facts.get("topic") or "没什么明确的", facts.get("angle") or "随你")))
         yield req
 

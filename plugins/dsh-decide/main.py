@@ -87,6 +87,20 @@ from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core import logger
 from astrbot.core.agent.message import TextPart
+from astrbot.api.message_components import Image
+
+try:
+    from .image_reaction_logic import (
+        current_image_caption,
+        image_dive_rate,
+        is_image_only,
+    )
+except ImportError:  # 允许直接运行/测试 main.py
+    from image_reaction_logic import (
+        current_image_caption,
+        image_dive_rate,
+        is_image_only,
+    )
 
 DB = os.environ.get("DSH_MEM_DB", "/AstrBot/data/dsh_memory.db")
 
@@ -148,6 +162,18 @@ DIVE_RATE_ABOUT = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_ABOUT"
 DIVE_RATE_OPEN = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_OPEN", "0.35"))))
 DIVE_RATE_BANTER = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_BANTER", "0.55"))))
 DIVE_RATE_NONE = min(1.0, max(0.0, float(os.environ.get("DSH_DECIDE_DIVE_NONE", "0.80"))))
+
+# ---- 纯图片自然反应
+# 群友只发图/表情包而没有文字时，不再把「模型看得见图」误当成「每张都得评一句」。
+# 被 @、引用机器人、明确带字提问仍走原来的必回路径；这里只收紧没人点名的纯图片。
+IMAGE_DIVE = os.environ.get("DSH_DECIDE_IMAGE_DIVE", "1") != "0"
+IMAGE_DIVE_RATES = {
+    "reply": float(os.environ.get("DSH_DECIDE_IMAGE_DIVE_REPLY", "0.12")),
+    "about": float(os.environ.get("DSH_DECIDE_IMAGE_DIVE_ABOUT", "0.30")),
+    "open": float(os.environ.get("DSH_DECIDE_IMAGE_DIVE_OPEN", "0.58")),
+    "banter": float(os.environ.get("DSH_DECIDE_IMAGE_DIVE_BANTER", "0.78")),
+    "none": float(os.environ.get("DSH_DECIDE_IMAGE_DIVE_NONE", "0.92")),
+}
 
 # ---- 作息：睡觉时段不主动插话（《回答.md》D14/D15）
 #
@@ -212,6 +238,8 @@ PROMPT = """看这段 QQ 群聊，回答几个关于**最后一条消息**的事
 - open：最后一条是个大家都能接的话头吗（问大家、发感慨、晒东西、起哄）
 - about_bot：提到了这个机器人，或提到它擅长的事吗
 - replying_to_bot：最后一条是在回应「你自己」刚说的那句吗（顺着它答、反驳它、追问它）
+
+如果最后一条含“当前纯图片描述”，那只是让你知道图片内容，不代表必须评价；仍按上下文判断它是不是面向全群的话头。
 
 再补四个描述（给它开口时参考）：
 - topic：他们在聊什么，≤12字
@@ -474,6 +502,21 @@ def verdict(f: dict) -> tuple[str, str]:
     return "回话", "可接（%s）" % (",".join(pos) if pos else "无否决信号")
 
 
+_QUESTION_WORDS = ("怎么", "为什么", "吗", "呢", "什么", "啥", "哪",
+                   "能不能", "是不是", "有没有", "行不行", "怎样",
+                   "怎么样", "可以吗", "好吗", "怎么办", "谁", "几", "多少")
+
+
+def _is_question(text: str) -> bool:
+    """提问检测：结尾问号或含明确疑问词 → 必回（潜水率为 0）。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t[-1] in "？?":
+        return True
+    return any(w in t for w in _QUESTION_WORDS)
+
+
 def dive_rate(f: dict) -> float:
     """这轮「可接但没什么好接的」时潜水的概率（0~1），按信号强度分级。
 
@@ -530,7 +573,7 @@ class Main(star.Star):
         logger.info(
             "[decide] 已加载：%s%s 超时%.0fs 回看%d条/%.0f分钟内 "
             "刚说过%.0fs内只回接话/%.0fs内全闭嘴 自己的话记%d条 熔断%d次/%.0fs "
-            "静音群=%s 别的AI在被喊时闭嘴=%s 睡觉时段=%s",
+            "静音群=%s 别的AI在被喊时闭嘴=%s 睡觉时段=%s 纯图片自然潜水=%s",
             "开" if ENABLED else "关",
             "（影子模式，只看不拦）" if SHADOW else "",
             TIMEOUT, LOOKBACK, SPAN / 60.0, MIN_GAP, GAP_HARD, OWN_MAX,
@@ -538,6 +581,7 @@ class Main(star.Star):
             "、".join(sorted(MUTE_GROUPS)) if MUTE_GROUPS else "无",
             "开" if OTHER_AI else "关",
             ("%d~%d点不主动插话" % (SLEEP_FROM, SLEEP_TO)) if SLEEP_ON else "关",
+            "开" if IMAGE_DIVE else "关",
         )
 
     # ---------------------------------------------------------- 记自己何时说过
@@ -631,6 +675,12 @@ class Main(star.Star):
                 _stat["skip_proactive"] = _stat.get("skip_proactive", 0) + 1
                 logger.info("[decide] 兴趣探头事件，让路不判")
                 return
+            # dsh-poke 主动试探已经得到对方回戳/开口，是明确的正向互动信号。
+            # 只让这一轮自然承接，后续仍恢复正常潜水判断。
+            if event.get_extra("dsh_poke_probe") or event.get_extra("dsh_poke_probe_feedback"):
+                _stat["skip_poke_probe"] = _stat.get("skip_poke_probe", 0) + 1
+                logger.info("[decide] 戳一戳试探已得到反馈，让路续聊")
+                return
             gid = str(event.get_group_id() or "")
             if not gid:
                 _stat["skip_nogid"] += 1
@@ -654,6 +704,16 @@ class Main(star.Star):
             if msg.startswith(("/", "／", "!", "！")):
                 _stat["skip_cmd"] += 1
                 return
+
+            # 视觉转述让模型“看得见”，但不代表群友每丢一张图都在等它点评。
+            # 只识别当前输入链里的真实 Image；带文字说明的图仍按普通消息处理。
+            try:
+                chain = getattr(getattr(event, "message_obj", None), "message", None) or ()
+                has_current_image = any(isinstance(comp, Image) for comp in chain)
+            except BaseException:
+                has_current_image = False
+            pure_image = is_image_only(has_current_image, msg)
+            event.set_extra("dsh_image_only", pure_image)
 
             # 有人在跟别的 AI 说话（「豆包：这题怎么解」），别抢话。
             # 位置有讲究，两边都是必须的：
@@ -700,7 +760,7 @@ class Main(star.Star):
             # 刚说过话就先闭嘴。压发言占比最直接、且完全不花钱的一根杠杆。
             gap = time.time() - _last_send.get(gid, 0.0)
             # 硬地板：一定是自己连着说，不问模型（零成本）。
-            if gap < GAP_HARD:
+            if gap < GAP_HARD and not _is_question(msg):
                 _stat["gap_silence"] += 1
                 brief = "刚说过 %.0fs 前（<%.0fs 硬地板），这轮不说话" % (
                     gap, GAP_HARD)
@@ -725,6 +785,19 @@ class Main(star.Star):
                 return
 
             transcript = _recent(gid, msg)
+            if pure_image:
+                caption = current_image_caption(
+                    getattr(req, "extra_user_content_parts", None) or ()
+                )
+                if caption:
+                    transcript += "\n（当前纯图片描述，仅供理解，不代表必须评价）%s" % caption
+                elif len(transcript) < 6:
+                    # 看不清图且没人点名时，不为一张内容未知的图硬挤评语。
+                    _stat["image_silence_unclear"] = _stat.get("image_silence_unclear", 0) + 1
+                    if not SHADOW:
+                        event.stop_event()
+                    logger.info("[decide] 纯图片没有可用描述，不硬评")
+                    return
             if len(transcript) < 6:
                 _stat["skip_thin"] += 1
                 logger.info("[decide] 群聊内容太少，不判断 gid=%s", gid)
@@ -763,14 +836,26 @@ class Main(star.Star):
             # 软区间收紧：刚说过话，只有「在回你」才准开口。
             # 不在这里提前 return 是刻意的 —— 走同一条沉默路径，日志形状一致，
             # 统计口径也一致（否则「为什么没说话」又要分两处查）。
-            if in_gap and act == "回话" and not f.get("replying_to_bot"):
+            if in_gap and act == "回话" and not f.get("replying_to_bot") and not _is_question(msg):
                 _stat["gap_soft_silence"] = _stat.get("gap_soft_silence", 0) + 1
                 act = "沉默"
                 why = "刚说过 %.0fs（<%.0fs）且不是在回你" % (gap, MIN_GAP)
             # 动态潜水：verdict 判「回话」，但按信号强度掷骰子，
             # 没什么可接的对话（没人叫、没话头）就潜水 —— 用户钦定。
-            if DIVE and act == "回话":
-                rate = dive_rate(f)
+            if pure_image and IMAGE_DIVE and act == "回话":
+                rate = image_dive_rate(f, IMAGE_DIVE_RATES)
+                if random.random() < rate:
+                    _stat["image_dive"] = _stat.get("image_dive", 0) + 1
+                    act = "沉默"
+                    why = "纯图片自然略过（没有明确互动，骰中 %.0f%%）" % (rate * 100)
+                else:
+                    # 偶尔确实想接时也只需一个真人式短反应，别写看图作文。
+                    f["avoid"] = "逐项点评或长篇分析"
+                    if not f.get("tone"):
+                        f["tone"] = "随手短反应"
+            elif DIVE and act == "回话":
+                # 提问必回：明确提问不参与潜水骰子（用户钦定）。
+                rate = 0.0 if _is_question(str(msg)) else dive_rate(f)
                 if random.random() < rate:
                     _stat["dive"] = _stat.get("dive", 0) + 1
                     act = "沉默"
@@ -815,7 +900,7 @@ class Main(star.Star):
     # ResultDecorateStage → RespondStage，压根不经过 on_llm_request ——
     # 静音群里任何人敲一条公开指令，机器人照样会出声。
     # 这不是假想：dsh-guard 的警告是 event.send 直发，同样绕过那道闸门，
-    # 已经真的在 1048435041 说过一句「群里不聊这个，收着点」。
+    # 已经真的在 100000001 说过一句「群里不聊这个，收着点」。
     #
     # 所以这里补一道**出口级**兜底：结果装好、还没发出去时，
     # 群在静音名单里就把整个 result 清掉。clear_result() 是框架自己的 API，

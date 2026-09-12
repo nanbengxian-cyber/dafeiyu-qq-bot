@@ -228,7 +228,8 @@ class Main(star.Star):
             # dsh-initiate 的合成事件不是真人发言，记进来会污染
             # 「他发问后别人又说了几条」这个计数（那是另外两条 @ 规则的判据）。
             # dsh-proactive 同理：哨兵号发言不算群友发言。
-            if event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive"):
+            if (event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive")
+                    or event.get_extra("dsh_poke_probe")):
                 return
             q = _recent.get(gid)
             if q is None:
@@ -255,14 +256,35 @@ class Main(star.Star):
     async def smart_at(self, event: AstrMessageEvent) -> None:
         try:
             result = event.get_result()
-            if result is None or not result.chain:
+            if result is None:
+                return
+
+            # MessageEventResult.chain 应是组件 list。若上游插件误把 MessageChain
+            # 传给 chain_result()，这里提前拆平，避免装饰钩子和框架后续 len()
+            # 一起崩掉。dsh-steal 的已知肇事点已修，此处是长期保护。
+            chain = getattr(result, "chain", None)
+            if chain is not None and not isinstance(chain, list):
+                inner = getattr(chain, "chain", None)
+                if isinstance(inner, list):
+                    result.chain = inner
+                    logger.warning(
+                        "[mention] 检测到嵌套 MessageChain，已拆平（%d 个组件）",
+                        len(inner),
+                    )
+                else:
+                    logger.error("[mention] result.chain 类型异常: %r", type(chain))
+                    return
+
+            if not result.chain:
                 return
 
             # 主动开口/兴趣探头没有「发送者」可 @：合成事件用的是哨兵号
             # （不能用机器人自己的号，ignore_bot_self_message=True 会把事件掐掉），
             # 插进去就是一个点不动的 @。
-            if event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive"):
-                logger.info("[mention] at=False 合成事件，没有对象可@")
+            if (event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive")
+                    or event.get_extra("dsh_poke_probe")
+                    or event.get_extra("dsh_poke_probe_feedback")):
+                logger.info("[mention] at=False 主动/试探事件，不用@追人")
                 return
 
             # 和框架保持一致：只给纯文本/图文消息加 @，别去动转发、语音等复杂链

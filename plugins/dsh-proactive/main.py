@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from collections import deque
@@ -67,6 +68,11 @@ from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, Message
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.filter.custom_filter import CustomFilter
 
+_PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
+from dsh_link import blocks  # type: ignore  # noqa: E402
+
 
 def _flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
@@ -80,12 +86,13 @@ GROUPS = {
 }
 # 每群两次主动探头之间的最小间隔（毫秒，对齐 Codex minIntervalMs 语义）。
 MIN_INTERVAL_MS = max(60_000, int(os.environ.get("DSH_PROACTIVE_MIN_INTERVAL_MS", "600000")))
-DAY_MAX = max(1, int(os.environ.get("DSH_PROACTIVE_DAY_MAX", "3")))
+DAY_MAX = max(1, int(os.environ.get("DSH_PROACTIVE_DAY_MAX", "5")))
 THRESHOLD = max(1, int(os.environ.get("DSH_PROACTIVE_THRESHOLD", "8")))
 OWNER = os.environ.get("DSH_PROACTIVE_OWNER", "2774000001").strip()
 TIMEZONE = os.environ.get("DSH_PROACTIVE_TZ", "Asia/Shanghai")
 HOURS = os.environ.get("DSH_PROACTIVE_HOURS", "10-23,0-2")
 DB_PATH = os.environ.get("DSH_PROACTIVE_DB", "/AstrBot/data/dsh_memory.db")
+SOCIAL_DB = os.environ.get("DSH_PROACTIVE_SOCIAL_DB", "/AstrBot/data/dsh_social.db")
 STATE_PATH = Path(os.environ.get("DSH_PROACTIVE_STATE", "/AstrBot/data/dsh_proactive_state.json"))
 PLATFORM_ID = os.environ.get("DSH_PROACTIVE_PLATFORM", "default")
 SELF_ID_ENV = os.environ.get("DSH_PROACTIVE_SELF_ID", "").strip()
@@ -307,6 +314,33 @@ def read_context(gid: str, limit: int = 8, db: str = DB_PATH) -> list[tuple]:
     return merged[-limit:]
 
 
+def social_allows_proactive(gid: str, uid: str, now: float | None = None,
+                            db: str = SOCIAL_DB) -> tuple[bool, str]:
+    """Honor dsh-social's explicit boundary before optional proactive chatter.
+
+    Direct requests never reach this helper.  Reading is group/user isolated and fail-open so a
+    missing, locked or older dsh-social database cannot disable the bot's normal message path.
+    Users who opted out of relationship profiling are treated as neutral; opt-out is not itself a
+    request for silence.
+    """
+    if not gid or not uid:
+        return True, "no_identity"
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=0.5)
+        try:
+            row = con.execute(
+                "SELECT avoid_until FROM relations WHERE group_id=? AND user_id=?",
+                (gid, uid),
+            ).fetchone()
+        finally:
+            con.close()
+        if row and float(row[0] or 0) > (time.time() if now is None else float(now)):
+            return False, "对方要求少打扰"
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+    return True, "ok"
+
+
 class ProactiveFilter(CustomFilter):
     """只放行本插件自己造的事件。靠 extra 标记认，不靠猜消息形状。"""
 
@@ -322,12 +356,16 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         self._state = _load_state()
-        self._last_event: dict[str, float] = {}  # 同一条消息去重（消息 id -> ts）
+        self._last_event: dict[str, float] = {}  # 消息 id -> ts，跨适配器重复投递去重
         self._quiet: dict[str, str] = {}  # 日志去重，避免每条消息刷一行
         self._self_id: str = SELF_ID_ENV
         logger.info(
             "[proactive] 已加载：%s 影子=%s 阈值%d 间隔%.0f分钟 每日%d次 群=%s",
             "开" if ENABLED else "关", "开" if SHADOW else "关",
+            # 每群两次探头仍受冷却限制；每日额度只是最后一道防刷屏保险。
+            # 原来每日 3 次在午后已经耗尽，之后即使命中高相关话题也完全不说，
+            # 主观感受会从“偶尔接话”突然变成“必须 @ 才说”。默认提高到 5，
+            # 仍明显低于 initiate 的每日上限，且保留 10 分钟冷却。
             THRESHOLD, MIN_INTERVAL_MS / 60000, DAY_MAX,
             ",".join(sorted(GROUPS)) or "无",
         )
@@ -335,7 +373,7 @@ class Main(star.Star):
     # ---------------------------------------------------------- 消息入口
     # 用 platform_adapter_type(ALL) 像 dsh-memory 一样收每条群消息，
     # 这样群友之间的闲聊也进评分（主动探头要抓的恰恰是没人喊它的时候）。
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=100)
     async def collect(self, event: AstrMessageEvent) -> None:
         if not ENABLED:
             return
@@ -355,6 +393,9 @@ class Main(star.Star):
             # 被 @ / 被回复 —— 正常应答路径，不是主动探头。
             if bool(getattr(event, "is_at_or_wake_command", False)):
                 return
+            # 管理动作、复读或其它已发送响应可显式占有本轮，探头必须让路。
+            if blocks(event, "proactive"):
+                return
             # 上一句是自己说的 —— 别自己接自己（decide 的 MIN_GAP 类比）。
             recent = read_context(gid, 3)
             if recent and str(recent[-1][0]) == SENTINEL_UID:
@@ -370,6 +411,11 @@ class Main(star.Star):
                 return
             if text.startswith("/"):
                 return
+            if not in_active_hours():
+                return self._quiet_skip(gid, "当前不在主动探头时段", "inactive_hour")
+            social_ok, social_reason = social_allows_proactive(gid, uid)
+            if not social_ok:
+                return self._quiet_skip(gid, "不探头：%s" % social_reason, "social_boundary:%s" % uid)
 
             now_ms = int(time.time() * 1000)
             state = self._day(gid, now_ms)
@@ -390,12 +436,20 @@ class Main(star.Star):
             ok, why, score, hits = decision
             if not ok:
                 return self._quiet_skip(gid, "不探头：%s" % why, why[:16])
-            # 同一条消息可能被多个渠道/适配器重复送进来，按消息 id 去重。
-            mid = str(getattr(getattr(event, "raw_message", None), "message_id", "") or "#%s:%s" % (gid, text[:12]))
-            last = self._last_event.get(gid, 0.0)
-            if time.time() - last < 2.0:
+            # 同一条消息可能被多个渠道/适配器重复送进来，优先按平台 message_id 去重。
+            raw_message = getattr(event, "raw_message", None)
+            if isinstance(raw_message, dict):
+                raw_mid = raw_message.get("message_id")
+            else:
+                raw_mid = getattr(raw_message, "message_id", "")
+            mid = str(raw_mid or "#%s:%s:%s" % (gid, uid, text[:24]))
+            now = time.time()
+            for event_id, seen_at in tuple(self._last_event.items()):
+                if now - seen_at > 30.0:
+                    self._last_event.pop(event_id, None)
+            if mid in self._last_event:
                 return
-            self._last_event[gid] = time.time()
+            self._last_event[mid] = now
             logger.info(
                 "[proactive] gid=%s 命中兴趣(%s) 分%d %s 原文=%r",
                 gid, "+".join(hits), score, why, text[:60],

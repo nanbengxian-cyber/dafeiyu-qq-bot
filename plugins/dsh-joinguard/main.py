@@ -46,7 +46,15 @@ def _set(name: str, default: str = "") -> set[str]:
 ENABLED = _flag("DSH_JOINGUARD")
 GROUPS = _set("DSH_JOINGUARD_GROUPS")   # 真实群号由服务器 env 配置
 OWNERS = _set("DSH_JOINGUARD_OWNER")    # 真实群主 QQ 由服务器 env 配置
-PROVIDER = os.environ.get("DSH_JOINGUARD_PROVIDER", "").strip()  # 缺省用主会话 provider
+# 判定渠道链：DSH_JOINGUARD_PROVIDER 可逗号分隔多个 provider id（如
+# "bigfeiyu-justwoker-sol,bigfeiyu-vsllm-text"），依次尝试；全部失败再退回
+# 主会话 provider。2026-09-10 事故：主会话渠道 key 配错后所有申请全转人工，
+# 真人全被挡在门外——单个渠道挂掉不能让入群审核失效。
+PROVIDERS = [
+    p.strip() for p in os.environ.get("DSH_JOINGUARD_PROVIDER", "").split(",") if p.strip()
+]
+# 每个渠道的判定尝试次数（渠道偶发 429/超时/403 时重试一次再换下一条）。
+_JUDGE_TRIES = max(1, int(os.environ.get("DSH_JOINGUARD_TRIES", "2")))
 _CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "joinguard.json")
 _TIMEOUT = float(os.environ.get("DSH_JOINGUARD_TIMEOUT", "30"))
 _LOG_MAX = 12  # 状态里保留的最近审核记录条数
@@ -248,35 +256,60 @@ class Main(star.Star):
         await self._decide(event, gid, uid, flag, answer, decision, reason)
 
     async def _judge(self, event, question: str, answer: str):
-        """LLM 判 approve/reject/review；失败或解析不出返回 None。"""
-        umo = getattr(event, "unified_msg_origin", None)
-        pid = PROVIDER
-        if not pid:
-            try:
-                pid = await self.context.get_current_chat_provider_id(umo)
-            except BaseException:
-                pid = None
-        if not pid:
-            logger.warning("[joinguard] 拿不到 provider，转人工")
+        """LLM 判 approve/reject/review；失败或解析不出返回 None。
+
+        按渠道链依次尝试（env 指定的 + 主会话 provider），每条渠道最多试
+        _JUDGE_TRIES 次，避免单渠道偶发故障直接把申请打成「转人工」。
+        """
+        candidates = await self._provider_candidates(event)
+        if not candidates:
+            logger.warning("[joinguard] 拿不到任何 provider，转人工")
             return None
+        prompt = _PROMPT.format(question=question, answer=answer or "（空）")
+        for pid in candidates:
+            for attempt in range(1, _JUDGE_TRIES + 1):
+                try:
+                    resp = await asyncio.wait_for(
+                        self.context.llm_generate(
+                            chat_provider_id=pid,
+                            prompt=prompt,
+                            system_prompt=_SYS,
+                            temperature=0,
+                            max_tokens=300,
+                        ),
+                        timeout=_TIMEOUT,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[joinguard] LLM 审核失败（渠道=%s 第%d/%d次）: %s",
+                        pid, attempt, _JUDGE_TRIES, exc)
+                    continue
+                raw = (getattr(resp, "completion_text", "") or "").strip()
+                if not raw:
+                    raw = (getattr(resp, "reasoning_content", "") or "").strip()
+                parsed = self._parse(raw)
+                if parsed:
+                    return parsed
+                logger.warning("[joinguard] 判定不可解析（渠道=%s 第%d次）：%r",
+                               pid, attempt, raw[:120])
+        logger.warning("[joinguard] 全部渠道判定失败（试过 %s），转人工", "→".join(candidates))
+        return None
+
+    async def _provider_candidates(self, event) -> list[str]:
+        """判定渠道候选链：env 指定（可多个）→ 主会话 provider，去重、保序。"""
+        out: list[str] = []
+        for pid in PROVIDERS:
+            if pid and pid not in out:
+                out.append(pid)
         try:
-            resp = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=pid,
-                    prompt=_PROMPT.format(question=question, answer=answer or "（空）"),
-                    system_prompt=_SYS,
-                    temperature=0,
-                    max_tokens=300,
-                ),
-                timeout=_TIMEOUT,
-            )
-        except BaseException as exc:  # noqa: BLE001
-            logger.warning("[joinguard] LLM 审核失败: %s", exc)
-            return None
-        raw = (getattr(resp, "completion_text", "") or "").strip()
-        if not raw:
-            raw = (getattr(resp, "reasoning_content", "") or "").strip()
-        return self._parse(raw)
+            cur = await self.context.get_current_chat_provider_id(
+                getattr(event, "unified_msg_origin", None))
+        except BaseException:  # noqa: BLE001
+            cur = None
+        cur = str(cur or "").strip()
+        if cur and cur not in out:
+            out.append(cur)
+        return out
 
     @staticmethod
     def _parse(text: str):

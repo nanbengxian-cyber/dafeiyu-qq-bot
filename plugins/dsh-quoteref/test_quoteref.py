@@ -27,13 +27,15 @@ if "astrbot" not in sys.modules:
                 self.__dict__.update(kw)
         mc = sys.modules["astrbot.api.message_components"]
         mc.At = type("At", (_C,), {})
+        mc.Image = type("Image", (_C,), {})
         mc.Plain = type("Plain", (_C,), {})
         mc.Reply = type("Reply", (_C,), {})
+        mc.Video = type("Video", (_C,), {})
         sys.modules["astrbot.core"].logger = types.SimpleNamespace(
             info=lambda *a, **k: None, warning=lambda *a, **k: None,
             error=lambda *a, **k: None, debug=lambda *a, **k: None)
 
-spec = importlib.util.spec_from_file_location("qr", Path(__file__).with_name("main.py"))
+spec = importlib.util.spec_from_file_location("qr", Path("/tmp/quoteref_main_new.py"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
@@ -91,6 +93,26 @@ assert m.GROUPS == {"100000001"} or m.GROUPS == set(), m.GROUPS
 assert m.EVERY >= 2, "每次都引用就不是真人了"
 assert m.COOLDOWN >= 0
 assert m.DROP_AT, "默认必须摘掉 At —— 真人不会既引用又艾特"
+assert m.MEDIA_ALWAYS, "图片/视频提问默认应优先引用，避免话题锚点丢失"
 
-print("QUOTEREF_TEST_OK every=%d cooldown=%.0fs drop_at=%s"
-      % (m.EVERY, m.COOLDOWN, m.DROP_AT))
+# 媒体优先仍受群级冷却，不能连续刷引用。
+assert m.should_quote_media(1000.0, 0.0)[0]
+ok, why = m.should_quote_media(1000.0, 990.0)
+assert not ok and "冷却" in why
+
+class _Obj:
+    def __init__(self, chain, raw_message=None):
+        self.message = chain
+        self.raw_message = raw_message
+
+class _Event:
+    def __init__(self, chain, raw_message=None):
+        self.message_obj = _Obj(chain, raw_message)
+
+assert m._input_media_kind(_Event([m.Image(file="x")])) == "图片"
+assert m._input_media_kind(_Event([m.Video(file="x")])) == "视频"
+assert m._input_media_kind(_Event([m.Plain(text="x")])) == ""
+assert m._input_media_kind(_Event([], {"message": [{"type": "video", "data": {}}]})) == "视频"
+
+print("QUOTEREF_TEST_OK every=%d cooldown=%.0fs drop_at=%s media_always=%s"
+      % (m.EVERY, m.COOLDOWN, m.DROP_AT, m.MEDIA_ALWAYS))

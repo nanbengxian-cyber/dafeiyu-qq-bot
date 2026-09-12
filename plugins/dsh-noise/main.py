@@ -216,6 +216,7 @@ class Main(star.Star):
                 if out is None or out == core:
                     new_chain.append(comp)
                     continue
+                changed = True
                 _stat[kind] = _stat.get(kind, 0) + 1
                 logger.info("[noise] %s：%r -> %r", kind, core, out)
                 new_chain.append(Plain(lead + out))

@@ -36,10 +36,11 @@ import aiohttp
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.core import logger
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.platform.message_type import MessageType
 
 # ---------------------------------------------------------------- 通用泄漏清理
 #
@@ -356,8 +357,26 @@ SELF_PORTRAIT = os.environ.get(
     "身后有鲸鱼尾巴，闭着眼睛微笑，上半身特写",
 )
 
+# 主动理解式生图：群友不是在“要一张图”，而是在描述一个明确的视觉成品时，
+# 机器人可主动把它画成草图，再问“是不是这样的”。这条链路不依赖 LLM 工具调用，
+# 即使规则再窄也会把普通描述当请求；为避免误打扰，默认关闭，只允许管理员显式开启。
+AUTO_CONCEPT = os.environ.get("DSH_IMG_CONCEPT_AUTO", "0") not in ("0", "false", "False")
+CONCEPT_MIN_CHARS = max(8, int(os.environ.get("DSH_IMG_CONCEPT_MIN_CHARS", "14")))
+CONCEPT_COOLDOWN = max(60, int(os.environ.get("DSH_IMG_CONCEPT_COOLDOWN", "1800")))
+CONCEPT_GROUPS = {
+    x.strip() for x in os.environ.get("DSH_IMG_CONCEPT_GROUPS", "").split(",") if x.strip()
+}
+CONCEPT_CONFIRM = os.environ.get(
+    "DSH_IMG_CONCEPT_CONFIRM", "我按你说的先画了个草图，是不是这种感觉？"
+).strip()
+CONCEPT_ONLY_WHEN_NOT_REPLIED = os.environ.get(
+    "DSH_IMG_CONCEPT_ONLY_WHEN_NOT_REPLIED", "1"
+) not in ("0", "false", "False")
+
 _sem = asyncio.Semaphore(MAX_CONCURRENCY)
 _last_call: dict[str, float] = {}
+_concept_last: dict[str, float] = {}
+_concept_inflight: set[str] = set()
 
 
 # ---------------------------------------------------------------- 意图识别
@@ -381,19 +400,14 @@ LEAK_PROMPT_RE = re.compile(
 )
 LEAK_PROMPT_JSON_RE = re.compile(r"[\"']prompt[\"']\s*:\s*[\"'](.+?)[\"']", re.S)
 
-# 用户在要图 —— 强信号：动词 + 明确的图片类名词。
-# 「发个照片」「给张图」也算：用户要的是图，至于是画还是找，对他没差别。
-# 实测漏过「@大肥鱼 发个照片」，机器人回了「发了！说好的偷藏一张自拍」却没图。
+# 严格强信号：只认“创作/生成一张新图”，不再把“发/给/晒一张图”、
+# “长什么样”或裸“自拍”当作生图。那些说法可能是在讨论或转发已有图片，
+# 也可能只是问外观；宁可让模型正常回答，也不能擅自生成新图。
 DRAW_INTENT_RE = re.compile(
-    r"(画|绘|生成|做|整|来|搞|弄|发|给|甩|扔|放|晒|p|P)\s*(?:一)?\s*(?:张|个|幅|副|下|点)?\s*"
-    r"[^。！？\n]{0,12}?(图|图片|照|照片|画|画像|壁纸|头像|表情包|自拍|插画|海报|封面|立绘|简笔画)"
-    r"|画画|画个|画一|画张|画只|画条|画头|画只|自拍|拍一张|拍张|拍个|拍照"
-    # 裸「看看你」曾把「我看看你的品味怎么样」当成要图（真实语料命中）。
-    # 它本意是覆盖「看看你长什么样」，而那句已经由同一行的「长什么样」独立覆盖，
-    # 所以裸词纯属冗余、只带来误伤。改成必须紧跟外观类名词。
-    r"|生成图|出图|作图|画图|来点图|上图"
-    r"|看看你(?:的)?(?:长相|样子|模样|真容|尊容|颜值|脸|头像)"
-    r"|长什么样|长啥样|什么样子"
+    r"(画|绘|生成|制作|创作|设计|作|p|P)\s*(?:一)?\s*(?:张|个|幅|副|下|点)?\s*"
+    r"[^。！？\n]{0,12}?(图|图片|照|照片|画像|壁纸|头像|表情包|插画|海报|封面|立绘|简笔画)"
+    r"|画画|画个|画一|画张|画只|画条|画头"
+    r"|生成图|出图|作图|画图"
 )
 
 # 弱信号：动词 + 量词，但宾语是具体事物而不是「图」这个字。
@@ -533,6 +547,81 @@ BARE_PIC_RE = re.compile(
     r"(图片|照片|图|照|自拍|头像|壁纸|表情包|动图|动态图|看看|"
     r"长什么样|长啥样|什么样子|样子)"
 )
+
+def has_explicit_creation_intent(text: str) -> bool:
+    """只确认用户是否明确要求创作一张新图；讨论、转发或询问外观不算。"""
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw or raw.startswith("/"):
+        return False
+    if OTHER_MEDIA_RE.search(raw) and not EXPLICIT_IMG_RE.search(raw):
+        return False
+    if DRAW_INTENT_RE.search(raw):
+        return True
+    if NON_VISUAL_RE.search(raw):
+        return False
+    return bool(
+        WEAK_DRAW_RE.search(raw)
+        or WEAK_DIRECTIONAL_RE.search(raw)
+        or WEAK_BARE_RE.search(raw)
+    )
+
+
+# ---------------------------------------------------------------- 主动理解式生图
+# 只认“对象 + 外观/构图描述”的句子，不认单纯叙事、感受、提问或服务请求。
+# 与显式 DRAW_INTENT_RE 分离：用户真正在要图时仍走原来的快路径，不占主动额度。
+_CONCEPT_SUBJECT_RE = re.compile(
+    r"(?:^|[，。；;、\s])(?:我想要|我想做|设想|想象|构思|设计|成品|制品|角色|人物|"
+    r"头像|海报|封面|壁纸|房间|建筑|衣服|裙子|机甲|机器人|怪物|场景|画面|logo|LOGO|标志)"
+)
+_CONCEPT_VISUAL_RE = re.compile(
+    r"(长着|有着|穿着|戴着|拿着|背着|站在|坐在|躺在|趴在|漂浮|悬浮|"
+    r"配色|颜色|风格|造型|外观|构图|背景|材质|光线|姿势|表情|镜头|"
+    r"蓝色|红色|白色|黑色|金色|银色|透明|发光|机械|可爱|赛博|古风|二次元)"
+)
+_CONCEPT_RELATION_RE = re.compile(
+    r"(?:是|像|做成|设计成|设定成|看起来|整体|主体|背景|上面|下面|旁边|身后)"
+)
+_CONCEPT_NEGATIVE_RE = re.compile(
+    r"(?:不要|别|不用|无需|不需要|别给我|别画|不画|不生图|不要生图|不必生图)"
+)
+_CONCEPT_NONVISUAL_RE = re.compile(
+    r"(代码|程序|插件|接口|配置|部署|服务器|模型|提示词|prompt|表格|文档|报告|方案|"
+    r"计划|教程|规则|功能|机制|语音|视频|动画|音乐|歌曲|小说|故事|论文|数据)"
+)
+_CONCEPT_QUESTION_ONLY_RE = re.compile(r"^(?:为什么|怎么|如何|能不能|可以吗|是不是|有没有)")
+
+
+def detect_visual_concept(text: str) -> tuple[bool, str]:
+    """判断群友是否在描述一个值得可视化确认的明确制品/画面。纯函数，便于回测。"""
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(raw) < CONCEPT_MIN_CHARS or len(raw) > 220:
+        return False, "长度不合适"
+    if raw.startswith("/") or _CONCEPT_NEGATIVE_RE.search(raw):
+        return False, "显式否定"
+    if DRAW_INTENT_RE.search(raw) or WEAK_DRAW_RE.search(raw) or WEAK_DIRECTIONAL_RE.search(raw):
+        return False, "显式要图归原链路"
+    if OTHER_MEDIA_RE.search(raw) and not EXPLICIT_IMG_RE.search(raw):
+        return False, "其他媒体"
+    if _CONCEPT_NONVISUAL_RE.search(raw) or NON_VISUAL_RE.search(raw):
+        return False, "非视觉制品"
+    if _CONCEPT_QUESTION_ONLY_RE.search(raw) and not _CONCEPT_SUBJECT_RE.search(raw):
+        return False, "纯提问"
+    subject = bool(_CONCEPT_SUBJECT_RE.search(raw))
+    visual = bool(_CONCEPT_VISUAL_RE.search(raw))
+    relation = bool(_CONCEPT_RELATION_RE.search(raw))
+    # 两种可靠形状：明确说“设计/角色/画面…”并给出视觉属性；或同时给出
+    # 视觉属性和空间/外观关系。只命中一个形容词不够，避免“这个模型很可爱”误出图。
+    if subject and visual:
+        return True, "主体+视觉属性"
+    if visual and relation and len(raw) >= CONCEPT_MIN_CHARS + 6:
+        return True, "视觉属性+构图关系"
+    return False, "描述不够具体"
+
+
+def _concept_prompt(text: str) -> str:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    return "把下面这段描述可视化成一张概念草图，用于让描述者确认理解是否正确：" + raw[:220]
+
 
 # [patch:owned-v1 你的X 不再一律画成自画像]
 # 「你的X」里的 X 才是要画的东西。原来只要句里有「你的」就直接画自画像，
@@ -823,23 +912,90 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[imagegen] 已加载：base=%s model=%s fallback=%s auto=%s style=%s...",
+            "[imagegen] 已加载：base=%s model=%s fallback=%s auto=%s concept=%s/%ds style=%s...",
             API_BASE,
             MODEL,
             FALLBACK_MODELS,
             AUTO_FALLBACK,
+            AUTO_CONCEPT,
+            CONCEPT_COOLDOWN,
             STYLE_SUFFIX[:40],
         )
+
+    # ------------------------------------------ 路径 0：描述明确制品时主动可视化
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    async def auto_concept(self, event: AstrMessageEvent) -> None:
+        """群友描述明确视觉制品时主动出概念草图，并询问理解是否正确。"""
+        if not AUTO_CONCEPT:
+            return
+        try:
+            if event.get_message_type() != MessageType.GROUP_MESSAGE:
+                return
+            if event.get_extra("dsh_initiate") or event.get_extra("dsh_proactive"):
+                return
+            # 默认只在普通唤醒链没有准备回复时补充视觉回应，避免同一条消息同时
+            # 出现常规文字回复和概念图追问。可用环境变量关闭此限制。
+            if CONCEPT_ONLY_WHEN_NOT_REPLIED and bool(event.is_at_or_wake_command):
+                return
+            gid = str(event.get_group_id() or "")
+            uid = str(event.get_sender_id() or "")
+            if not gid or not uid or uid == str(event.get_self_id() or ""):
+                return
+            if CONCEPT_GROUPS and gid not in CONCEPT_GROUPS:
+                return
+            text = str(event.get_message_str() or "").strip()
+            ok, why = detect_visual_concept(text)
+            if not ok:
+                return
+
+            sid = event.unified_msg_origin or ("group:" + gid)
+            now = time.time()
+            left = CONCEPT_COOLDOWN - int(now - _concept_last.get(sid, 0.0))
+            if left > 0:
+                logger.info("[imagegen] 主动概念图命中但在冷却中（%ds）：%.60s", left, text)
+                return
+            if sid in _concept_inflight:
+                return
+
+            _concept_inflight.add(sid)
+            _concept_last[sid] = now
+            event.set_extra("imagegen_done", True)
+            prompt = _concept_prompt(text)
+            logger.info("[imagegen] 主动概念图（%s）：%.120s", why, text)
+            try:
+                path, err = await _generate(prompt)
+                if not path:
+                    _concept_last[sid] = 0.0
+                    logger.error("[imagegen] 主动概念图失败：%s", err)
+                    return
+                chain = [Image.fromFileSystem(path)]
+                if CONCEPT_CONFIRM:
+                    chain.append(Plain(CONCEPT_CONFIRM))
+                await event.send(MessageChain(chain=chain))
+                # 已经用“图片+确认问题”完整回应本条描述，阻止后续普通聊天链
+                # 再补一条重复文字；失败路径不会 stop，仍可正常文字回复。
+                event.stop_event()
+                logger.info("[imagegen] 主动概念图已发送：%s", path)
+            finally:
+                _concept_inflight.discard(sid)
+        except BaseException as exc:
+            logger.error("[imagegen] 主动概念图异常：%s", exc)
 
     # ------------------------------------------------ 路径 1：规范工具调用
 
     @filter.llm_tool(name="generate_image")
     async def generate_image(self, event: AstrMessageEvent, prompt: str):
-        """画图、生成图片、出图、做壁纸/头像/表情包/插画、拍照片时调用本工具，生成并发送图片。只要用户想要一张图就调用它。
+        """仅当用户明确要求创作新图片时调用。讨论/转发已有图片、询问外观、仅描述画面、请求视频/语音时严禁调用。
 
         Args:
-            prompt(string): 图片内容的详细描述，写清主体、动作、表情、场景，越具体越好
+            prompt(string): 用户明确要求创作的图片内容，写清主体、动作、表情和场景
         """
+        user_text = str(event.get_message_str() or event.message_str or "").strip()
+        if not has_explicit_creation_intent(user_text):
+            logger.warning("[imagegen] 拒绝工具误调用：用户没有明确作画意图 | 用户=%.80s", user_text)
+            return "未生成图片：用户没有明确要求创作新图。请正常回答原问题，不要声称图片已生成。"
+
         sid = event.unified_msg_origin or "global"
         left = _cooldown_left(sid)
         if left > 0:
@@ -900,12 +1056,9 @@ class Main(star.Star):
             asked_back = bool(ASK_BACK_RE.search(cleaned))
             # 模型回复里自己说在画什么，是理解成画图请求的可靠旁证
             assist_draw = bool(ASSIST_DRAW_RE.search(cleaned))
-            # 弱信号：「生成懒人群主」「弄个猫娘」这类没有「图」字的说法。
-            #
-            # 取舍：与其枚举「画得出来的东西」（无穷），不如排除「明显画不出的」
-            # （表格/投票/报表/饭…，有限且稳定）。宾语不在黑名单里就认作要图。
-            # 代价是遇到没列举的非画面宾语会误发一张图；但漏检更恼人——用户
-            # 明确要图却毫无反应，比多发一张图糟糕得多。黑名单可随时补。
+            # 泛动词、来个X、裸名词等关键词只能作为旁证，不能单独触发生图。
+            # 它们在自然聊天里太常见（搞个音色、来个人、生成方案），旧版正是因此误触发。
+            # 仅保留给日志观测；真正兜底只认严格强信号，或“明确作画弱信号 + 模型确认在画”。
             non_visual = bool(NON_VISUAL_RE.search(user_text))
             # [patch:whichsig-v1 出图时记下是哪条信号命中的]
             # 记下**具体是哪条**信号命中、命中的是哪几个字。
@@ -935,43 +1088,36 @@ class Main(star.Star):
                         _sig_hits.append("%s:%s" % (_name, _m.group(0)))
             sig_detail = "｜".join(_sig_hits) if _sig_hits else "无"
 
-            weak = not non_visual and (
+            explicit_weak = not non_visual and (
                 bool(WEAK_DRAW_RE.search(user_text))
-                or bool(WEAK_LOOSE_RE.search(user_text))
-                # 趋向补语（画出来）与「来个X」——见 patch:intent-v3 的实测漏例
                 or bool(WEAK_DIRECTIONAL_RE.search(user_text))
-                or bool(WEAK_BRING_RE.search(user_text))
-                # 动词+裸名词（生成懒人群主）——见 patch:nonvisual-v1
                 or bool(WEAK_BARE_RE.search(user_text))
             )
-            has_intent = strong or weak
+            loose_hint = not non_visual and (
+                bool(WEAK_LOOSE_RE.search(user_text))
+                or bool(WEAK_BRING_RE.search(user_text))
+            )
+            weak = explicit_weak or loose_hint
+            # 触发门槛：严格图像创作词可直接兜底；省略“图”字的画/绘/生成请求，
+            # 必须再由模型回复明确确认正在作画。泛“做/整/搞/弄/来个”永不单独触发。
+            has_intent = strong or (explicit_weak and assist_draw and promised)
 
-            # 触发条件。核心判断很简单：
-            #   **用户明确要图 + 模型没拒绝 + 模型不是在反问细节 => 就该出图。**
-            #
-            # 早先版本还要求模型「说了答应的话」或「回复短于 30 字」，
-            # 结果一句 32 字的「行，画给你看！蓝的，胖的，闭着眼翻白眼那种！」
-            # 就因为超一个字而漏掉——用户明明看到机器人答应了却等不到图。
-            # 模型答应的说法千变万化，靠枚举关键词或掐字数都不可靠；
-            # 用户的请求意图才是真正该看的东西，模型回复只用来否决
-            #（明确拒绝 / 反问画什么）。
-            if leaked_prompt:
+            # 触发条件：
+            #   **用户明确要求创作新图**，或明确使用画/绘/生成且模型也确认作画；
+            #   模糊关键词、讨论已有图片、询问外观都不触发。
+            if leaked_prompt and (strong or (explicit_weak and assist_draw and promised)):
                 prompt = leaked_prompt
-                reason = "模型泄漏 prompt"
+                reason = "模型泄漏 prompt（已核验用户作画意图）"
             elif has_intent and not refused and not asked_back:
                 prompt = _derive_prompt(user_text, cleaned)
                 bits = []
                 if not strong:
-                    bits.append("弱信号")
+                    bits.append("明确弱信号+模型双确认")
                 if promised:
                     bits.append("模型答应")
                 if assist_draw:
                     bits.append("模型提到画")
-                reason = "用户要图" + ("（" + "、".join(bits) + "）" if bits else "")
-            elif assist_draw and promised and not refused and not asked_back:
-                # 用户原话没被认出，但模型自己说在画 X —— 采信模型的理解
-                prompt = _derive_prompt(user_text, cleaned)
-                reason = "模型自称在画"
+                reason = "用户明确要图" + ("（" + "、".join(bits) + "）" if bits else "")
             else:
                 # 不触发也留个痕：只要出现了任一信号却没出图，就记一条，
                 # 否则下次「有时候不生图」还得靠猜。日志量可控——

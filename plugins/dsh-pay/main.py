@@ -110,7 +110,7 @@ _machines: dict[str, PayMachine] = {}
 # 统计
 _stat = {"detect_intent": 0, "ask": 0, "method": 0, "qr": 0,
          "owner_confirm_note": 0, "thank": 0, "expired": 0,
-         "shadow_block": 0}
+         "shadow_block": 0, "reject_target": 0}
 _events: deque = deque(maxlen=40)
 
 
@@ -149,6 +149,19 @@ def _img_path(method: str):
         return None
     p = os.path.join(PAY_DIR, name)
     return p if os.path.isfile(p) else None
+
+def _at_other_only(event: AstrMessageEvent) -> bool:
+    """消息带了 @，但没有 @ 机器人自己；说明收款对象是群友而非大肥鱼。"""
+    try:
+        self_id = str(event.get_self_id() or "")
+        targets = []
+        for comp in event.get_messages() or ():
+            if isinstance(comp, At):
+                targets.append(str(getattr(comp, "qq", "") or ""))
+        return bool(targets) and self_id not in targets
+    except BaseException:
+        return False
+
 
 def _stat_add(key: str) -> None:
     _stat[key] = _stat.get(key, 0) + 1
@@ -204,9 +217,15 @@ class Main(star.Star):
                     await self._on_method_select(event, m, gid, text)
                 return
 
-            # 空闲态：检测赞助意向
+            # 空闲态：只有明确指向机器人的赞助意向才进入流程。
+            # 若消息含 @，还必须 @ 到机器人自己；@群友讨论赞助不算。
             if m.st == 0:  # ST_IDLE
                 kw = detect_intent(text, EXTRA_WORDS)
+                if kw and _at_other_only(event):
+                    _stat_add("reject_target")
+                    logger.info("[赞助] 意向文本未指向机器人，忽略 from %s(%s): %s",
+                                uname, uid, text[:40])
+                    return
                 if kw:
                     _stat_add("detect_intent")
                     code = m.trigger_intent(uid, uname)
@@ -323,10 +342,10 @@ class Main(star.Star):
             "开关 %s｜模式 %s｜群 %s" % ("开" if ENABLED else "关", self._mode, "、".join(sorted(GROUPS)) or "无"),
             "收款码 微信 %s｜支付宝 %s" % (_img_path("wechat") or "缺", _img_path("alipay") or "缺"),
             "冷却 同人问 %ds｜全局问 %ds｜待确认 %ds｜同人感谢 %ds" % (ASK_COOLDOWN, GLOBAL_COOLDOWN, PENDING_TTL, THANK_COOLDOWN),
-            "累计 意向%d 问%d 选方式%d 发码%d 群主确认%d 感谢%d 过期%d 影子拦截%d" % (
+            "累计 意向%d 问%d 选方式%d 发码%d 群主确认%d 感谢%d 过期%d 影子拦截%d 错目标忽略%d" % (
                 _stat["detect_intent"], _stat["ask"], _stat["method"],
                 _stat["qr"], _stat["owner_confirm_note"], _stat["thank"],
-                _stat["expired"], _stat["shadow_block"]),
+                _stat["expired"], _stat["shadow_block"], _stat["reject_target"]),
         ]
         stlines = []
         for g, m in _machines.items():

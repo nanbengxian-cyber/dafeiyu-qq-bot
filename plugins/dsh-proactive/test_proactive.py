@@ -8,7 +8,11 @@
 """
 
 import importlib.util
+import os
+import sqlite3
 import sys
+import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -139,6 +143,21 @@ check("同消息同分（稳定抖动）", s1 == s2, "%d vs %d" % (s1, s2))
 # ---------------- 纯函数不炸
 check("空消息安全", m.score_interest("")[0] == 0)
 check("None 安全", m.score_interest(None)[0] == 0)
+
+# ---------------- 与 dsh-social 的明确边界联动（只读、按群按人、故障放行）
+social_db = os.path.join(tempfile.mkdtemp(), "social.db")
+con = sqlite3.connect(social_db)
+con.execute("CREATE TABLE relations(group_id TEXT,user_id TEXT,avoid_until REAL,opted_out INTEGER)")
+con.executemany(
+    "INSERT INTO relations VALUES(?,?,?,?)",
+    [("g1", "u1", time.time() + 60, 0), ("g2", "u1", 0, 0)],
+)
+con.commit()
+con.close()
+check("社交边界阻止可选探头", not m.social_allows_proactive("g1", "u1", db=social_db)[0])
+check("社交边界按群隔离", m.social_allows_proactive("g2", "u1", db=social_db)[0])
+check("社交库缺失时故障放行", m.social_allows_proactive("g1", "u1", db=social_db + ".missing")[0])
+check("活跃时段解析可测", m.in_active_hours(0) in (True, False))
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(0 if failed == 0 else 1)

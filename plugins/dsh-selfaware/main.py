@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """dsh-selfaware -- 让大肥鱼知道「我能做什么、刚才做过什么」。
 
 这是一个零侵入旁路插件：不修改其它业务插件，而是在 AstrBot 的主 logger 上挂一个
 logging.Handler，识别那些已经由业务插件写出的成功日志，存进独立 SQLite 行为账本。
 入群审核则直接读取 dsh-joinguard 自己原子落盘的 joinguard.json，避免日志漏行或重复。
 
-每次 LLM 请求最多注入三个事实块：封闭能力表、近期入群审核、近期自身动作。所有块都
-明确是事实而非命令，并受独立字符预算约束；账本或配置坏掉时只跳过，不影响聊天。
+每次 LLM 请求注入封闭能力表、当前机器自我、长期能力经验、近期入群审核和自身动作。
+当前自我来自真实运行遥测与本轮输入，长期经验来自近 30 天成败统计；配置存在绝不冒充
+能力可用。所有块都明确是事实而非命令并受字符预算约束，感知失败不影响聊天。
 
 环境变量：
   DSH_SELFAWARE              总开关，默认 1
@@ -17,7 +20,9 @@ logging.Handler，识别那些已经由业务插件写出的成功日志，存�
   DSH_SELFAWARE_ACTION_MAX   注入最近动作条数，默认 5
   DSH_SELFAWARE_JOIN_MAX     注入最近审核条数，默认 4
   DSH_SELFAWARE_ACTION_AGE   动作回看秒数，默认 86400（24 小时）
-  DSH_SELFAWARE_BUDGET       三块合计字符预算，默认 1100
+  DSH_SELFAWARE_BUDGET       全部事实块字符预算，默认 1400
+  DSH_SELFAWARE_SENSE        短期机器自感知，默认 1
+  DSH_SELFAWARE_LONG         近 30 天长期能力经验，默认 1（只在状态异常或被问自身时注入）
 """
 
 import json
@@ -25,9 +30,25 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
+
+# AstrBot 以文件方式加载插件目录，不保证它是可 import 的 Python 包。
+_PLUGIN_DIR = str(Path(__file__).resolve().parent)
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+from self_model import (  # noqa: E402
+    SelfModel,
+    STATUS_AVAILABLE,
+    STATUS_UNAVAILABLE,
+    inspect_input,
+    render_current_self,
+    render_long_self,
+    render_status as render_sense_status,
+)
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
@@ -65,7 +86,17 @@ JOIN_FILE = os.environ.get(
 )
 ACTION_MAX = _int("DSH_SELFAWARE_ACTION_MAX", 5, 1, 10)
 JOIN_MAX = _int("DSH_SELFAWARE_JOIN_MAX", 4, 1, 8)
-BUDGET = _int("DSH_SELFAWARE_BUDGET", 1300, 500, 2400)
+BUDGET = _int("DSH_SELFAWARE_BUDGET", 1400, 900, 3600)
+SENSE_ENABLED = _flag("DSH_SELFAWARE_SENSE")
+SENSE_LONG_ENABLED = _flag("DSH_SELFAWARE_LONG")
+
+# 长期可靠性是诊断层，不该在每句闲聊里重复背一遍。短期异常仍立即注入；
+# 长期统计只在用户询问自身能力/状态时补充，既保留机器自我精华，又削掉常态冗余。
+_SELF_QUERY_RE = re.compile(
+    r"(?:你|大肥鱼).{0,8}(?:能|会|可以|状态|感觉|感受|身体|运行|在线|正常|故障|稳定|可靠)"
+    r"|(?:能不能|会不会|可不可以).{0,10}(?:画|看|听|说|搜|读|记|发|做)"
+    r"|(?:自我感受|自我认知|能力状态)"
+)
 try:
     ACTION_AGE = max(300.0, float(os.environ.get("DSH_SELFAWARE_ACTION_AGE", "86400")))
 except (TypeError, ValueError):
@@ -77,6 +108,8 @@ CAPABILITY_TEXT = (
     "联网搜索、读网页和B站内容；生成短视频；理解群友发来的图片、视频、链接和合并转发；"
     "记住群友档案并理解本群黑话；作为管理员审核入群、警告/禁言/踢出普通成员；"
     "回戳、欢迎新人、发贴纸，并收藏群里反复出现且能理解含义的表情包；"
+    "在群主明确要求且目标确为当前群成员时，可以把主动戳一戳当作低打扰的社交试探；"
+    "它会先只戳一下等待对方反应，对方回戳或开口后再顺势对话，不会连续骚扰；"
     "引导赞助打赏收款（群友说要赞助/打赏/投喂你时，你会反问用微信还是支付宝并发出对应收款码，"
     "但只有群主确认到账后才会道谢）。"
     "清单外的游戏、比赛、猜拳、打赌等能力都没有，也从未做过。"
@@ -120,6 +153,8 @@ def init_db() -> None:
         con.commit()
     finally:
         con.close()
+    # 自我感知与动作账本共用一个独立库，但表完全隔离。
+    SelfModel(DB).init_db()
 
 
 def add_action(ts: float, kind: str, target: str, summary: str, source: str) -> bool:
@@ -279,15 +314,22 @@ def parse_action(message: str, ts: Optional[float] = None) -> Optional[dict]:
 
 
 class _ActionHandler(logging.Handler):
-    """logger 旁路；emit 内严禁再打日志，否则会递归。"""
+    """logger 旁路：同时捕获真实动作和能力运行遥测。"""
 
     dsh_selfaware_handler = True
 
+    def __init__(self, sense_model: Optional[SelfModel] = None, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.sense_model = sense_model
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            item = parse_action(record.getMessage(), record.created)
+            message = record.getMessage()
+            item = parse_action(message, record.created)
             if item:
                 add_action(**item)
+            if self.sense_model is not None and SENSE_ENABLED:
+                self.sense_model.observe_log(message, record.created)
         except BaseException:
             # 自我记账只是附加能力，磁盘锁/坏日志都不能反过来拖垮业务日志。
             pass
@@ -331,12 +373,22 @@ def render_actions(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_blocks(joins: list[dict], actions: list[dict], budget: Optional[int] = None) -> list[str]:
-    """按重要性装箱：能力必放；历史逐项缩短，绝不截断 XML 标签。"""
+def build_blocks(
+    joins: list[dict],
+    actions: list[dict],
+    budget: Optional[int] = None,
+    sense_blocks: Optional[list[str]] = None,
+) -> list[str]:
+    """按重要性装箱：能力和当前自我优先；其余只放完整 XML 块。"""
     cap = render_capabilities()
     limit = BUDGET if budget is None else max(1, int(budget))
     blocks = [cap]
     used = len(cap)
+
+    for block in sense_blocks or []:
+        if block and used + len(block) <= limit:
+            blocks.append(block)
+            used += len(block)
 
     # 逐条尝试，确保预算不足时保留最新事实而不是硬切半个标签。
     picked_joins = []
@@ -355,7 +407,9 @@ def build_blocks(joins: list[dict], actions: list[dict], budget: Optional[int] =
         if used + len(candidate) <= limit:
             picked_actions.append(row)
     if picked_actions:
-        blocks.append(render_actions(picked_actions))
+        block = render_actions(picked_actions)
+        if used + len(block) <= limit:
+            blocks.append(block)
     return blocks
 
 
@@ -367,15 +421,19 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         self._handler = None
+        self.sense = SelfModel(DB)
         try:
             init_db()
+            if SENSE_ENABLED:
+                self.sense.seed_configuration()
             self._attach_handler()
         except BaseException as exc:
             logger.error("[selfaware] 初始化失败，旁路停用: %r", exc)
         logger.info(
-            "[selfaware] 已加载：%s 群=%s 动作%d条/%.0fh 入群%d条 预算%d字 TextPart=%s",
+            "[selfaware] 已加载：%s 群=%s 动作%d条/%.0fh 入群%d条 预算%d字 自感知=%s 长期=%s TextPart=%s",
             "开" if ENABLED else "关", "、".join(sorted(GROUPS)) or "无",
             ACTION_MAX, ACTION_AGE / 3600, JOIN_MAX, BUDGET,
+            "开" if SENSE_ENABLED else "关", "开" if SENSE_LONG_ENABLED else "关",
             "可用" if TextPart is not None else "降级字符串",
         )
 
@@ -386,9 +444,12 @@ class Main(star.Star):
             # 热重载时旧实例可能还没 terminate；只允许一个账本 handler。
             for handler in logger.handlers:
                 if getattr(handler, "dsh_selfaware_handler", False):
+                    # 热重载后的新实例必须接管旧 handler 的模型引用，否则遥测仍写旧对象。
+                    if isinstance(handler, _ActionHandler):
+                        handler.sense_model = self.sense
                     self._handler = handler
                     return
-            handler = _ActionHandler(level=logging.INFO)
+            handler = _ActionHandler(self.sense, level=logging.INFO)
             logger.addHandler(handler)
             self._handler = handler
 
@@ -404,6 +465,14 @@ class Main(star.Star):
                 pass
         self._handler = None
 
+    def _wants_long_self(self, event, current_block: str) -> bool:
+        """只在异常或明确问自身时带长期统计，避免每轮重复静态诊断。"""
+        text = str(getattr(event, "message_str", "") or "")
+        if _SELF_QUERY_RE.search(text):
+            return True
+        # 当前块只在确有遥测异常时出现这些状态词；“未知”不是故障，不触发长期层。
+        return "=不可用" in current_block or "=降级" in current_block or "=已关闭" in current_block
+
     # priority=100：与 scene/effect 同属事实注入层，拦截型插件放行后才执行。
     @filter.on_llm_request(priority=100)
     async def inject(self, event: AstrMessageEvent, req) -> None:
@@ -416,11 +485,55 @@ class Main(star.Star):
                 return
             _stat["seen"] += 1
             # 现有 guard/joinguard 成功日志没有 group_id。单群部署可安全归属；
-            # 多群时宁可只注入能力表，也不能把甲群成员/审核结果透露给乙群。
+            # 多群时宁可只注入能力和机器自我，也不能跨群泄露成员/审核结果。
             attributable = len(GROUPS) == 1
+            sense_blocks = []
+            if SENSE_ENABLED:
+                # 收到一条实际群消息，足以证明 QQ 入站链路在这一刻可用。
+                self.sense.observe(
+                    "qq", STATUS_AVAILABLE, True, "astrbot_event",
+                    "已收到当前群消息", ts=time.time(),
+                )
+                input_state = inspect_input(req)
+                if input_state.get("image_captioned"):
+                    self.sense.observe(
+                        "vision", STATUS_AVAILABLE, True, "request_context",
+                        "本轮已有成功图片转述", ts=time.time(),
+                    )
+                elif input_state.get("image_failed"):
+                    self.sense.observe(
+                        "vision", STATUS_UNAVAILABLE, False, "request_context",
+                        "本轮图片转述失败", ts=time.time(),
+                    )
+                chat_provider = ""
+                try:
+                    chat_provider = await self.context.get_current_chat_provider_id(
+                        getattr(event, "unified_msg_origin", "") or gid
+                    ) or ""
+                except BaseException:
+                    pass
+                vision_provider = ""
+                try:
+                    cfg = self.context.get_config() or {}
+                    vision_provider = (
+                        cfg.get("provider_settings", {}).get(
+                            "default_image_caption_provider_id", ""
+                        ) or ""
+                    )
+                except BaseException:
+                    pass
+                current_block = render_current_self(
+                    self.sense, gid, str(chat_provider), str(vision_provider), input_state
+                )
+                sense_blocks.append(current_block)
+                if SENSE_LONG_ENABLED and self._wants_long_self(event, current_block):
+                    long_block = render_long_self(self.sense)
+                    if long_block:
+                        sense_blocks.append(long_block)
             blocks = build_blocks(
                 read_join_history() if attributable else [],
                 recent_actions() if attributable else [],
+                sense_blocks=sense_blocks,
             )
             for block in blocks:
                 if TextPart is not None:
@@ -429,7 +542,9 @@ class Main(star.Star):
                     req.extra_user_content_parts.append(block)
             _stat["injected"] += len(blocks)
             logger.info(
-                "[selfaware] 注入 能力=1 入群=%s 动作=%s 共%d块/%d字",
+                "[selfaware] 注入 能力=1 自感知=%s 长期=%s 入群=%s 动作=%s 共%d块/%d字",
+                "1" if any(b.startswith("<current_machine_") for b in blocks) else "0",
+                "1" if any(b.startswith("<long_term_machine_") for b in blocks) else "0",
                 "1" if any(b.startswith("<join_") for b in blocks) else "0",
                 "1" if any(b.startswith("<recent_") for b in blocks) else "0",
                 len(blocks), sum(len(b) for b in blocks),
@@ -437,6 +552,32 @@ class Main(star.Star):
         except BaseException as exc:
             _stat["fail"] += 1
             logger.warning("[selfaware] 注入失败，跳过: %r", exc)
+
+    @filter.on_llm_response()
+    async def observe_chat_response(self, event: AstrMessageEvent, response) -> None:
+        """主模型已产出回复，只记成功事实，不保存回复正文。"""
+        if not ENABLED or not SENSE_ENABLED:
+            return
+        try:
+            gid = str(getattr(event.message_obj, "group_id", "") or "")
+            if gid and gid in GROUPS:
+                self.sense.observe(
+                    "chat", STATUS_AVAILABLE, True, "llm_response",
+                    "本轮文字回复已生成", ts=time.time(),
+                )
+        except BaseException:
+            pass
+
+    @filter.command("自我感受")
+    async def sense_status(self, event: AstrMessageEvent):
+        uid = str(event.get_sender_id() or "")
+        if OWNERS and uid not in OWNERS:
+            yield event.plain_result("这个只有群主能看")
+            return
+        try:
+            yield event.plain_result(render_sense_status(self.sense))
+        except BaseException as exc:
+            yield event.plain_result("自我感受读取失败：%s" % type(exc).__name__)
 
     @filter.command("自我认知状态")
     async def status(self, event: AstrMessageEvent):
@@ -447,11 +588,12 @@ class Main(star.Star):
         try:
             actions = recent_actions(limit=5)
             joins = read_join_history(limit=5)
+            senses = self.sense.latest_states() if SENSE_ENABLED else []
             latest = "；".join(x["summary"] for x in actions[:3]) or "暂无"
             yield event.plain_result(
-                "自我认知%s｜能力表=封闭清单｜近期入群%d条｜近期动作%d条\n"
+                "自我认知%s｜能力表=封闭清单｜自感知%d项｜近期入群%d条｜近期动作%d条\n"
                 "注入 seen=%d blocks=%d fail=%d｜最近：%s"
-                % ("开启" if ENABLED else "关闭", len(joins), len(actions),
+                % ("开启" if ENABLED else "关闭", len(senses), len(joins), len(actions),
                    _stat["seen"], _stat["injected"], _stat["fail"], latest)
             )
         except BaseException as exc:

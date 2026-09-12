@@ -345,6 +345,8 @@ class Main(star.Star):
                 kind, block = "主动开口", _INITIATED
             elif event.get_extra("dsh_proactive"):
                 kind, block = "兴趣探头", _PROACTIVE
+            elif event.get_extra("dsh_poke_probe") or event.get_extra("dsh_poke_probe_feedback"):
+                kind, block = "戳一戳试探反馈", _PROACTIVE
             elif bool(getattr(event, "is_at_or_wake_command", False)):
                 kind, block = "被喊的", _ADDRESSED
             else:

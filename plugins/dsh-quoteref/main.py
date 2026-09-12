@@ -55,7 +55,7 @@ import time
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, Image, Plain, Reply, Video
 from astrbot.core import logger
 
 
@@ -75,6 +75,8 @@ EVERY = max(2, int(os.environ.get("DSH_QUOTEREF_EVERY", "4")))
 COOLDOWN = max(0.0, float(os.environ.get("DSH_QUOTEREF_COOLDOWN", "240")))
 # 引用时把 At 摘掉（真人不会既引用又艾特）
 DROP_AT = _flag("DSH_QUOTEREF_DROP_AT")
+# 带图片/视频的提问更需要明确锚点，直接引用，不等计数；仍受冷却限制。
+MEDIA_ALWAYS = _flag("DSH_QUOTEREF_MEDIA_ALWAYS")
 OWNERS = _set("DSH_QUOTEREF_OWNER", "2774000001")
 
 # 判「像不像提问」。与 dsh-drift 用同一套，已经拿真语料校准过：
@@ -107,7 +109,39 @@ def should_quote(count: int, now: float, last: float,
     return True, "第%d次提问式@，引用" % count
 
 
-_stat = {"addressed": 0, "question": 0, "quoted": 0, "not_yet": 0, "cooling": 0,
+def _input_media_kind(event) -> str:
+    """当前被回复的消息类型；适配器漏掉 Video 时再查 OneBot 原始段。"""
+    obj = getattr(event, "message_obj", None)
+    chain = getattr(obj, "message", None) or ()
+    if any(isinstance(c, Video) for c in chain):
+        return "视频"
+    if any(isinstance(c, Image) for c in chain):
+        return "图片"
+    try:
+        raw = getattr(obj, "raw_message", None)
+        segments = raw.get("message") if isinstance(raw, dict) else getattr(raw, "message", None)
+        types = {
+            str((seg or {}).get("type", "")).lower()
+            for seg in (segments or ()) if isinstance(seg, dict)
+        }
+        if "video" in types:
+            return "视频"
+        if "image" in types:
+            return "图片"
+    except Exception:
+        pass
+    return ""
+
+
+def should_quote_media(now: float, last: float, cooldown: float = None) -> tuple[bool, str]:
+    cooldown = COOLDOWN if cooldown is None else cooldown
+    if last and now - last < cooldown:
+        return False, "媒体回复在冷却（还差%.0fs）" % (cooldown - (now - last))
+    return True, "当前消息带媒体，优先引用"
+
+
+_stat = {"addressed": 0, "question": 0, "quoted": 0, "media_quoted": 0,
+         "not_yet": 0, "cooling": 0,
          "no_msgid": 0, "already": 0, "skip_group": 0, "not_model": 0, "dropped_at": 0}
 _last: list[str] = []
 
@@ -118,10 +152,10 @@ class Main(star.Star):
         self._count: dict[str, int] = {}
         self._last_ts: dict[str, float] = {}
         logger.info(
-            "[quoteref] 已加载：%s 群=%s 每%d次提问式@引用一次 冷却%.0fs 引用时摘@=%s"
-            "（真人实测 6.0%%，这样约 4~5%%）",
+            "[quoteref] 已加载：%s 群=%s 每%d次提问式@引用一次 冷却%.0fs 引用时摘@=%s "
+            "媒体优先=%s（真人实测 6.0%%，普通文字约 4~5%%）",
             "开" if ENABLED else "关", "、".join(sorted(GROUPS)) or "无",
-            EVERY, COOLDOWN, "开" if DROP_AT else "关",
+            EVERY, COOLDOWN, "开" if DROP_AT else "关", "开" if MEDIA_ALWAYS else "关",
         )
 
     @filter.on_decorating_result()
@@ -157,7 +191,11 @@ class Main(star.Star):
             n = self._count.get(gid, 0) + 1
             self._count[gid] = n
             now = time.time()
-            ok, why = should_quote(n, now, self._last_ts.get(gid, 0.0))
+            media_kind = _input_media_kind(event) if MEDIA_ALWAYS else ""
+            if media_kind:
+                ok, why = should_quote_media(now, self._last_ts.get(gid, 0.0))
+            else:
+                ok, why = should_quote(n, now, self._last_ts.get(gid, 0.0))
             if not ok:
                 _stat["cooling" if "冷却" in why else "not_yet"] += 1
                 logger.debug("[quoteref] 不引用：%s", why)
@@ -187,7 +225,11 @@ class Main(star.Star):
             result.chain.insert(0, Reply(id=mid))
             self._last_ts[gid] = now
             _stat["quoted"] += 1
-            brief = "%s｜问的是：%s" % (why, asked[:28])
+            if media_kind:
+                _stat["media_quoted"] += 1
+            brief = "%s%s｜问的是：%s" % (
+                (media_kind + "｜") if media_kind else "", why, asked[:28]
+            )
             _last.append(time.strftime("%H:%M:%S ") + brief)
             del _last[:-8]
             logger.info("[quoteref] 引用回复 msg_id=%s｜%s", mid, brief)
@@ -205,11 +247,11 @@ class Main(star.Star):
         yield event.plain_result(
             "引用回复：%s｜群：%s｜每 %d 次提问式@引用一次｜冷却 %.0fs\n"
             "被@ %d 次，其中像提问 %d 次（本群已数到第 %d 次，还差 %d 次）\n"
-            "已引用 %d 次｜没到次数 %d｜在冷却 %d｜拿不到消息id %d｜引用时摘掉@ %d 次\n"
+            "已引用 %d 次（其中图片/视频 %d）｜没到次数 %d｜在冷却 %d｜拿不到消息id %d｜引用时摘掉@ %d 次\n"
             "参考：本群真人带引用的消息占 6.0%%（96 条里 4 条，3 个人在用）\n"
             "最近：%s"
             % ("开" if ENABLED else "关", "、".join(sorted(GROUPS)) or "无", EVERY, COOLDOWN,
                s["addressed"], s["question"], n, (EVERY - n % EVERY) % EVERY or EVERY,
-               s["quoted"], s["not_yet"], s["cooling"], s["no_msgid"], s["dropped_at"],
+               s["quoted"], s["media_quoted"], s["not_yet"], s["cooling"], s["no_msgid"], s["dropped_at"],
                "｜".join(_last[-3:]) or "还没有")
         )

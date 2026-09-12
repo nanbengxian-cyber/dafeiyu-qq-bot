@@ -23,7 +23,7 @@ P = os.environ.get("DSH_VID_MAIN", "/AstrBot/data/plugins/dsh-video/main.py")
 SRC = io.open(P, encoding="utf-8").read()
 
 NAME_OK = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
-WANT_FN = ("_derive_prompt", "_imperative_gain")
+WANT_FN = ("_derive_prompt", "_imperative_gain", "_video_attachment_hits")
 chunks = []
 for node in ast.parse(SRC).body:
     if isinstance(node, ast.Assign):
@@ -179,3 +179,18 @@ if fails:
         print("  ✗", f)
     sys.exit(f"VIDEO_TEST_FAIL {len(fails)} 项")
 print(f"VIDEO_TEST_OK 该出片 {len(MUST_FIRE)} 条 / 不该出片 {len(MUST_NOT_FIRE)} 条")
+
+# 附件解析必须保留「当前视频/引用视频」身份，避免主模型把引用内容当新视频。
+class _Part:
+    def __init__(self, text):
+        self.text = text
+
+hits = ns["_video_attachment_hits"]([
+    _Part("[Video Attachment: name now.mp4, path /tmp/now.mp4]"),
+    _Part("[Video Attachment in quoted message: name old.mp4, path /tmp/old.mp4]"),
+])
+assert hits == [
+    (0, "now.mp4", "/tmp/now.mp4", False),
+    (1, "old.mp4", "/tmp/old.mp4", True),
+], hits
+print("VIDEO_QUOTED_ATTACHMENT_TEST_OK")

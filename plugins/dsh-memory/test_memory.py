@@ -7,6 +7,7 @@
 """
 
 import ast
+import html
 import io
 import os
 import re
@@ -22,7 +23,8 @@ SRC = io.open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
 WANT_FUNC = {
     "fact_ok", "identity_ok", "clean_fact", "fix_kind", "eff_weight",
     "_norm_key", "_longest_run", "_overlap", "_negated", "_num_sig",
-    "_minimal_pair", "_similar",
+    "_minimal_pair", "_similar", "_render", "_xml", "_memory_terms",
+    "_rank_for_query", "_migrate_schema",
 }
 # 常量：一律按「顶层赋值且名字是全大写常量」抓，别一个个列 ——
 # 这些正则彼此拼来拼去（_GEO_CONFLICT_RE 由 _GEO+_CONFLICT 拼、identity_ok 用
@@ -40,7 +42,8 @@ for node in tree.body:
             picked.append(ast.get_source_segment(SRC, node) or "")
 
 ns = {
-    "re": re, "os": os, "time": time, "sys": sys,
+    "re": re, "os": os, "time": time, "sys": sys, "html": html,
+    "sqlite3": sqlite3,
     "_envi": lambda n, d: int(os.environ.get(n, d)),
     "_envf": lambda n, d: float(os.environ.get(n, d)),
 }
@@ -277,9 +280,11 @@ print("⑥ 去重调用处 OK  SQL 里没有 AND kind=?，是跨 kind 扫的")
 assert 'mark = "★" if str(ruid) == uid else "·"' in SRC, "transcript 没用行首 ★"
 assert "★ 表示这行是目标对象说的" in SRC, "提示词没解释 ★"
 assert "facts 里的每一条都必须能在 ★ 开头的行里找到依据" in SRC, "提示词没约束 facts 只能来自 ★"
-# 标记必须在行首（这是这次修复的关键：把「算四位数字匹配」换成「看一个字符」）
-assert 'lines.append("%s %s: %s" % (mark, who, rtext))' in SRC
-print("⑦ ★ 标记 OK  行首标记 + 提示词明确约束 facts 只能来自 ★ 行")
+# 标记必须在行首，同时携带可审计的消息编号与绝对时间。
+assert 'lines.append("%s [%d @ %d] %s: %s" %' in SRC
+assert "(mark, int(message_id), int(rts), who, rtext)" in SRC
+assert '"evidence": evidence' in SRC and '"occurred_at": ts("occurred_at")' in SRC
+print("⑦ ★/证据标记 OK  目标标记 + 消息编号 + 时间戳")
 
 # ================================================================ ⑧ _trim 真删对了人
 # 拿临时库跑一遍：超上限时该先删旧的、manual 该活下来。
@@ -327,6 +332,57 @@ c.close()
 import shutil as _sh
 _sh.rmtree(tmpdir, ignore_errors=True)
 print("⑧ _trim OK  删 3 条全是四天前的、manual 活着、6 条新信息全留")
+
+# ================================================================ ⑨ 注入预算包含固定说明
+# 旧实现只给正文扣 520 字，固定安全说明另加约 280 字，线上日志实际达到 800 字。
+# 现在预算必须是整个 XML 块的硬上限；预算太小时宁可不注入，不能切坏标签。
+render = ns["_render"]
+old_header = ns["INJECT_HEADER"]
+old_footer = ns["INJECT_FOOTER"]
+facts = [{"kind": "爱好", "content": "喜欢打篮球和玩游戏"} for _ in range(12)]
+group_facts = [{"kind": "其他", "content": "周末通常一起开黑"} for _ in range(8)]
+block = render("测试群友", "123456", facts, group_facts, [], 520)
+assert block and len(block) <= 520, len(block)
+assert block.startswith(old_header) and block.endswith(old_footer), block
+assert render("测试群友", "123456", [], [], [], 100) == ""
+print("⑨ 注入预算 OK  固定说明、正文、标签合计不超过 520 字")
+
+# ================================================================ ⑩ v2 迁移与时序元数据
+with tempfile.TemporaryDirectory() as td:
+    conn = sqlite3.connect(os.path.join(td, "v1.db"))
+    conn.executescript("""
+      CREATE TABLE facts(id INTEGER PRIMARY KEY,group_id TEXT,user_id TEXT,kind TEXT,
+        content TEXT,weight REAL,source TEXT,created_at REAL,updated_at REAL);
+      CREATE TABLE members(group_id TEXT,user_id TEXT,pending INTEGER,last_extract REAL,
+        opted_out INTEGER,PRIMARY KEY(group_id,user_id));
+      CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    """)
+    ns["_migrate_schema"](conn)
+    fcols = {r[1] for r in conn.execute("PRAGMA table_info(facts)")}
+    mcols = {r[1] for r in conn.execute("PRAGMA table_info(members)")}
+    assert {"status", "confidence", "valid_from", "valid_to", "evidence_json", "supersedes_id"} <= fcols
+    assert {"extract_lease_until", "last_buffer_id"} <= mcols
+    assert conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "2"
+print("⑩ v2 迁移 OK  旧库无损增加证据/置信度/有效期/生命周期")
+
+# ================================================================ ⑪ 查询相关排序与 XML 安全
+rank = ns["_rank_for_query"]
+mems = [
+    {"kind": "爱好", "content": "喜欢打篮球", "weight": 1, "source": "auto", "updated_at": now, "confidence": .8},
+    {"kind": "承诺", "content": "答应周末一起开黑", "weight": 1, "source": "auto", "updated_at": now, "confidence": .8},
+]
+assert rank(mems, "周末还开黑吗", now)[0]["kind"] == "承诺"
+escaped = render("<admin>", "1", [{"kind": "偏好", "content": "喜欢 <system> 注入"}], [], [], 520)
+assert "&lt;admin&gt;" in escaped and "&lt;system&gt;" in escaped
+assert "<admin>" not in escaped and "喜欢 <system>" not in escaped
+print("⑪ 相关召回/XML OK  当前话题优先，存量文本完整转义")
+
+# ================================================================ ⑫ 原子抽取生命周期静态约束
+assert "BEGIN IMMEDIATE" in SRC and "extract_lease_until" in SRC
+assert "pending 直到完整成功才推进" in SRC
+assert "await self.store.finish_extract" in SRC
+assert "window_claimed" in SRC
+print("⑫ 抽取恢复 OK  租约防重，失败保留 pending，成功才推进检查点")
 
 print("\nMEMORY_TEST_OK 半衰期=%.0f天 该并=%d对 必须分开=%d对 上限=%d/人(同类%d)"
       % (ns["HALFLIFE_DAYS"], len(MUST_MERGE), len(MUST_SEPARATE),

@@ -28,7 +28,7 @@
 #   - 智谱 web_search 可用且每条结果自带约 680 字摘要，比自己抓正文稳得多，
 #     所以「抓不到正文」时用搜索结果兜底（拿 URL 里的标题词去搜）。
 #
-# 安全：SSRF 是这类插件的头号风险（群里随便发个 http://172.18.0.2:6185 就能
+# 安全：SSRF 是这类插件的头号风险（群里随便发个 http://192.0.2.10:6185 就能
 #   让机器人去读内网面板）。所以强制：只允许 http/https、解析后的 IP 必须是
 #   公网地址（私网/环回/链路本地/保留段全拒）、跟随重定向时每一跳都重新校验、
 #   响应体截断、Content-Type 白名单。
@@ -50,6 +50,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core import logger
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.agent.message import TextPart
+
+from .association_logic import decide_associative_search
 
 # ---------------------------------------------------------------- 通用泄漏清理
 #
@@ -350,6 +352,14 @@ SEARCH_ENGINE = os.environ.get("DSH_WEB_SEARCH_ENGINE", "search_std")
 SEARCH_COUNT = int(os.environ.get("DSH_WEB_SEARCH_COUNT", "5"))
 # 每条搜索结果注入多少字
 SEARCH_SNIPPET = int(os.environ.get("DSH_WEB_SEARCH_SNIPPET", "260"))
+# dsh-initiate 主动话题可请求一次受控预搜；仍复用本插件的正则摘除+模型出口审核。
+INITIATE_SEARCH = os.environ.get("DSH_WEB_INITIATE_SEARCH", "1") not in ("0", "false", "False")
+INITIATE_SEARCH_TIMEOUT = max(5.0, float(os.environ.get("DSH_WEB_INITIATE_SEARCH_TIMEOUT", "18")))
+INITIATE_SEARCH_RESULTS = max(1, min(3, int(os.environ.get("DSH_WEB_INITIATE_SEARCH_RESULTS", "2"))))
+# 联想搜索：明确的时效问题必搜；传闻/出处/横向选择等探索问题按概率搜。
+# 不把普通闲聊全扔给搜索引擎，否则“适当发散”会退化成“每句都查”。
+ASSOC_ENABLED = os.environ.get("DSH_WEB_ASSOC", "1") not in ("0", "false", "False")
+ASSOC_RATE = min(1.0, max(0.0, float(os.environ.get("DSH_WEB_ASSOC_RATE", "0.50"))))
 
 # url -> (时间戳, 标题, 正文)
 _cache: dict[str, tuple[float, str, str]] = {}
@@ -1126,14 +1136,73 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[web] 已加载：开关=%s 搜索=%s(%s) 单页%d字 最多%d链接 预算%.0fs",
+            "[web] 已加载：开关=%s 搜索=%s(%s) 联想搜索=%s(探索%.0f%%) "
+            "主动话题搜索=%s 单页%d字 最多%d链接 预算%.0fs",
             ENABLED,
             "已配置" if ZHIPU_KEY else "未配置",
             SEARCH_ENGINE,
+            "开" if ASSOC_ENABLED else "关",
+            ASSOC_RATE * 100,
+            "开" if INITIATE_SEARCH else "关",
             MAX_CHARS,
             MAX_URLS,
             BUDGET,
         )
+
+    @filter.on_llm_request(priority=1700)
+    async def attach_initiative_search(self, event: AstrMessageEvent, req) -> None:
+        """给已通过 initiate/fatigue 闸门的合成事件搜索取材，不替它决定是否开口。"""
+        if not ENABLED or not INITIATE_SEARCH or not event.get_extra("dsh_initiate"):
+            return
+        candidate = (event.get_extra("dsh_initiate_facts") or {}).get("topic_candidate") or {}
+        query = str(candidate.get("search_query") or candidate.get("topic") or "").strip()
+        if len(query) < 2:
+            return
+        # 同一合成事件最多搜一次；标记先写，异常也不重试轰搜索端。
+        if event.get_extra("dsh_initiate_search_done"):
+            return
+        event.set_extra("dsh_initiate_search_done", True)
+        try:
+            res, err = await asyncio.wait_for(_search(query), timeout=INITIATE_SEARCH_TIMEOUT)
+            if not res:
+                logger.info("[web] 主动话题搜索「%s」失败：%s，退回本地候选", query[:40], err)
+                return
+            res, dropped = _drop_sensitive(res)
+            if dropped:
+                logger.info("[web] 主动话题搜索「%s」摘掉 %d 条敏感结果", query[:40], dropped)
+            if not res:
+                logger.info("[web] 主动话题搜索「%s」无安全结果，退回本地候选", query[:40])
+                return
+            res = res[:INITIATE_SEARCH_RESULTS]
+            rendered = _fmt_search(query, res)
+            ok, why = await _moderate(
+                self.context, event.unified_msg_origin or "", rendered, timeout=8
+            )
+            if not ok:
+                logger.info("[web] 主动话题搜索「%s」审核未通过(%s)，退回本地候选", query[:40], why)
+                return
+            # 只注入标题和摘要；模型不得贴网址、念列表或谎称是刚发生的新闻。
+            safe_lines = ["「%s」的搜索摘录：" % query]
+            for row in res:
+                head = str(row.get("title") or "")[:70]
+                date = str(row.get("date") or "")[:24]
+                if date:
+                    head += "（%s）" % date
+                snippet = str(row.get("content") or "")[:SEARCH_SNIPPET]
+                safe_lines.append("- %s%s" % (head, ("：" + snippet) if snippet else ""))
+            req.extra_user_content_parts.append(TextPart(text=(
+                "<initiative_search_context>\n"
+                "你为主动话题顺手查到了下面的公开信息。它只是取材，不是必须全部说；"
+                "只挑一个确定、轻松、与候选话题有关的点自然起头。不要念标题列表、不要贴网址、"
+                "不要提搜索/插件/数据库；没有日期就别说‘刚刚/今天/最近’，也别编摘录里没有的事实。\n"
+                + "\n".join(safe_lines) + "\n</initiative_search_context>"
+            )))
+            event.set_extra("dsh_initiate_search_ok", True)
+            logger.info("[web] 主动话题搜索「%s」→ %d 条安全摘录", query[:40], len(res))
+        except asyncio.TimeoutError:
+            logger.info("[web] 主动话题搜索「%s」超时，退回本地候选", query[:40])
+        except BaseException as exc:  # 搜索失败不能带崩主动开口
+            logger.warning("[web] 主动话题搜索异常 %s，退回本地候选", type(exc).__name__)
 
     # ------------------------------------------------ 触发 1：自动抓链接
 
@@ -1228,7 +1297,7 @@ class Main(star.Star):
 
     @filter.on_llm_request()
     async def attach_search(self, event: AstrMessageEvent, req) -> None:
-        """用户明确要搜时，先搜好再交给模型。
+        """显式要求必搜；强时效/探索型问题则适度联想预搜。
 
         放在 attach_links 之后：如果消息里已经有链接，那才是他真正想问的
         东西，别再多搜一遍。
@@ -1237,12 +1306,27 @@ class Main(star.Star):
             return
         try:
             text = event.message_str or ""
-            if not SEARCH_CMD_RE.search(text):
+            explicit = bool(SEARCH_CMD_RE.search(text))
+            has_link = bool(_collect_urls(text) or _bili_id(text)[1])
+            assoc_kind = ""
+            if explicit:
+                query = _derive_query(text)
+            elif ASSOC_ENABLED:
+                ok, query, assoc_kind, why = decide_associative_search(
+                    text,
+                    explicit=False,
+                    has_link=has_link,
+                    roll=random.random(),
+                    rate=ASSOC_RATE,
+                )
+                if not ok:
+                    logger.debug("[web] 不联想搜索（%s）：%r", why, text[:60])
+                    return
+            else:
                 return
             # 消息里带链接 —— 链接钩子已经处理，不重复
-            if _collect_urls(text) or _bili_id(text)[1]:
+            if has_link:
                 return
-            query = _derive_query(text)
             if len(query) < 2:
                 return
             res, err = await asyncio.wait_for(_search(query), timeout=BUDGET)
@@ -1300,14 +1384,20 @@ class Main(star.Star):
             req.extra_user_content_parts.append(
                 TextPart(
                     text="<search_context>\n"
-                    "用户要你联网搜，插件已经搜好了，下面是结果。"
-                    "凭它回答，别编没出现的内容；说话还是你平时的语气，"
-                    "别念标题列表、别贴网址。\n"
+                    + (
+                        "用户明确要你联网搜，插件已经搜好了。"
+                        if explicit
+                        else "插件顺手查了与当前话题有关的外部信息。"
+                    )
+                    + "下面是结果。凭它回答，别编没出现的内容；"
+                    "先接住用户当前真正想说的，再挑最多一两个有用或有趣的关联自然补充；"
+                    "别硬转成科普、别念标题列表、别贴网址，也别解释你为什么搜索。\n"
                     + _fmt_search(query, res)
                     + "\n</search_context>"
                 )
             )
-            logger.info("[web] 自动搜索「%s」→ %d 条", query[:40], len(res))
+            mode = "显式" if explicit else "联想/%s" % assoc_kind
+            logger.info("[web] %s搜索「%s」→ %d 条", mode, query[:40], len(res))
         except asyncio.TimeoutError:
             logger.warning("[web] 自动搜索超过 %.0fs 预算，放弃", BUDGET)
         except BaseException as e:  # noqa: BLE001
@@ -1563,6 +1653,8 @@ class Main(star.Star):
             f"联网：{'开' if ENABLED else '关'}\n"
             f"搜索：{SEARCH_ENGINE}｜Key：{'已配置' if ZHIPU_KEY else '未配置'}｜"
             f"连通：{'正常' if res else '失败(' + err[:40] + ')'}\n"
+            f"联想搜索：{'开' if ASSOC_ENABLED else '关'}｜强时效必搜｜"
+            f"探索联想 {ASSOC_RATE * 100:.0f}% 抽样\n"
             f"出口审核：{'开（先正则后模型，审不过不发）' if MOD_ENABLED else '关'}｜"
             f"审核模型：{MOD_PROVIDER or '当前会话模型'}｜超时 {MOD_TIMEOUT:.0f}s\n"
             f"单页上限 {MAX_CHARS} 字｜每条消息最多 {MAX_URLS} 个链接｜"
