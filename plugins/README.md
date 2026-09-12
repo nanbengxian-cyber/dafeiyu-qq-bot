@@ -130,7 +130,7 @@ python3 dsh-emotion/test_emotion.py         # 36 项:抽取规则 + 状态机 + 
 python3 dsh-fwd/test_fwd.py                 # 嵌套展开 + 保头保尾 + 图片视频预算
 python3 dsh-glossary/test_glossary.py       # 真命中 + 防假命中 + 注入块形状 + 说明文字不许膨胀
 python3 dsh-guard/test_guard.py             # 关键词预筛 + 决策函数
-python3 dsh-guard/test_mood.py              # 113 项:五路状态→宽容度 + 档位/门槛/时长边界
+python3 dsh-guard/test_mood.py              # 116 项:五路状态→宽容度 + 档位/门槛/时长边界
 python3 dsh-guard/test_mood_check.py        # 47 项:跑真实 check()（假事件+桩判定+影子模式，不碰真群）
 python3 dsh-interest/test_interest.py       # 热度计算 + 口味轮换 + 注入预算
 python3 dsh-leakguard/test_leakguard.py     # 强/弱标题档 + 指令句影子层
