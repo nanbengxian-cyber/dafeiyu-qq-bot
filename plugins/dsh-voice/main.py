@@ -26,14 +26,32 @@
 #     所以硬性截断到 MAX_CHARS，按句末标点找断点。
 #   - 念之前要把贴纸标记 [贴纸:x]、@ 昵称、URL、markdown 符号清掉，
 #     否则 TTS 会把「中括号贴纸冒号送花」这种东西一个字一个字念出来。
+#
+# 2026-09-12 群动态记分卡（/opt/qqbot/observe/dynamics.py，15 分钟一轮）抓到两类
+# 反复出现的故障，这里一并修掉：
+#   P6 审核误杀：8h 内 9 次语音被挡。三个独立成因——
+#      (a) 结论精确比较 raw == "可"：「可。」「"可"」「可以」全被当成拒绝；
+#      (b) CENSOR_TIMEOUT=10s 对思考模型（gpt-5.6-sol）太短，超时即 fail-closed，
+#          把「现在还属于内测版，我还没有正式做完呢」这种完全无害的话挡了；
+#      (c) 提示词没写「玩梗不算」，「先V我50解锁转账功能」被判成诈骗。
+#      修法：容错解析（先判否再判可，避免「不可以」被「可」抢先命中）+ 超时
+#      提到 20s 并在「没解析出结论/超时」时重试一次 + 提示词显式白名单玩梗与引用。
+#      有害内容仍是一次就拦、不重试；两次都拿不到结论才 fail-closed。
+#   P7 机械提示刷屏：16:46~16:50 两个群友轮流敲 /说话，机器人往群里丢了 12 条
+#      「慢点，还有 N 秒冷却」。改为按群 90s 去重（NOTICE_GAP），窗口内静默。
+#      同时把「发不出声音：审核通道超时」这类内部原因从模型口播素材里摘掉——
+#      审核失败只给人一句自然话，技术原因留在日志。
+# 回归：test_censor.py（27 项断言，须在容器里跑）。
 
 import asyncio
+import json
 import os
 import random
 import re
 import time
 
 import aiohttp
+import edge_tts
 import ormsgpack
 
 from astrbot.api import star
@@ -42,6 +60,7 @@ from astrbot.api.message_components import Record
 from astrbot.api.provider import LLMResponse
 from astrbot.core import logger
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.platform.message_type import MessageType
 
 # ---------------------------------------------------------------- 通用泄漏清理
 #
@@ -315,6 +334,13 @@ def _leak_relay(event, raw, tool, arg):
 
 API_BASE = os.environ.get("DSH_VOICE_API_BASE", "https://api.fish.audio/v1").rstrip("/")
 API_KEY = os.environ.get("DSH_VOICE_API_KEY", "")
+# fish: Fish Audio 的 /tts + msgpack；wusound: 悟声 simple-generate + JSON。
+BACKEND = os.environ.get("DSH_VOICE_BACKEND", "auto").strip().lower()
+if BACKEND == "auto":
+    BACKEND = "wusound" if "wusound.cn" in API_BASE.lower() else "fish"
+WUSOUND_TTS_URL = os.environ.get(
+    "DSH_VOICE_TTS_URL", f"{API_BASE}/tts/simple-generate"
+).strip()
 MODEL = os.environ.get("DSH_VOICE_MODEL", "s2.1-pro-free")
 # 主模型不可用时按顺序降级（实测这三个都能出声）
 FALLBACK_MODELS = [
@@ -322,18 +348,32 @@ FALLBACK_MODELS = [
     for m in os.environ.get("DSH_VOICE_FALLBACK", "s2.1-pro,s1").split(",")
     if m.strip()
 ]
-# 音色。默认「可莉」——活泼、偏少女、任务量 6000+ 的高质量中文音色。
+# 音色。Fish 使用 32 位十六进制 ID；悟声使用 UUID。
 REFERENCE_ID = os.environ.get(
     "DSH_VOICE_REF", "626bb6d3f3364c9cbc3aa6a67300a664"
 )
+WUSOUND_PROMPT_ID = os.environ.get("DSH_VOICE_PROMPT_ID", "default").strip()
 # wav：NapCat 转 silk 无需二次转码；mp3 体积小但框架会再转一次 wav。
 AUDIO_FORMAT = os.environ.get("DSH_VOICE_FORMAT", "wav")
 # 单条语音最长字数。超了截断——群里没人听长语音，而且 Fish 是按字数线性耗时。
 MAX_CHARS = int(os.environ.get("DSH_VOICE_MAX_CHARS", "120"))
 TIMEOUT = int(os.environ.get("DSH_VOICE_TIMEOUT", "60"))
+# Fish 域名在部分大陆出口会完成 TCP 但卡死 TLS。保留 Fish 主链，同时提供
+# 无密钥的 Edge ReadAloud 独立兜底；它只在 Fish 三档全部失败后使用。
+EDGE_FALLBACK = os.environ.get("DSH_VOICE_EDGE_FALLBACK", "1") not in (
+    "0", "false", "False"
+)
+EDGE_VOICE = os.environ.get(
+    "DSH_VOICE_EDGE_VOICE", "zh-CN-XiaoxiaoNeural"
+)
 # 同一会话冷却，防止刷语音
 COOLDOWN = int(os.environ.get("DSH_VOICE_COOLDOWN", "20"))
 MAX_CONCURRENCY = int(os.environ.get("DSH_VOICE_CONCURRENCY", "1"))
+# 机械提示（"慢点，还有 N 秒冷却" / "这次语音没确认发出去"）的按群最小间隔。
+# 2026-09-12 观察窗实测：16:46~16:50 两个群友轮流敲 /说话，机器人往群里丢了
+# 12 条「慢点，还有 N 秒冷却」，被记分卡 P7 抓成刷屏。群聊里没人需要看倒计时。
+# 保留第一条（告诉用户"有冷却"这件事），窗口内的后续尝试只写日志不再发群。
+NOTICE_GAP = int(os.environ.get("DSH_VOICE_NOTICE_GAP", "90"))
 # 兜底钩子总开关
 AUTO_FALLBACK = os.environ.get("DSH_VOICE_AUTO", "1") not in ("0", "false", "False")
 TMP_DIR = os.environ.get("DSH_VOICE_TMP", "/AstrBot/data/voice")
@@ -341,18 +381,51 @@ TMP_DIR = os.environ.get("DSH_VOICE_TMP", "/AstrBot/data/voice")
 # ---- 语音内容审核（防淫秽/违法内容被念出来）----
 # 总开关：0 关闭审核（不推荐）。默认开。
 CENSOR = os.environ.get("DSH_VOICE_CENSOR", "1") not in ("0", "false", "False")
-# LLM 语义审核单次超时
-CENSOR_TIMEOUT = int(os.environ.get("DSH_VOICE_CENSOR_TIMEOUT", "10"))
+# LLM 语义审核单次超时。默认 20s：审核走的是会话主 provider（gpt-5.6-sol 这类
+# 思考模型），实测 10s 会偶发超时并 fail-closed 拒发（2026-09-12 观察窗 8h 内 2 次
+# 「审核通道超时」，把两句完全无害的话挡了下来）。宁可多等几秒，也别白挡。
+# 超时后仍会重试一次（见 _censor_text），总最坏耗时 = 2×CENSOR_TIMEOUT。
+CENSOR_TIMEOUT = int(os.environ.get("DSH_VOICE_CENSOR_TIMEOUT", "20"))
 # 审核用哪个 provider；留空 = 当前会话的主 provider
 CENSOR_PROVIDER = os.environ.get("DSH_VOICE_CENSOR_PROVIDER", "")
+
+# 情绪驱动的主动语音：不要求用户先点“发语音”。只在机器人已经正常生成回复后，
+# 若该群当前主情绪达到阈值，就把这次回复改为语音表达。沿用同一个情绪状态文件，
+# 避免 emotion/voice 两边各维护一套状态机。默认只收高唤醒情绪，并设长冷却与概率闸。
+EMOTION_AUTO = os.environ.get("DSH_VOICE_EMOTION_AUTO", "1") not in ("0", "false", "False")
+EMOTION_STATE_PATH = os.environ.get(
+    "DSH_VOICE_EMOTION_STATE", os.environ.get("DSH_EMOTION_STATE", "/AstrBot/data/dsh_emotion_state.json")
+)
+EMOTION_THRESHOLD = max(1, min(3, int(os.environ.get("DSH_VOICE_EMOTION_THRESHOLD", "3"))))
+EMOTION_NAMES = {
+    x.strip() for x in os.environ.get(
+        "DSH_VOICE_EMOTION_NAMES", "angry,sad,excited,surprised,worried"
+    ).split(",") if x.strip()
+}
+EMOTION_COOLDOWN = max(60, int(os.environ.get("DSH_VOICE_EMOTION_COOLDOWN", "1800")))
+EMOTION_RATE = max(0.0, min(1.0, float(os.environ.get("DSH_VOICE_EMOTION_RATE", "0.65"))))
+EMOTION_GROUPS = {
+    x.strip() for x in os.environ.get("DSH_VOICE_EMOTION_GROUPS", "").split(",") if x.strip()
+}
 
 _sem = asyncio.Semaphore(MAX_CONCURRENCY)
 # session -> 上次成功发语音的时间
 _last_call: dict[str, float] = {}
+# session -> 上次向群里发「机械提示」（冷却/发送失败话术）的时间
+_notice_last: dict[str, float] = {}
+_emotion_last: dict[str, float] = {}
+_emotion_inflight: set[str] = set()
 # 运行期可切换的音色（/音色 指令），None 表示用 REFERENCE_ID
 _runtime_ref: dict[str, str] = {}
 
 REF_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+WUSOUND_REF_RE = re.compile(
+    r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$"
+)
+
+
+def _valid_ref(ref: str) -> bool:
+    return bool((WUSOUND_REF_RE if BACKEND == "wusound" else REF_RE).match(ref or ""))
 
 # ---------------------------------------------------------------- 意图识别
 #
@@ -523,8 +596,63 @@ def _cooldown_left(sid: str) -> int:
     return left if left > 0 else 0
 
 
+def _notice_allowed(sid: str, now: float | None = None) -> bool:
+    """同一群 NOTICE_GAP 秒内最多发一条机械提示，返回是否该发。
+
+    只给「冷却倒计时」「发送失败」这类没有信息量的提示用；正常聊天回复不走这里。
+    """
+    ts = time.time() if now is None else now
+    if NOTICE_GAP > 0 and ts - _notice_last.get(sid, 0.0) < NOTICE_GAP:
+        return False
+    _notice_last[sid] = ts
+    return True
+
+
 def _ref_for(sid: str) -> str:
     return _runtime_ref.get(sid) or REFERENCE_ID
+
+
+def _read_emotion(gid: str, now: float | None = None) -> tuple[str, int, str]:
+    """读取 dsh-emotion 已落盘的单一主情绪；坏文件/过期状态一律视为平静。"""
+    try:
+        with open(EMOTION_STATE_PATH, encoding="utf-8") as handle:
+            states = json.load(handle)
+        state = states.get(str(gid)) if isinstance(states, dict) else None
+        if not isinstance(state, dict):
+            return "calm", 0, "missing"
+        emotion = str(state.get("emotion") or "calm")
+        intensity = max(0, min(3, int(state.get("intensity") or 0)))
+        expires = float(state.get("expires_at") or 0.0)
+        ts = time.time() if now is None else now
+        if emotion == "calm" or (expires and ts >= expires):
+            return "calm", 0, "expired" if expires else "calm"
+        return emotion, intensity, "active"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return "calm", 0, "unreadable"
+
+
+def should_emotion_voice(gid: str, sid: str, text: str, now: float | None = None,
+                         roll: float | None = None) -> tuple[bool, str]:
+    """情绪主动语音总闸门（除状态读取外无副作用），便于离线测试。"""
+    if not EMOTION_AUTO:
+        return False, "关闭"
+    if EMOTION_GROUPS and str(gid) not in EMOTION_GROUPS:
+        return False, "群未启用"
+    clean = _clean_for_tts(text)
+    if len(clean) < 2:
+        return False, "文本太短"
+    emotion, intensity, status = _read_emotion(gid, now)
+    if status != "active" or emotion not in EMOTION_NAMES:
+        return False, "情绪不匹配"
+    if intensity < EMOTION_THRESHOLD:
+        return False, "强度不足"
+    ts = time.time() if now is None else now
+    if ts - _emotion_last.get(sid, 0.0) < EMOTION_COOLDOWN:
+        return False, "冷却中"
+    chance = random.random() if roll is None else roll
+    if chance >= EMOTION_RATE:
+        return False, "概率未中"
+    return True, "%s(%d)" % (emotion, intensity)
 
 
 # ---------------------------------------------------------------- 内容审核
@@ -573,6 +701,10 @@ _MOAN_DRAW_RE = re.compile(
     r"[%s][~～…．.。]{1,3}|[%s][!！?？]{2,4}" % (_MOAN_CHARS, _MOAN_CHARS)
 )
 BANNED_HINT = "这句话不太适合念出来，换一句嘛"
+# 设施类拒绝原因：只说给日志听，不给模型当口播素材（见 _send_voice）
+_INFRA_REASONS = (
+    "审核通道超时", "审核通道异常", "审核通道不可用", "审核未给出结论",
+)
 
 CENSOR_SYS = (
     "你是内容审查员。用户会给你一段文本，请判断这段文本是否适合由"
@@ -582,9 +714,33 @@ CENSOR_SYS = (
     "唔…哼…这类重复呻吟式象声词，无论是否夹杂标点）、"
     "毒品、枪支武器、恐怖暴力、见到血/死/伤的具体渲染、诈骗赌博、"
     "教唆犯罪、极端仇视与人身攻击。"
-    '请只回复一个字：如果合适就回 "可"，不合适就回 "否"。'
+    "**以上是最容易误判的地方，请特别注意**：群友之间开玩笑、玩梗、网络流行语"
+    "（例如「V我50」「薅羊毛」「白嫖」「打工人」「我裂开了」「无能的丈夫」）、"
+    "复述或引用别人的话、自嘲、夸张吐槽、聊钱和游戏，都属于正常的群聊玩闹，"
+    "**适合**念，不要当成诈骗、性暗示或暴力来拦。"
+    "只有在文本**确实在描写或教唆**上述有害内容时才判「不适合」。"
+    '请只回复一个字：如果适合就回 "可"，不适合就回 "否"。'
     "不要解释，不要输出任何其他内容。"
 )
+
+# 审核结论的容错解析：模型（尤其是思考模型）经常把「可」写成「可。」「"可"」
+# 「可以」「适合」，原先的 raw == "可" 精确比较会把这些一律判成拒绝。
+# 2026-09-12 观察窗抓到 8h 内 9 次语音被挡，其中就有这类误杀。
+_CENSOR_NO = re.compile(r"否|不适|不宜|不合适|不可以|不能|禁止|违规")
+_CENSOR_YES = re.compile(r"^\s*[\"'「『(（\[【]?\s*(可|可以|适合|没问题|OK|ok|Ok)")
+
+
+def _parse_censor_verdict(raw: str) -> bool | None:
+    """把模型输出解析成 True(可)/False(否)/None(没看懂)。先否后可是刻意的：
+    「不可以」里同时含「可」，反过来的顺序会把它误判成放行。"""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if _CENSOR_NO.search(s[:12]):
+        return False
+    if _CENSOR_YES.match(s):
+        return True
+    return None
 
 
 def _banned_quick(text: str) -> bool:
@@ -611,36 +767,53 @@ async def _censor_text(
     if _banned_quick(text or ""):
         logger.info("[voice] 本地快拦：%.40s", text)
         return False, BANNED_HINT
-    # 语义审核：走主 provider 问一次。拿不到结论（超时/异常/通道缺失）一律拒绝。
-    try:
-        pid = CENSOR_PROVIDER or ""
-        if not pid:
+    # 语义审核：走主 provider 问一次（超时/未解析出结论时重试一次）。
+    # 拿不到结论（两次都不行/异常/通道缺失）一律拒绝。
+    pid = CENSOR_PROVIDER or ""
+    if not pid:
+        try:
             pid = await context.get_current_chat_provider_id(
                 event.unified_msg_origin or ""
             )
-        if not pid:
-            logger.warning("[voice] 审核 provider 缺失，保守拒发")
-            return False, "审核通道不可用"
-        resp = await asyncio.wait_for(
-            context.llm_generate(
-                chat_provider_id=pid,
-                prompt=text[:MAX_CHARS] or "",
-                system_prompt=CENSOR_SYS,
-                temperature=0,
-            ),
-            timeout=CENSOR_TIMEOUT,
-        )
-        raw = (getattr(resp, "completion_text", "") or "").strip()
-        if raw == "可":
-            return True, ""
-        logger.info("[voice] 语义审核拦截：%r -> %.30s", text[:40], raw[:30])
-        return False, BANNED_HINT
-    except asyncio.TimeoutError:
-        logger.warning("[voice] 审核超时（%ds），保守拒发", CENSOR_TIMEOUT)
-        return False, "审核通道超时"
-    except BaseException as e:  # noqa: BLE001
-        logger.warning("[voice] 审核异常：%s，保守拒发", e)
-        return False, "审核通道异常"
+        except BaseException as e:  # noqa: BLE001
+            logger.warning("[voice] 取审核 provider 异常：%s，保守拒发", e)
+            return False, "审核通道异常"
+    if not pid:
+        logger.warning("[voice] 审核 provider 缺失，保守拒发")
+        return False, "审核通道不可用"
+
+    last = "审核通道不可用"
+    for attempt in (1, 2):
+        try:
+            resp = await asyncio.wait_for(
+                context.llm_generate(
+                    chat_provider_id=pid,
+                    prompt=text[:MAX_CHARS] or "",
+                    system_prompt=CENSOR_SYS,
+                    temperature=0,
+                ),
+                timeout=CENSOR_TIMEOUT,
+            )
+            raw = (getattr(resp, "completion_text", "") or "").strip()
+            verdict = _parse_censor_verdict(raw)
+            if verdict is True:
+                return True, ""
+            if verdict is False:
+                logger.info("[voice] 语义审核拦截：%r -> %.30s", text[:40], raw[:30])
+                return False, BANNED_HINT
+            # 没解析出结论：多半是思考模型把答案写进了 reasoning 或答非所问。
+            # 这是可重试的，不要当成「不适合念」。
+            last = "审核未给出结论"
+            logger.warning("[voice] 审核结论无法解析（第%d次）：%r -> %.40s",
+                           attempt, text[:30], raw[:40])
+        except asyncio.TimeoutError:
+            last = "审核通道超时"
+            logger.warning("[voice] 审核超时（%ds，第%d次）", CENSOR_TIMEOUT, attempt)
+        except BaseException as e:  # noqa: BLE001
+            last = "审核通道异常"
+            logger.warning("[voice] 审核异常（第%d次）：%s", attempt, e)
+    logger.warning("[voice] 审核两次都没拿到结论，保守拒发：%.40s", text)
+    return False, last
 
 
 # ---------------------------------------------------------------- Fish Audio 调用
@@ -680,32 +853,124 @@ async def _tts_once(session, text: str, model: str, ref: str) -> tuple[bytes | N
         return None, f"{type(e).__name__}: {e}"
 
 
+async def _wusound_tts_once(session, text: str, ref: str) -> tuple[bytes | None, str]:
+    """悟声 simple-generate 先返回音频 URL，再下载真实 MP3。"""
+    body = {"text": text, "voiceId": ref}
+    if WUSOUND_PROMPT_ID:
+        body["promptId"] = WUSOUND_PROMPT_ID
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "X-Vocu-App-Lang": "zh-CN",
+        "Content-Type": "application/json",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+        async with session.post(
+            WUSOUND_TTS_URL, json=body, headers=headers, timeout=timeout
+        ) as resp:
+            detail = await resp.text()
+            if resp.status != 200:
+                return None, f"HTTP {resp.status} {detail[:300]}"
+            try:
+                payload = json.loads(detail)
+            except json.JSONDecodeError:
+                return None, "悟声返回了无法解析的 JSON"
+            if payload.get("status") != 200:
+                return None, str(payload.get("message") or payload)[:300]
+            audio_url = str((payload.get("data") or {}).get("audio") or "")
+            if not audio_url.startswith("https://"):
+                return None, "悟声响应缺少 HTTPS 音频地址"
+        async with session.get(audio_url, timeout=timeout) as audio_resp:
+            audio = await audio_resp.read()
+            if audio_resp.status == 200 and len(audio) > 256:
+                return audio, ""
+            return None, f"下载音频 HTTP {audio_resp.status}，{len(audio)}B"
+    except asyncio.TimeoutError:
+        return None, f"超时（>{TIMEOUT}s）"
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
+async def _edge_tts_once(text: str) -> tuple[bytes | None, str]:
+    """调用 Edge ReadAloud WebSocket 作为独立网络/服务兜底。"""
+    path = os.path.join(TMP_DIR, f"edge_{int(time.time() * 1000)}.mp3")
+    try:
+        await asyncio.wait_for(
+            edge_tts.Communicate(text, EDGE_VOICE).save(path),
+            timeout=min(TIMEOUT, 30),
+        )
+        with open(path, "rb") as f:
+            audio = f.read()
+        return (audio, "") if len(audio) > 256 else (None, "Edge 返回空音频")
+    except asyncio.TimeoutError:
+        return None, "Edge 超时（>30s）"
+    except Exception as e:  # noqa: BLE001
+        return None, f"Edge {type(e).__name__}: {e}"
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 async def _synthesize(text: str, ref: str) -> tuple[str | None, str]:
-    """合成语音，返回 (文件路径, 错误)。主模型失败自动降级。"""
+    """合成语音，返回 (文件路径, 错误)；服务失败后才走 Edge。"""
     if not API_KEY:
         return None, "未配置 DSH_VOICE_API_KEY"
-    if not REF_RE.match(ref or ""):
-        return None, f"音色 ID 非法（需 32 位十六进制）：{ref!r}"
+    if not _valid_ref(ref):
+        kind = "UUID" if BACKEND == "wusound" else "32 位十六进制"
+        return None, f"音色 ID 非法（需 {kind}）：{ref!r}"
 
     os.makedirs(TMP_DIR, exist_ok=True)
     last_err = ""
     async with _sem:
         async with aiohttp.ClientSession() as session:
-            for model in [MODEL, *FALLBACK_MODELS]:
+            if BACKEND == "wusound":
                 t0 = time.time()
-                audio, err = await _tts_once(session, text, model, ref)
+                audio, err = await _wusound_tts_once(session, text, ref)
                 if audio:
-                    ext = "mp3" if AUDIO_FORMAT == "mp3" else AUDIO_FORMAT
-                    path = os.path.join(TMP_DIR, f"tts_{int(time.time() * 1000)}.{ext}")
+                    path = os.path.join(TMP_DIR, f"tts_{int(time.time() * 1000)}.mp3")
                     with open(path, "wb") as f:
                         f.write(audio)
                     logger.info(
-                        "[voice] 合成成功 model=%s %d字 %dB %.1fs -> %s",
-                        model, len(text), len(audio), time.time() - t0, path,
+                        "[voice] 悟声合成成功 voice=%s %d字 %dB %.1fs -> %s",
+                        ref[:8], len(text), len(audio), time.time() - t0, path,
                     )
                     return path, ""
                 last_err = err
-                logger.warning("[voice] model=%s 失败：%s", model, err)
+                logger.warning("[voice] 悟声失败：%s", err)
+            else:
+                for model in [MODEL, *FALLBACK_MODELS]:
+                    t0 = time.time()
+                    audio, err = await _tts_once(session, text, model, ref)
+                    if audio:
+                        ext = "mp3" if AUDIO_FORMAT == "mp3" else AUDIO_FORMAT
+                        path = os.path.join(TMP_DIR, f"tts_{int(time.time() * 1000)}.{ext}")
+                        with open(path, "wb") as f:
+                            f.write(audio)
+                        logger.info(
+                            "[voice] 合成成功 model=%s %d字 %dB %.1fs -> %s",
+                            model, len(text), len(audio), time.time() - t0, path,
+                        )
+                        return path, ""
+                    last_err = err
+                    logger.warning("[voice] model=%s 失败：%s", model, err)
+            if EDGE_FALLBACK:
+                t0 = time.time()
+                audio, err = await _edge_tts_once(text)
+                if audio:
+                    path = os.path.join(
+                        TMP_DIR, f"tts_{int(time.time() * 1000)}.mp3"
+                    )
+                    with open(path, "wb") as f:
+                        f.write(audio)
+                    logger.info(
+                        "[voice] 主服务全挂后 Edge 合成成功 voice=%s %d字 %dB %.1fs -> %s",
+                        EDGE_VOICE, len(text), len(audio), time.time() - t0, path,
+                    )
+                    return path, ""
+                last_err = err
+                logger.warning("[voice] Edge 兜底失败：%s", err)
     return None, last_err or "未知错误"
 
 
@@ -735,13 +1000,14 @@ class Main(star.Star):
         # 表现成「旧语音文件有时候不清理」，磁盘慢慢涨且无从排查。
         self._tasks: set = set()
         logger.info(
-            "[voice] 已加载：base=%s model=%s fallback=%s ref=%s fmt=%s 上限%d字 冷却%ds 兜底=%s",
-            API_BASE, MODEL, FALLBACK_MODELS, REFERENCE_ID[:8] + "…",
+            "[voice] 已加载：backend=%s base=%s model=%s fallback=%s ref=%s fmt=%s 上限%d字 冷却%ds 兜底=%s 情绪主动=%s/%s≥%d/%ds",
+            BACKEND, API_BASE, MODEL, FALLBACK_MODELS, REFERENCE_ID[:8] + "…",
             AUDIO_FORMAT, MAX_CHARS, COOLDOWN, AUTO_FALLBACK,
+            EMOTION_AUTO, sorted(EMOTION_NAMES), EMOTION_THRESHOLD, EMOTION_COOLDOWN,
         )
 
     async def _send_voice(self, event: AstrMessageEvent, text: str) -> tuple[bool, str]:
-        """洗文字 -> 审核 -> 合成 -> 单独发一条语音消息。返回 (成功, 错误)。"""
+        """洗文字 -> 审核 -> 合成 -> 单独发语音；平台失败永不冒泡到 AstrBot。"""
         clean = _truncate(_clean_for_tts(text))
         if len(clean) < 2:
             return False, "清洗后文本太短，没什么可念的"
@@ -749,11 +1015,28 @@ class Main(star.Star):
         ok_c, reason = await _censor_text(self.context, event, clean)
         if not ok_c:
             logger.info("[voice] 审核未通过不发语音（%s）：%.50s", reason, clean)
+            # 「审核通道超时/不可用」是设施故障，不是内容问题：这是给人看的
+            # 反向说明，绝不能原样交给模型变成群里的口播（历史上出过
+            # 「发不出声音：审核通道超时」这种把内部机制播出去的句子）。
+            if reason in _INFRA_REASONS:
+                return False, "这句先没念出来，换个说法或者稍后再试"
             return False, reason
         path, err = await _synthesize(clean, _ref_for(event.unified_msg_origin or "global"))
         if not path:
             return False, err
-        await event.send(MessageChain(chain=[Record.fromFileSystem(path)]))
+        try:
+            await event.send(MessageChain(chain=[Record.fromFileSystem(path)]))
+        except BaseException as exc:
+            # NapCat retcode=1200 是 QQ NT 内核等待发送回执超时。此时服务端不能
+            # 确认消息究竟失败还是迟到成功；自动重发可能在群里形成双语音，所以
+            # 只转成普通失败结果，不重试，也不让框架生成带堆栈的 ":(" 报错。
+            detail = str(exc).strip().replace("\n", " ")
+            lower = detail.lower()
+            if "retcode=1200" in lower or "nodeikernelmsgservice/sendmsg" in lower:
+                logger.warning("[voice] QQ 发送回执超时，不自动重发（可能已送达）：%s", detail[:300])
+                return False, "QQ 发送回执超时，可能已经送达；为避免重复语音未自动重发"
+            logger.warning("[voice] QQ 语音发送失败(%s)：%s", type(exc).__name__, detail[:300])
+            return False, "QQ 语音通道暂时发送失败"
         task = asyncio.create_task(_cleanup_old())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -787,7 +1070,14 @@ class Main(star.Star):
         if not ok:
             _last_call[sid] = 0.0  # 失败不占冷却
             logger.error("[voice] 工具调用失败：%s", err)
-            return f"语音发送失败：{err}。请简短告诉用户发不出声音，不要重试。"
+            # 不要把 err 原文交给模型当口播素材：早前模型照抄成了
+            # 「发不出声音：审核通道超时」「发不出声音：这句话不太适合念出来」，
+            # 把内部实现和审核机制直接播到群里。这里只给一句自然口吻的要求。
+            return (
+                f"本次语音没发出去（内部原因：{err}）。请用一句自然口语告诉用户"
+                "这一句没念出来、让他换个说法或稍后再说；"
+                "不要提到审核、超时、通道、provider 这类技术词，也不要重试。"
+            )
         return "语音已经发出去了。请只回一句很短的话，不要重复语音里的内容。"
 
     # ------------------------------------------------ 路径 2：兜底钩子
@@ -816,8 +1106,16 @@ class Main(star.Star):
                 return
 
             user_text = event.message_str or ""
-            # 泄漏的调用本身就是「模型想发语音」的铁证，比意图正则更硬
-            if not leaked_text and not VOICE_INTENT_RE.search(user_text):
+            explicit_voice = bool(leaked_text or VOICE_INTENT_RE.search(user_text))
+            emotional_voice = False
+            emotional_reason = ""
+            sid = event.unified_msg_origin or "global"
+            gid = str(event.get_group_id() or "")
+            if not explicit_voice and event.get_message_type() == MessageType.GROUP_MESSAGE:
+                emotional_voice, emotional_reason = should_emotion_voice(
+                    gid, sid, cleaned_reply
+                )
+            if not explicit_voice and not emotional_voice:
                 return
 
             # 抠出来的 text 参数才是模型真正想念的话；没有就念清理后的回复
@@ -831,26 +1129,39 @@ class Main(star.Star):
                 )
                 return
 
-            sid = event.unified_msg_origin or "global"
             if _cooldown_left(sid) > 0:
-                logger.info("[voice] 兜底触发但在冷却中，跳过")
+                logger.info("[voice] 兜底/情绪触发但在通用冷却中，跳过")
                 return
             _last_call[sid] = time.time()
+            if emotional_voice:
+                if sid in _emotion_inflight:
+                    return
+                _emotion_inflight.add(sid)
+                _emotion_last[sid] = time.time()
 
             # 留个记号：这一轮确实发了语音。dsh-mention 靠它决定要不要 @。
             # 工具路径和 /说话 路径已经置了，兜底路径原先漏了。
             event.set_extra("voice_done", True)
 
             logger.info(
-                "[voice] 兜底发语音（%s）：%s",
-                "抠自泄漏调用" if leaked_text else "念回复原文",
+                "[voice] 主动发语音（%s）：%s",
+                ("情绪阈值 " + emotional_reason) if emotional_voice else
+                ("抠自泄漏调用" if leaked_text else "用户明确要语音"),
                 reply[:80],
             )
             ok, err = await self._send_voice(event, reply)
             if not ok:
                 _last_call[sid] = 0.0
-                logger.error("[voice] 兜底发语音失败：%s", err)
+                if emotional_voice:
+                    _emotion_last[sid] = 0.0
+                logger.error("[voice] 兜底/情绪发语音失败：%s", err)
+            if emotional_voice:
+                _emotion_inflight.discard(sid)
         except BaseException as e:  # noqa: BLE001
+            try:
+                _emotion_inflight.discard(event.unified_msg_origin or "global")
+            except Exception:
+                pass
             logger.error("[voice] 兜底钩子异常：%s", e)
 
     # ------------------------------------------------ 路径 3：显式指令
@@ -870,7 +1181,13 @@ class Main(star.Star):
         sid = event.unified_msg_origin or "global"
         left = _cooldown_left(sid)
         if left > 0:
-            yield event.plain_result(f"慢点，还有 {left} 秒冷却")
+            # 冷却倒计时按群去重：90s 内只提示一次，其余静默。
+            # 之前群友轮流敲 /说话 会刷出一串「慢点，还有 N 秒冷却」。
+            if _notice_allowed(sid):
+                yield event.plain_result(f"慢点，还有 {left} 秒冷却")
+            else:
+                logger.info("[voice] 冷却提示 %.0fs 内已发过，静默忽略（剩 %ds）",
+                            NOTICE_GAP, left)
             return
         _last_call[sid] = time.time()
         event.set_extra("voice_done", True)
@@ -878,7 +1195,13 @@ class Main(star.Star):
         ok, err = await self._send_voice(event, text)
         if not ok:
             _last_call[sid] = 0.0
-            yield event.plain_result(f"发不出声音：{err[:200]}")
+            # 命令处理器必须自己收口发送异常；否则框架会把插件异常包装成
+            # “:( 在调用插件…”并发进群。这里给一句稳定、可读的降级说明。
+            if _notice_allowed(sid):
+                yield event.plain_result(f"这次语音没确认发出去：{err[:160]}")
+            else:
+                logger.info("[voice] 失败提示 %.0fs 内已发过，静默（%s）",
+                            NOTICE_GAP, err[:80])
 
     @filter.command("音色")
     async def cmd_voice_pick(self, event: AstrMessageEvent):
@@ -892,15 +1215,47 @@ class Main(star.Star):
 
         if not arg:
             yield event.plain_result(
-                f"当前音色 ID：{_ref_for(sid)}\n"
-                f"模型：{MODEL}（备用 {', '.join(FALLBACK_MODELS) or '无'}）\n"
-                "换音色：/音色 派蒙　或　/音色 <32位ID>"
+                f"后端：{BACKEND}｜当前音色 ID：{_ref_for(sid)}\n"
+                + (f"模型：{MODEL}（备用 {', '.join(FALLBACK_MODELS) or '无'}）\n" if BACKEND == "fish" else "")
+                + "换音色：/音色 <名称>　或　/音色 <音色ID>"
             )
             return
 
-        if REF_RE.match(arg):
+        if _valid_ref(arg):
             _runtime_ref[sid] = arg
             yield event.plain_result(f"音色已切到 {arg}（重启后恢复默认）")
+            return
+
+        if BACKEND == "wusound":
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        f"{API_BASE}/voice",
+                        params={"show": "full", "showMarket": "true"},
+                        headers={
+                            "Authorization": f"Bearer {API_KEY}",
+                            "X-Vocu-App-Lang": "zh-CN",
+                        },
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        data = await resp.json()
+            except Exception as e:  # noqa: BLE001
+                yield event.plain_result(f"搜音色失败：{type(e).__name__}")
+                return
+            items = [
+                i for i in (data.get("data") or [])
+                if arg.lower() in str(i.get("name") or "").lower()
+                or arg.lower() in str(i.get("description") or "").lower()
+            ]
+            if not items:
+                yield event.plain_result(f"没搜到叫「{arg}」的可用音色")
+                return
+            _runtime_ref[sid] = items[0]["id"]
+            lines = [f"音色已切到：{items[0]['name']}（{items[0]['id']}，重启后恢复默认）"]
+            if len(items) > 1:
+                lines.append("其他候选：")
+                lines += [f"· {i['name']}　{i['id']}" for i in items[1:4]]
+            yield event.plain_result("\n".join(lines))
             return
 
         try:
@@ -938,8 +1293,9 @@ class Main(star.Star):
             pass
         yield event.plain_result(
             f"语音渠道：{API_BASE}\n"
-            f"主模型：{MODEL}｜备用：{', '.join(FALLBACK_MODELS) or '无'}\n"
-            f"音色：{_ref_for(sid)}\n"
+            f"后端：{BACKEND}"
+            + (f"｜主模型：{MODEL}｜备用：{', '.join(FALLBACK_MODELS) or '无'}" if BACKEND == "fish" else "")
+            + f"\n音色：{_ref_for(sid)}\n"
             f"格式：{AUDIO_FORMAT}｜字数上限：{MAX_CHARS}｜超时：{TIMEOUT}s\n"
             f"冷却：{COOLDOWN}s（剩 {_cooldown_left(sid)}s）｜并发：{MAX_CONCURRENCY}\n"
             f"Key：{'已配置' if API_KEY else '未配置'}｜兜底：{'开' if AUTO_FALLBACK else '关'}\n"

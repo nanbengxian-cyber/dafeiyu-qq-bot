@@ -1,5 +1,5 @@
 name: dsh-voice
-desc: 语音（TTS）插件。接 Fish Audio S2.1 Pro，提供 LLM 函数工具 send_voice（模型按需调用）、/说话 指令与「用户要语音但模型只发文字」的兜底钩子；支持音色切换、主备模型降级、字数截断与冷却。
+desc: 语音（TTS）插件。Fish Audio/悟声主链、Edge ReadAloud 独立兜底，提供 LLM 工具、/说话、显式请求兜底，并可在 dsh-emotion 主情绪达到阈值时主动用语音表达；支持审核、音色、降级、冷却与限长。QQ NT 发送回执超时时安全降级且不盲目重发，避免插件异常和重复语音。
 author: 大肥鱼
-version: 1.0.0
+version: 1.2.2
 repo: local
