@@ -39,6 +39,22 @@
 #   ③ dsh-imgctx 转述前几条消息里的图（PROVIDER_ID 留空时回落到同一个配置项）
 # dsh-video 的视频抽帧识别走它自己的 DSH_VID_VIS_* HTTP 客户端，不经过
 # provider 系统，不在本插件范围内。
+#
+# ============================ 2026-09-12 慢档降权 ============================
+# 群主在群里说「现在的主要限制就是速率太慢了」，回查日志坐实了具体落在哪：
+# 近 70000 行里 114 次成功识图，背后 234 次失败重试白花了 1866.9 秒 ——
+# **平均每张图 16.4 秒纯空等**，而成功那次中位只要 4.8 秒。
+#
+# 钱花在一条固定的链条上：vision-scnet 已死 → 落到 zhipu-vision，先吃满
+# ATTEMPT_TIMEOUT(10s) 超时、再吃一次 429 限流，才发现同一个 key 上的
+# glm-4.1v-thinking-flash 1.8 秒就答完了。而原本能跳过这两档的两个机制都
+# 抓不住它：_dead 只在「永久错误」上打标（超时和 429 都不算），_consec 要
+# 连败 3 次，而 AstrBot 一天被重启十几次、进程内存每次清零。
+#
+# 于是加了 SLOW_TTL：**一档只要白白耗掉过一次墙钟时间，就在这段时间里排到
+# 最后**（不拉黑，仍兜底）。群里抛梗二十多秒后才接，梗早凉了 —— 这是最伤
+# 「像真人」的一条，比措辞更像人重要得多。
+# 开关：DSH_VIS_SLOW_TTL（秒，默认 180；0=退回老行为）。
 
 import asyncio
 import os
@@ -79,6 +95,26 @@ WATCH_INTERVAL = float(os.environ.get("DSH_VIS_WATCH", "30"))
 
 # 一档被判「没通道」后多久内直接跳过。0=不缓存。
 DEAD_TTL = float(os.environ.get("DSH_VIS_DEAD_TTL", "600"))
+# [patch:slow-v1 慢档降权]
+# 「白花时间」的档单独降权多久。0=关掉这条规则（退回只有 _dead/_consec 的老行为）。
+#
+# 为什么 _dead 和 _consec 都不够：
+#   _dead 只在**永久错误**（配置/无通道）上打标，超时和 429 都不算 ——
+#   而这两种恰恰是唯一**拿秒表去撞**的失败。
+#   _consec 要连败 CONSEC_BAN(3) 次才永久移除，进程一重启就归零，
+#   而凌晨到深夜 AstrBot 被重启过十几次，等于永远在「重新学一遍」。
+#
+# 实测（2026-09-12 夜，近 70000 行日志）：114 次成功识图背后，234 次失败
+# 重试白花了 1866.9 秒 —— **平均每张图 16.4 秒纯空等**，而成功那次中位只要
+# 4.8 秒。主因固定是这一串：vision-scnet 已死 → 落到 zhipu-vision，先吃满
+# ATTEMPT_TIMEOUT(10s) 超时、再吃一次 429，才发现同一个 key 上的
+# glm-4.1v-thinking-flash 1.8 秒就答完了。
+#
+# 群里抛梗要等二十多秒才接，梗早凉了 —— 这是最伤「像真人」的一条。
+# 所以：一档只要**白白耗掉**过一次时间，就在 SLOW_TTL 内排到最后（仍会兜底再试）。
+# 与 _consec 的协同：被降权期间不再被撞，于是它每 SLOW_TTL 才攒 1 次失败，
+# 三次之后照样进 _banned —— 既不每张图白等，也不会永远相信一个坏档。
+SLOW_TTL = float(os.environ.get("DSH_VIS_SLOW_TTL", "180"))
 # 只用现有 provider id 不够：同一个智谱 key 其实还有几个可用视觉模型，
 # 而免费主模型 429 时原链没有第二条独立模型可走。这里允许给任意 OpenAI 兼容
 # provider 补“同源不同模型”档，格式 provider_id:model；不创建新密钥、不改源配置。
@@ -120,6 +156,8 @@ _PERMANENT = (
 _IMAGE_LEVEL = ("1210", "1301", "contentfilter")
 # pid -> 判定为「没通道」的时刻。只影响跳过顺序，不影响 fail-open。
 _dead: dict[str, float] = {}
+# [patch:slow-v1] pid -> 最近一次「白花时间」的时刻（超时/限流）。同 _dead 只影响顺序。
+_slow: dict[str, float] = {}
 # 同一档连续失败 CONSEC_BAN 次后永久移除（进程内存）。用于有限额度/
 # 一次性套餐 provider：额度耗尽后不需要每次都傻试到超时再回落。
 CONSEC_BAN = int(os.environ.get("DSH_VIS_CONSEC_BAN", "3"))
@@ -145,6 +183,27 @@ def _transient(e: Exception) -> bool:
         return False
     s = str(e).lower()
     return any(k in s for k in _TRANSIENT) or isinstance(e, asyncio.TimeoutError)
+
+
+# [patch:slow-v1] 「白花时间」的失败特征：超时和限流。
+#
+# 必须按**类型**判超时，不能只搜字符串：asyncio.wait_for 抛的
+# asyncio.TimeoutError 的 str() 是空串，日志里那句「(超时，无消息)」是
+# logger 自己补的，异常本身什么都没有 —— 只按文本匹配会整条漏掉，
+# 而超时正是最大的一笔开销（ATTEMPT_TIMEOUT=10s，每张图都撞一次）。
+_EXPENSIVE = ("timeout", "timed out", "超时", "429")
+# 耗时撞满超时线（留 10% 余量）也算白花，不管最后报的是什么错。
+_EXPENSIVE_RATIO = 0.9
+
+
+def _expensive(e: Exception, dt: float = 0.0) -> bool:
+    """这一档是不是**白白耗掉了**墙钟时间（而不是秒失败）。"""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if ATTEMPT_TIMEOUT > 0 and dt >= ATTEMPT_TIMEOUT * _EXPENSIVE_RATIO:
+        return True
+    s = str(e).lower()
+    return any(k in s for k in _EXPENSIVE)
 
 
 def _normalize_image(path: str) -> str | None:
@@ -264,13 +323,15 @@ class ChainProvider(Provider):
     def _order(self) -> list:
         """按可用性给各档排序：最近被判瞬态「没通道」的排到最后（fail-open）；
         [ban:consec-v1] 连续失败达 CONSEC_BAN 次的档永久移除，不再进入候选。
+        [patch:slow-v1] 最近**白花过时间**（超时/限流）的档同样排到最后，
+        只是用更短的 SLOW_TTL —— 它未必坏，但每次撞它都要掏 10 秒。
         """
         # 永久剔除连败过阈值的档
         base = [lk for lk in self.links
                 if lk.provider_config.get("id", "?") not in _banned]
         if len(base) == 1:
             return list(base)
-        if DEAD_TTL <= 0:
+        if DEAD_TTL <= 0 and SLOW_TTL <= 0:
             return list(base)
         now = time.time()
         alive, dead = [], []
@@ -279,16 +340,22 @@ class ChainProvider(Provider):
             t = _dead.get(pid, 0.0)
             if t and now - t < DEAD_TTL:
                 dead.append(lk)
-            else:
-                if t:
-                    _dead.pop(pid, None)   # 过期了，恢复正常顺序
-                alive.append(lk)
+                continue
+            if t:
+                _dead.pop(pid, None)   # 过期了，恢复正常顺序
+            s = _slow.get(pid, 0.0)
+            if s and now - s < SLOW_TTL:
+                dead.append(lk)
+                continue
+            if s:
+                _slow.pop(pid, None)   # 冷够了，重新给它一次机会
+            alive.append(lk)
         if dead:
             # 必须留痕：不打日志的话，下次「识图怎么换档了」又只能靠猜。
             logger.info(
-                "[vischain] 本轮先跳过 %s（%.0f 分钟内判定为无通道，仍会兜底再试）",
+                "[vischain] 本轮先跳过 %s（%.0f 分钟无通道 / %.0f 分钟白花过时间，仍会兜底再试）",
                 ",".join(lk.provider_config.get("id", "?") for lk in dead),
-                DEAD_TTL / 60.0,
+                DEAD_TTL / 60.0, SLOW_TTL / 60.0,
             )
         return alive + dead
 
@@ -324,6 +391,7 @@ class ChainProvider(Provider):
                                 _consec[pid] = 0       # 成功后清零连败计数
                                 st["sec"] += time.time() - t0
                                 _dead.pop(pid, None)
+                                _slow.pop(pid, None)   # [patch:slow-v1] 能答就撤销降权
                                 logger.info(
                                     "[vischain] %s 图片转 JPEG 后成功（%.1fs）",
                                     pid, time.time() - t0,
@@ -345,6 +413,11 @@ class ChainProvider(Provider):
                     last = e
                     perm = _permanent(e)
                     tr = _transient(e)
+                    # [patch:slow-v1] 白花过时间的档：不是坏，是贵。降权而不是拉黑，
+                    # 所以它仍留在候选里兜底，只是这一轮排到最后。
+                    exp = SLOW_TTL > 0 and _expensive(e, dt)
+                    if exp:
+                        _slow[pid] = time.time()
                     if perm and not img:
                         _dead[pid] = time.time()
                     logger.warning(
@@ -355,7 +428,9 @@ class ChainProvider(Provider):
                         "这张图它读不了（不重试，换下一档看看）" if img
                         else ("没通道／永久错误，直接换下一档并记 %.0f 分钟"
                               % (DEAD_TTL / 60.0) if perm
-                              else ("瞬时可重试" if tr else "非瞬时，直接换下一档")),
+                              else ("白花了这 %.1fs，%.0f 分钟内排到最后"
+                                    % (dt, SLOW_TTL / 60.0) if exp
+                                    else ("瞬时可重试" if tr else "非瞬时，直接换下一档"))),
                         str(e)[:120] or "(超时，无消息)",
                     )
                     if not tr:
@@ -366,6 +441,7 @@ class ChainProvider(Provider):
                 _consec[pid] = 0       # 成功后清零连败计数
                 st["sec"] += dt
                 _dead.pop(pid, None)     # 成功一次就洗掉黑名单
+                _slow.pop(pid, None)     # [patch:slow-v1] 降权同理
                 # 不触发/降级路径也要留痕：走到第几档、试了几次，
                 # 否则以后排查「识图怎么慢了」只能靠猜。
                 if lk is self.links[0] and attempt == 0:
@@ -518,9 +594,13 @@ class Main(star.Star):
             avg = (s.get("sec", 0.0) / ok) if ok else 0.0
             t = _dead.get(pid, 0.0)
             left = (DEAD_TTL - (time.time() - t)) if t else 0.0
+            sl = _slow.get(pid, 0.0)
+            sl_left = (SLOW_TTL - (time.time() - sl)) if sl else 0.0
             lines.append(
-                "%d. %s 成功%d/失败%d%s%s"
+                "%d. %s 成功%d/失败%d%s%s%s"
                 % (i, pid, ok, fail, ("，平均%.1fs" % avg) if ok else "",
-                   ("，判定无通道还剩%.0f分钟" % (left / 60.0)) if left > 0 else "")
+                   ("，判定无通道还剩%.0f分钟" % (left / 60.0)) if left > 0 else "",
+                   ("，白花过时间还剩%.0f分钟排最后" % (sl_left / 60.0))
+                   if sl_left > 0 else "")
             )
         yield event.plain_result("\n".join(lines))
