@@ -43,6 +43,29 @@
 是否被逐字抄进正文。它容易误伤（用户也可能引用），所以只记日志不拦。
 
 ---------------------------------------------------------------------------
+
+2026-09-13 加的一条：基础设施报错绝不进群
+
+查全量日志发现机器人**11 次把原始报错当回复发进了群**，全文长这样：
+
+    LLM 响应错误: All chat models failed: APIStatusError: Error code: 402 -
+    {'code': 'INSUFFICIENT_BALANCE', 'message': '余额不足',
+     'data': {'retryAfterSeconds': 6}, 'traceId': 'trace_19c89f88-...'}
+
+另外还有 `APIConnectionError: Connection error.` 和 `InternalServerError: <html>`。
+2026-09-10 01:57~02:01 **四分钟内连发 9 条**，等于当着全群念了一遍栈。
+
+这是比泄露标题更硬的破绽：真人不会贴 traceId，也不会告诉全群自己「余额不足」。
+来源是 AstrBot 核心 tool_loop_agent_runner.py:891 把异常塞进了 completion_text，
+然后照常经过 respond.stage 发出去。**不动框架**（升级会覆盖），在出口拦掉。
+
+处理方式是**沉默**，不是换一句安慰话：报错是成串来的（四分钟九条），一句固定
+话术连发九遍比贴报错更像机器；人遇到这种情况本来就没吭声。真相留在日志里
+（WARNING 带原文前 160 字）。这一条不受 MODE 影响 —— 它不是"人格泄露"，
+是"机器人坏了"，任何时候都不该见群。
+
+
+---------------------------------------------------------------------------
 三种模式（env DSH_LEAKGUARD_MODE，默认 strip）
 
   - strip：只删掉正文里命中的标题片段，其余照发。混合链（夹图片/@ 等）
@@ -111,6 +134,38 @@ _COMMON_DEFAULT = {
     "你在哪", "语言", "说话方式", "不认账", "时政不聊", "安全底线",
     "工具规则", "人格与梗", "表情包贴纸", "AI味黑名单", "AI 味黑名单",
 }
+
+
+# 基础设施报错指纹（见文件头 2026-09-13）。分两档是为了不误伤正常聊天：
+# 机器人有时候会跟群主聊代码，句子里出现「traceId」「余额不足」都不奇怪。
+# 所以只有"整句就是一段报错"才拦 —— 强指纹命中一个就够，弱指纹要同时中两个。
+_INFRA_STRONG = (
+    "LLM 响应错误",
+    "All chat models failed",
+    "APIStatusError",
+    "APIConnectionError",
+    "APITimeoutError",
+    "InternalServerError",
+    "RateLimitError",
+    "Traceback (most recent call last)",
+)
+_INFRA_WEAK = (
+    "INSUFFICIENT_BALANCE",
+    "余额不足",
+    "traceId",
+    "Error code:",
+    "retryAfterSeconds",
+    "'code':",
+    "'message':",
+)
+
+
+def _infra_error(text: str) -> bool:
+    """这段正文是不是"机器人自己坏了"的原始报错。"""
+    t = text or ""
+    if any(s in t for s in _INFRA_STRONG):
+        return True
+    return sum(1 for w in _INFRA_WEAK if w in t) >= 2
 
 
 def _norm(s: str) -> str:
@@ -187,7 +242,7 @@ def build_markers(system_prompt: str) -> dict:
 
 
 _stat = {"seen": 0, "strip": 0, "block": 0, "shadow_strong": 0, "shadow_rule": 0,
-         "fail_fetch": 0}
+         "fail_fetch": 0, "infra": 0}
 _last: list[str] = []
 _state = {"markers": None, "fetched_at": 0.0, "prompt_len": 0}
 
@@ -251,16 +306,23 @@ class Main(star.Star):
             result = event.get_result()
             if result is None or not result.chain:
                 return
+            text = result.get_plain_text() or ""
+
+            # ---- 基础设施报错：放在 is_model_result 之前。
+            # 报错那一条未必被标成 model result，而它恰恰是最不能见群的。
+            if _infra_error(text):
+                self._handle_infra(event, text)
+                return
+
             try:
                 if not result.is_model_result():
                     return
             except BaseException:
                 pass
-            if not (result.get_plain_text() or "").strip():
+            if not text.strip():
                 return
             if not await self._ensure_markers():
                 return
-            text = result.get_plain_text() or ""
             markers = _state["markers"]
             _stat["seen"] += 1
 
@@ -347,6 +409,20 @@ class Main(star.Star):
             self._note("剥标题「%s」：%s → %s" % (joined, text[:26], total[:26]))
             logger.info("[leakguard] 剥掉 strong 标题「%s」：%s", joined, total[:36])
 
+    # ------------------------------------------------- 基础设施报错处理
+    def _handle_infra(self, event, text: str) -> None:
+        """把基础设施报错换成沉默。
+
+        为什么不发一句"我这边卡住了"：报错是成串来的（09-10 那次四分钟九条），
+        一句固定话术连发九遍，比贴报错更像机器。人遇到这种情况就是没吭声。
+        原文完整留在日志里，要查真相去日志。
+        """
+        _stat["infra"] += 1
+        self._note("拦下基础设施报错｜原话头：%s" % text[:48])
+        logger.warning("[leakguard] 拦下基础设施报错，改为沉默：%s", text[:160])
+        event.clear_result()
+        event.stop_event()
+
     def _note(self, brief: str) -> None:
         _last.append(time.strftime("%H:%M:%S ") + brief)
         del _last[:-8]
@@ -365,12 +441,13 @@ class Main(star.Star):
         yield event.plain_result(
             "[泄露guard] 开=%s 群=%s 模式=%s\n"
             "标题 strong %d / weak %d / common %d（缓存 %d 秒）\n"
-            "看过 %d 段｜剥标题 %d｜整条拦 %d｜shadow strong %d 规则句 %d\n"
+            "看过 %d 段｜剥标题 %d｜整条拦 %d｜shadow strong %d 规则句 %d｜拦报错 %d\n"
             "最近：%s"
             % ("开" if ENABLED else "关",
                "、".join(sorted(GROUPS)) or "无", self._mode,
                len(m["strong_titles"]), len(m["weak_titles"]), len(_COMMON_DEFAULT), age,
                s["seen"], s["strip"], s["block"], s["shadow_strong"], s["shadow_rule"],
+               s["infra"],
                "｜".join(_last[-5:]) or "还没有"))
 
     @filter.command("泄露guard刷新")
