@@ -253,19 +253,35 @@ def test_poke_flow():
 
 
 def test_filter():
+    """filter 只分「哪一类事件」，群过滤在 handler 里。
+
+    线上事故：filter 里多判断了一层 message_type/平台名，把 poke 通知整类
+    静默拦掉，采集全丢（DB 里 poke 0 条，同期实际被戳 3 次）。
+    """
     f = aw.AwarenessFilter()
-    # 本群消息放行。
-    assert f.filter(FakeEvent(comps=[comp("Plain", text="hi")]), None) is True
-    # 撤回通知放行（message_str 为空也要能走到 handler）。
-    assert f.filter(FakeEvent(raw={"post_type": "notice",
-                                   "notice_type": "group_recall"}), None) is True
-    # 别的群拦掉。
-    assert f.filter(FakeEvent(gid="123456"), None) is False
-    # webchat 平台拦掉。
-    ev = FakeEvent()
-    ev.get_platform_name = lambda: "webchat"
-    assert f.filter(ev, None) is False
-    print("  filter ok")
+    assert f.filter(FakeEvent(raw={"post_type": "message"}), None) is True
+    # 通知类必须放行 —— 撤回与戳一戳都走这里。
+    assert f.filter(FakeEvent(raw={"post_type": "notice", "sub_type": "poke"}), None) is True
+    assert f.filter(
+        FakeEvent(raw={"post_type": "notice", "notice_type": "group_recall"}), None) is True
+    # 既不是消息也不是通知的（心跳/请求）不放行。
+    assert f.filter(FakeEvent(raw={"post_type": "meta_event"}), None) is False
+
+    # 群过滤由 handler 负责：别的群一律不采集。
+    model = fresh()
+    asyncio.run(model.on_event(FakeEvent(
+        comps=[comp("Plain", text="别的群")], gid="999", text="别的群")))
+    assert model._load("999", time.time() - 600) == [], "别的群不该采集"
+
+    # 本群的 poke 通知必须真的走到 handler 并落库（线上就是这里丢的）。
+    asyncio.run(model.on_event(FakeEvent(
+        raw={"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+             "group_id": GID, "user_id": "111", "target_id": BOT,
+             "self_id": BOT, "time": 1780000100}, gid=GID)))
+    pokes = [r for r in model._load(GID, time.time() - 600) if r["kind"] == "poke"]
+    assert len(pokes) == 1, "poke 通知必须入库"
+    assert pokes[0]["extra"]["to_me"] is True, pokes[0]
+    print("  filter/scope ok")
 
 
 def test_sensitive_not_stored():

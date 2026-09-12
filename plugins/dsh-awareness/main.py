@@ -181,26 +181,18 @@ def _at_bot(event, me: str) -> bool:
 
 
 class AwarenessFilter(CustomFilter):
-    """只放行本群的消息与通知事件。
+    """只放行「消息」与「通知」两类事件。
 
-    照抄 dsh-poke 的成熟做法：撤回是 notice 事件，message_str 为空，
-    必须用 CustomFilter 才能稳定走到 handler。
+    照抄 dsh-poke 那个已在生产跑通的写法：**判据必须极简**。
+    通知类事件（撤回/戳一戳）没有正文，`message_type`、平台名等字段与常规
+    消息并不一致，在 filter 里多做一层判断就会把整类通知静默拦掉
+    （实测：poke 采集全丢）。群归属等业务判断一律放到 handler 里做。
     """
 
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         try:
-            if event.get_message_type() != MessageType.GROUP_MESSAGE:
-                return False
-            if event.get_platform_name() == "webchat":
-                return False
-            gid = str(event.get_group_id() or "")
-            if not gid or (GROUPS and gid not in GROUPS):
-                return False
             raw = getattr(event.message_obj, "raw_message", None)
-            post = _rg(raw, "post_type")
-            if post and post not in ("message", "notice"):
-                return False
-            return True
+            return _rg(raw, "post_type") in (None, "message", "notice")
         except BaseException:
             return False
 
@@ -427,15 +419,27 @@ class Main(star.Star):
         if not ENABLED:
             return
         try:
+            raw = getattr(event.message_obj, "raw_message", None)
+            is_notice = _rg(raw, "post_type") == "notice"
+            # 通知类事件不走 message_type 判断（它与常规消息字段不一致）。
+            if not is_notice and event.get_message_type() != MessageType.GROUP_MESSAGE:
+                return
             gid = str(event.get_group_id() or "")
-            if not gid:
+            if not gid or (GROUPS and gid not in GROUPS):
                 _stat["skipped_group"] += 1
                 return
             _stat["seen"] += 1
+            if is_notice:
+                # 通知事件量小但关键（撤回/戳一戳），各落一条日志便于事后核对。
+                logger.info(
+                    "[awareness] 收到通知 sub=%s gid=%s uid=%s",
+                    _rg(raw, "sub_type"), gid, str(event.get_sender_id() or ""),
+                )
             self._record_event(event, gid)
             self._cleanup(time.time())
         except BaseException as exc:
-            logger.debug("[awareness] 采集异常: %r", exc)
+            # 采集异常必须可见：静默失败正是「戳一戳全丢」那次事故的成因。
+            logger.warning("[awareness] 采集异常: %r", exc)
 
     # --- 读取 -------------------------------------------------------------
     def _load(self, gid: str, since: float, limit: int = 1500) -> list:

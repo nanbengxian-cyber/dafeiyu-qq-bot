@@ -1,5 +1,5 @@
 name: dsh-awareness
 desc: 大肥鱼的群事件感知（含撤回与戳一戳）：群友发了什么、撤回了什么、谁戳了它都有据可查。以「类懒加载」注入——每轮只常驻一行薄索引，被点名或话里提到刚才/撤回/谁说的才展开明细，明细默认最近8分钟最多18条、硬预算700字。撤回正文靠 message_id 回查本地缓存还原，未留存的照实说不知道。戳一戳通知正文为空、昵称又被平台写成QQ号，插件用历史昵称补全并明确告知「谁戳了你、你回戳了没有」，避免反问「戳谁呀？」。
-version: 1.1.0
+version: 1.1.1
 author: DeepSeek Harness
 repo: https://github.com/nanbengxian-cyber/dafeiyu-qq-bot
