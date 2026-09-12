@@ -49,18 +49,58 @@
 # 理由：判定准确率 19/19 是在 19 个手工场景上量的，不是在真群一周流量上量的。
 # 先跑一段影子模式看日志里都判了谁，确认没误判再关掉。
 # 指令 /禁言状态 看统计和最近 8 次判定。
+#
+# 六、动态判罚层（mood_logic.py）：阈值不再对所有人所有时刻都一样
+#
+# 原来的动作表是固定的：sev2 警告 + 累犯禁 5 分钟、sev3 直接禁 10 分钟。
+# 现在把**态度类**判罚的松紧交给已经跑在生产里的状态：
+# 生气/警戒/关系疏远/被反复骚扰 -> 更严；心情好/玩心重/关系亲近 -> 更宽。
+# 读的是 dsh-emotion / dsh-desire / dsh-social / dsh-agency / dsh-fatigue
+# 的状态，**只读**（SQLite mode=ro / JSON），读不到就中性 = 上面的固定行为。
+#
+# 三条硬边界，写死在代码里（详见 mood_logic.py 的模块注释）：
+#   ① 行为类不受心情影响：违法/广告/色情索要/刷屏/明确辱骂/多人围攻
+#   ② 代码兜底（诅咒家人、群体仇恨）不受心情影响
+#   ③ 心情最多推动一档，且**只能把「放过」变成「警告」，不能把「放过」
+#      变成「禁言」** —— 禁言必须由原本就够格的判定（base sev>=2）触发。
+# 关掉：DSH_GUARD_MOOD=0（回到完整的固定行为，用于对照）。
 
 import asyncio
 import json
 import os
 import re
+import sys
 import time
 from collections import deque
+from pathlib import Path
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.core import logger
+
+_PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
+from dsh_link import TurnClaim, claim_turn  # type: ignore  # noqa: E402
+
+# 动态判罚层。优先相对导入（AstrBot 把插件当包加载，与 dsh-desire/dsh-agency
+# 一致）；万一加载方式没有包上下文，就退回同目录的绝对导入。
+try:  # noqa: E402
+    from .mood_logic import (  # type: ignore
+        Mood, MoodReader, Tunables, apply_duration, classify as mood_classify,
+        describe as mood_describe, leniency as mood_leniency, neutral as mood_neutral,
+        raised_only, severity_step, warn_need,
+    )
+except ImportError:  # pragma: no cover - 只在非包加载时走到
+    _HERE = str(Path(__file__).resolve().parent)
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+    from mood_logic import (  # type: ignore  # noqa: E402
+        Mood, MoodReader, Tunables, apply_duration, classify as mood_classify,
+        describe as mood_describe, leniency as mood_leniency, neutral as mood_neutral,
+        raised_only, severity_step, warn_need,
+    )
 
 ENABLED = os.environ.get("DSH_GUARD", "1") != "0"
 # 影子模式：只判不禁。默认**开**（禁言不可逆，先看数据）
@@ -79,6 +119,12 @@ MAX_BAN_SEC = int(os.environ.get("DSH_GUARD_MAX_BAN_SEC", "1800"))
 # sev=2 需要在这个窗口内累计到第几次才禁
 WARN_WINDOW = float(os.environ.get("DSH_GUARD_WARN_WINDOW", "86400"))
 WARN_TIMES = max(1, int(os.environ.get("DSH_GUARD_WARN_TIMES", "2")))
+# 高置信度、明确指向某人的直接辱骂不再交给模型。原规则刻意放过
+# 「傻逼/sb/废物」等日常互怼，导致真正 @ 人骂以及单独甩一句脏话也完全漏过。
+# 这条代码闸门只收「有 @ 指向 / 你他她指向 / 整句就是辱骂」的消息。
+DIRECT_INSULT_BAN_SEC = max(
+    60, int(os.environ.get("DSH_GUARD_DIRECT_INSULT_BAN_SEC", "300"))
+)
 # 同群 1 小时内最多禁几人
 BAN_WINDOW = float(os.environ.get("DSH_GUARD_BAN_WINDOW", "3600"))
 GROUP_BAN_MAX = max(1, int(os.environ.get("DSH_GUARD_GROUP_BAN_MAX", "3")))
@@ -102,6 +148,25 @@ GROUPS = {
 }
 # 判定用的最近上下文条数（帮模型分辨是不是在开玩笑）
 CTX_N = max(0, int(os.environ.get("DSH_GUARD_CTX", "4")))
+
+# ---------------------------------------------------------------- 动态判罚层
+# 总开关。关掉 = 回到固定阈值（用于对照：同一段流量两次跑，只看心情那部分差多少）。
+MOOD_ON = os.environ.get("DSH_GUARD_MOOD", "1") != "0"
+# 宽容度权重与档位上限：weight=0 等价于关掉；max_step=1 表示最多推动一档。
+# 这两个是「心情不是橡皮筋」那条硬边界的旋钮，给再大也不允许越界禁言。
+MOOD_TUN = Tunables.from_env()
+# 情绪把「本来放过」的消息变成一次公开警告时的同群冷却（秒）。
+# 为什么需要：生气时 borderline 消息会变多，不冷却就会一串「收着点」刷屏 ——
+# 那比不管还难看。冷却期内不警告、也不计入累犯（不能在没警告过的前提下禁人）。
+MOOD_WARN_CD = max(0.0, float(os.environ.get("DSH_GUARD_MOOD_WARN_CD", "300")))
+_mood_reader: MoodReader | None = None
+
+
+def _mood() -> MoodReader:
+    global _mood_reader
+    if _mood_reader is None:
+        _mood_reader = MoodReader(MOOD_TUN)
+    return _mood_reader
 
 # 关键词预筛。**只做成本闸门**，不做判定，所以宁可多放进来。
 #
@@ -187,6 +252,51 @@ _SLUR_RE = re.compile(
     r"该死|都死|去死|该杀|杀光|杀绝|灭绝|清理|清除|垃圾|畜生|杂种|劣等"
     r"|下贱|贱种|不是人|滚出|驱逐|该被|活该"
 )
+
+# 6) 明确指向个人的直接辱骂：纯代码、低延迟、无需调用模型。
+#
+# 只匹配高置信度侮辱核心，不把普通否定词（笨、菜、丑）塞进来；还必须满足：
+#   - 消息含 @（AstrBot 的 message_str 会展开为 @昵称(QQ)）；或
+#   - 侮辱词前有「你/他/她/这人」；或
+#   - 去掉标点后整句就是侮辱词（真群漏判样本「sb」）。
+# 这样「别骂人」「他说了sb」「这个游戏真垃圾」不会仅因出现词而禁人。
+_DIRECT_INSULT_RE = re.compile(
+    r"(?:傻\s*[逼比币]|煞\s*笔|沙\s*比|[sS][bB]|脑残|弱智|智障|废物|狗东西"
+    r"|畜生|杂种|贱种|贱人|人渣|去死|滚蛋|妈的|你妈|操你|草你|[nN][mM][sS][lL]"
+    r"|[cC][nN][mM])"
+)
+_DIRECT_TARGET_RE = re.compile(r"(?:你|他|她|这人|那人|这货|那货).{0,8}$")
+_DIRECT_QUOTE_RE = re.compile(
+    r"(?:(?:别|不要|不许|停止|禁止|没|没有|不会|不能|为什么|为啥).{0,4}(?:骂|说)"
+    r"|(?:他|她|有人|群里).{0,4}(?:说|骂|发))"
+)
+
+
+def direct_insult(text: str) -> str:
+    """返回高置信度直接辱骂词；不是明确指向个人时返回空字符串。"""
+    raw = (text or "").strip()
+    m = _DIRECT_INSULT_RE.search(raw)
+    if not m:
+        return ""
+    # 「别骂人/为什么说sb」是在谈论辱骂，不是实施辱骂。
+    if _DIRECT_QUOTE_RE.search(raw):
+        return ""
+    compact = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw)
+    insult_only = bool(_DIRECT_INSULT_RE.fullmatch(compact))
+    # 中文代词紧贴谓语是常态（「你是废物」「他真弱智」），不能要求前方空格。
+    targeted = "@" in raw or bool(_DIRECT_TARGET_RE.search(raw))
+    return m.group(0) if (insult_only or targeted) else ""
+
+
+def _has_at_component(event: AstrMessageEvent) -> bool:
+    """message_str 在不同适配器下未必保留 @；组件是权威指向证据。"""
+    try:
+        for comp in event.get_messages() or ():
+            if comp.__class__.__name__ == "At":
+                return True
+    except BaseException:
+        pass
+    return False
 
 
 def _is_group_admin(event) -> bool:
@@ -301,6 +411,11 @@ _stat = {
     "warned": 0, "banned": 0, "ban_fail": 0,
     "skip_admin": 0, "skip_ban_quota": 0, "shadow_ban": 0, "ms_total": 0.0,
     "flood_seen": 0, "flood_ban": 0, "flood_kick": 0, "flood_fail": 0,
+    "direct_insult": 0,
+    # 动态判罚层：心情实际改变了结果的次数（这是上线后唯一的验收指标 ——
+    # 如果永远是 0，说明状态没读到或者权重太低，等于没上线）
+    "mood_read": 0, "mood_err": 0, "mood_up": 0, "mood_down": 0,
+    "mood_ban_sec": 0, "mood_warn": 0, "mood_warn_cd": 0,
 }
 _warns: dict[str, deque] = {}       # "gid:uid" -> sev>=2 的时间窗口
 _bans: dict[str, deque] = {}        # gid -> 禁言时间窗口
@@ -308,6 +423,19 @@ _ctx: dict[str, deque] = {}         # gid -> 最近几条 (name, text)
 _last: list[str] = []
 _flood: dict[str, deque] = {}       # "gid:uid" -> 消息时间戳窗口
 _flood_strikes: dict[str, int] = {} # "gid:uid" -> 累计刷屏次数（决定禁言还是踢）
+_warn_cd: dict[str, float] = {}     # gid -> 上一次「心情加重式警告」的时间
+_last_mood: dict[str, str] = {}     # gid -> 最近一次心情摘要（/禁言状态 展示）
+
+
+def _warn_cd_ok(gid: str, now: float) -> bool:
+    """心情把「放过」抬成警告时的同群冷却。冷却中就什么都不做（连累犯都不记）。"""
+    if MOOD_WARN_CD <= 0:
+        _warn_cd[gid] = now
+        return True
+    if now - _warn_cd.get(gid, 0.0) < MOOD_WARN_CD:
+        return False
+    _warn_cd[gid] = now
+    return True
 
 
 def _parse(raw: str) -> dict | None:
@@ -432,12 +560,17 @@ def effective_severity(f: dict) -> int:
     return sev
 
 
-def decide(f: dict, warn_count: int) -> tuple[str, int, str]:
+def decide(f: dict, warn_count: int, sev: int | None = None,
+           warn_need_n: int | None = None) -> tuple[str, int, str]:
     """纯函数决策：返回 (动作, 禁言秒数, 理由)。
 
     动作 = none | warn | ban。写成纯函数就能单测，改倾向是改这几行。
+
+    sev / warn_need_n 两个参数是动态判罚层的入口（mood_logic 算出来的
+    严重度与警告门槛）；**默认 None = 完全按原来的固定规则**，
+    所以关掉心情时行为与老版本逐字相同，两条路径不塌成一条。
     """
-    sev = effective_severity(f)
+    sev = effective_severity(f) if sev is None else max(0, min(3, int(sev)))
     # stance 不在这里 —— 它是 politics 的修饰词，不是独立的违规类型
     kinds = [k for k in ("politics", "nsfw", "illegal", "ad", "pileon", "attack")
              if f.get(k)]
@@ -446,8 +579,9 @@ def decide(f: dict, warn_count: int) -> tuple[str, int, str]:
     kind = kinds[0]
     if sev >= 3:
         return "ban", min(BAN_SEC_HIGH, MAX_BAN_SEC), kind
-    # sev == 2：先警告，同人在窗口内累计到 WARN_TIMES 次才禁
-    if warn_count + 1 >= WARN_TIMES:
+    # sev == 2：先警告，同人在窗口内累计到 warn_need_n 次才禁
+    need = WARN_TIMES if warn_need_n is None else max(1, int(warn_need_n))
+    if warn_count + 1 >= need:
         return "ban", min(BAN_SEC, MAX_BAN_SEC), kind
     return "warn", 0, kind
 
@@ -471,9 +605,17 @@ class Main(star.Star):
             "、".join(sorted(GROUPS)) if GROUPS else "全部",
             FLOOD_WINDOW, FLOOD_MAX, FLOOD_BAN_SEC, FLOOD_KICK_AT,
         )
+        logger.info(
+            "[guard] 动态判罚：%s（权重%.2f 最多推%d档 严格线%+.1f 宽容线%+.1f "
+            "时长×%.1f~×%.1f 警告冷却%.0fs）",
+            "开" if (MOOD_ON and MOOD_TUN.weight > 0) else "关",
+            MOOD_TUN.weight, MOOD_TUN.max_step,
+            MOOD_TUN.len_lenient, MOOD_TUN.len_strict,
+            MOOD_TUN.dur_min, MOOD_TUN.dur_max, MOOD_WARN_CD,
+        )
 
     # ---------------------------------------------------------------- 判定入口
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def check(self, event: AstrMessageEvent) -> None:
         if not ENABLED:
             return
@@ -505,9 +647,36 @@ class Main(star.Star):
                 _stat["skip_white"] += 1
                 return
 
+            # -------------------------------------------------- 直接辱骂闸门
+            # 这类高置信度消息不依赖预筛词表和 LLM。管理员/白名单、同群禁言
+            # 配额以及平台权限仍统一由 _do_ban() 兜住。
+            # ★ 动态判罚层不参与这一路 ★：明确指向的辱骂是**行为事实**，
+            # 心情好也不该放行（用户把「违法、刷屏等行为」划在心情之外）。
+            insult = direct_insult(text)
+            if not insult and _has_at_component(event):
+                m = _DIRECT_INSULT_RE.search(text)
+                if m and not _DIRECT_QUOTE_RE.search(text):
+                    insult = m.group(0)
+            if insult:
+                _stat["direct_insult"] += 1
+                brief = "direct-insult word=%s ← %s：%s" % (
+                    insult, name, text[:30]
+                )
+                _last.append(time.strftime("%H:%M:%S ") + brief)
+                del _last[:-10]
+                logger.warning("[guard] 明确指向辱骂，直接禁言%d秒｜%s",
+                               DIRECT_INSULT_BAN_SEC, brief)
+                await self._do_ban(
+                    event, gid, uid, name, DIRECT_INSULT_BAN_SEC,
+                    "attack", brief,
+                )
+                return
+
             # ---------------------------------------------------------- 刷屏闸
             # 纯代码检测，不走 LLM：同一人 FLOOD_WINDOW 秒内发出 FLOOD_MAX 条
             # 消息即刷屏。白名单（群主）已在上一步豁免。
+            # ★ 同样不受心情影响 ★：刷屏禁 1 天是用户明确要的惩罚，
+            # 惩罚力度不该被「今天心情好不好」砍成一半（见 apply_duration 的 bypass_cap）。
             fkey = "%s:%s" % (gid, uid)
             now0 = time.time()
             fq = _flood.setdefault(fkey, deque())
@@ -585,21 +754,70 @@ class Main(star.Star):
             wq = _warns.setdefault(key, deque())
             _prune(wq, now, WARN_WINDOW)
 
-            act, sec, kind = decide(f, len(wq))
-            brief = "%s sev=%d(原%d) [%s] %s why=%s ← %s：%s" % (
-                act, sev, f["severity"], flags, kind or "-", f["why"] or "-",
-                name, text[:30],
+            # ------------------------------------------------------ 动态判罚层
+            # 心情只碰「态度类」（骂战/时政）。行为类（违法/广告/色情索要/
+            # 围攻）和代码兜底（诅咒家人/群体仇恨）连读都不读，直接走原规则。
+            #
+            # ★ 变量名别搞混 ★ sev = 规则（effective_severity）算出来的，
+            # mood_sev = 心情推过的；raised 判的是「心情把放过变成了要动手」。
+            # 第一版把这两个写反了：severity_step 的结果被算出来又丢掉，
+            # 只有警告门槛那一路生效 —— 纯函数单测全绿、日志也照打，
+            # 靠集成测试才发现。改名就是为了不再犯。
+            mood_note, mood_len, mood_sev, mood_need = self._mood_for(
+                f, gid, uid, sev, now)
+
+            # ★ 硬边界 ③：心情可以把「放过」抬成「警告」，但绝不能把「放过」
+            # 抬成「禁言」★ 否则生气状态下翻旧账（wq 里还有 24h 内的记录）
+            # 会让一句本来没事的话直接吃禁言 —— 这正是最不能接受的误禁方向。
+            raised = raised_only(sev, mood_sev)
+            if raised:
+                act, sec, kind = ("warn", 0, mood_classify(f)[0])
+            else:
+                act, sec, kind = decide(f, len(wq), sev=mood_sev,
+                                        warn_need_n=mood_need)
+                if act == "ban":
+                    # 纯规则（心情中性、门槛原样）会怎么判 —— 用来判断
+                    # 「这次禁言是不是心情带来的」，这是上线后的验收指标
+                    base_act, base_sec, _ = decide(f, len(wq), sev=sev)
+                    sec = apply_duration(sec, mood_len, tun=MOOD_TUN, cap=MAX_BAN_SEC)
+                    if base_act != "ban" or sec != max(1, base_sec):
+                        _stat["mood_ban_sec"] += 1
+
+            brief = "%s sev=%d(规则%d/模型%d) [%s] %s why=%s ← %s：%s" % (
+                act, mood_sev, sev, f["severity"], flags, kind or "-",
+                f["why"] or "-", name, text[:30],
             )
+            if mood_note:
+                brief += "｜%s" % mood_note
             _last.append(time.strftime("%H:%M:%S ") + brief)
             del _last[:-10]
+            # 偏向计数与「弱信号档」对齐（±0.5）：改了门槛的也要记，
+            # 否则 /禁言状态 会显示「一次没偏」却实际多给过机会
+            if mood_len >= MOOD_TUN.len_mild_strict:
+                _stat["mood_up"] += 1
+            elif mood_len <= MOOD_TUN.len_mild_lenient:
+                _stat["mood_down"] += 1
+            if mood_sev != sev:
+                _last_mood[gid] = "%s（sev %d→%d）" % (mood_note or "?", sev, mood_sev)
+            elif mood_note:
+                _last_mood[gid] = mood_note
 
             if act == "none":
                 logger.info("[guard] 放过｜%s", brief)
                 return
 
+            # 心情加重出来的警告要过同群冷却：生气时 borderline 消息会变多，
+            # 不冷却就会一串「收着点」刷屏。冷却期内不警告、也不记累犯。
+            if raised and not _warn_cd_ok(gid, now):
+                _stat["mood_warn_cd"] += 1
+                logger.info("[guard] 心情加重但警告冷却中，放过｜%s", brief)
+                return
+
             wq.append(now)
             if act == "warn":
                 _stat["warned"] += 1
+                if raised:
+                    _stat["mood_warn"] += 1
                 logger.info("[guard] 警告（第%d次，再犯就禁）｜%s", len(wq), brief)
                 if not SHADOW:
                     await self._say(event, "%s，收着点" % _REASON_TEXT.get(kind, "过线了"))
@@ -609,6 +827,42 @@ class Main(star.Star):
         except BaseException as e:
             # 判定模块自己出问题绝不能连累群聊
             logger.warning("[guard] 整体失败: %s", e)
+
+    # ---------------------------------------------------------------- 动态判罚
+    def _mood_for(self, f: dict, gid: str, uid: str, sev: int,
+                  now: float) -> tuple[str, float, int, int]:
+        """算出 (日志摘要, 宽容度, 心情调整后的 sev, 警告门槛)。
+
+        硬边界都在这一处收口，所以只有这一个地方需要审：
+          ① 行为类 / 围攻 / 代码兜底 -> 摘要为空、宽容度 0、sev 原样、门槛原样
+          ② 宽容度权重为 0（MOOD_ON=0）-> 同上
+          ③ sev 最多被推动一档（Tunables.max_step）
+          ④ 时长仍由 apply_duration 夹在 MAX_BAN_SEC 内（调用处执行）
+        读状态失败一律中性 —— 与「判定失败什么都不做」同一条精神：
+        动态层不能成为新的静默失效点。
+        """
+        if not MOOD_ON or MOOD_TUN.weight <= 0:
+            return "", 0.0, sev, WARN_TIMES
+        try:
+            kind, hard = mood_classify(f)
+            if hard or "代码判定" in (f.get("why") or ""):
+                return "", 0.0, sev, WARN_TIMES
+            mood = _mood().read(gid, uid, now)
+        except BaseException as e:
+            _stat["mood_err"] += 1
+            logger.warning("[guard] 心情读取失败，按固定规则处理(%s): %r",
+                           type(e).__name__, e)
+            return "", 0.0, sev, WARN_TIMES
+        _stat["mood_read"] += 1
+        if mood.errors:
+            _stat["mood_err"] += 1
+        len_value, tags = mood_leniency(mood, MOOD_TUN)
+        new_sev = severity_step(sev, len_value, MOOD_TUN)
+        need = warn_need(WARN_TIMES, len_value, MOOD_TUN)
+        note = mood_describe(mood, len_value, tags) if (tags or mood.errors) else ""
+        if note:
+            logger.info("[guard] 心情：%s（类型=%s sev=%d）", note, kind or "-", sev)
+        return note, len_value, new_sev, need
 
     # ---------------------------------------------------------------- 判定调用
     async def _judge(self, umo: str, name: str, text: str, ctx: str) -> dict | None:
@@ -765,14 +1019,22 @@ class Main(star.Star):
         logger.warning("[guard] 已踢出 %s(%s)｜%s", name, uid, brief)
         await self._say(event, "%s，刷屏上瘾是吧？送你出去冷静。" % name)
 
-    async def _say(self, event: AstrMessageEvent, text: str) -> None:
+    async def _say(self, event: AstrMessageEvent, text: str) -> bool:
         # event.send 要 MessageChain。plain_result() 返回 MessageEventResult，
         # 没有 get_result —— 实测报
         # 'MessageEventResult' object has no attribute 'get_result'。
         try:
             await event.send(MessageChain(chain=[Plain(text)]))
+            claim_turn(event, TurnClaim(
+                owner="dsh-guard", kind="moderation_replied", priority=100,
+                block_repeat=True, block_proactive=True, already_replied=True,
+            ))
+            # 处罚说明已经是这一轮的完整回应，避免 repeat 或主 LLM 再补一句。
+            event.stop_event()
+            return True
         except BaseException as e:
             logger.warning("[guard] 说明发送失败: %r", e)
+            return False
 
     # ---------------------------------------------------------------- 指令
     @filter.command("禁言状态")
@@ -818,10 +1080,26 @@ class Main(star.Star):
             % (s["skip_admin"], s["skip_ban_quota"]),
             "规矩：sev2 累计 %d 次禁 %d 分钟｜sev3 直接禁 %d 分钟｜上限 %d 分钟"
             % (WARN_TIMES, BAN_SEC // 60, BAN_SEC_HIGH // 60, MAX_BAN_SEC // 60),
+            "直接辱骂：命中即禁%d分钟｜已处理%d次"
+            % (max(1, DIRECT_INSULT_BAN_SEC // 60), s["direct_insult"]),
             "刷屏闸：%.0f秒内≥%d条算刷屏｜第%d次直接踢｜已禁%d人/踢%d人/失败%d"
             % (FLOOD_WINDOW, FLOOD_MAX, FLOOD_KICK_AT,
                s["flood_ban"], s["flood_kick"], s["flood_fail"]),
+            # 动态判罚层的验收指标：mood_up/mood_down 长期为 0 说明状态没读到
+            # 或权重太低 —— 等于没上线，必须能从这里看出来。
+            "动态判罚：%s｜读状态 %d 次（失败 %d）"
+            % ("开" if (MOOD_ON and MOOD_TUN.weight > 0) else "关",
+               s["mood_read"], s["mood_err"]),
+            "  偏向：更宽容 %d 次｜更严格 %d 次｜加重出的警告 %d（冷却挡下 %d）"
+            "｜心情带来的禁言 %d 次"
+            % (s["mood_up"], s["mood_down"], s["mood_warn"],
+               s["mood_warn_cd"], s["mood_ban_sec"]),
+            "  只作用于态度类（骂战/时政），行为类与围攻、代码兜底一律不看心情；"
+            "最多推一档，且只会把放过变成警告、不会变成禁言",
         ]
+        if _last_mood:
+            lines.append("最近几次心情：")
+            lines += ["  %s：%s" % (g, v) for g, v in list(_last_mood.items())[-4:]]
         if _last:
             lines.append("最近几次判定：")
             lines += ["  " + x for x in _last[-8:]]

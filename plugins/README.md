@@ -1,8 +1,8 @@
 # 插件目录 / Plugin Directory
 
-48 个 AstrBot 插件的索引。每个插件的设计取舍、踩过的坑、实测数据都写在各自 `main.py` 顶部注释里 —— 那里比这张表详细得多。
+54 个 AstrBot 插件的索引。每个插件的设计取舍、踩过的坑、实测数据都写在各自 `main.py` 顶部注释里 —— 那里比这张表详细得多。
 
-Index of 48 AstrBot plugins. Design tradeoffs, pitfalls, and measured data live in the header comment of each `main.py`, which is far more detailed than this table.
+Index of 54 AstrBot plugins. Design tradeoffs, pitfalls, and measured data live in the header comment of each `main.py`, which is far more detailed than this table.
 
 ## 安装 / Install
 
@@ -26,8 +26,10 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-mention` | 319 | `/艾特模式` | — | — |
 | `dsh-claimguard` | 525 | `/防骗状态` | — | — |
 | `dsh-selfworth` | 454 | `/利益状态` `/利益模式` `/利益账本` | — | — |
+| `dsh-agency` | 约 400 | `/自主状态` | — | — |
 | `dsh-initiate` | 620 | `/主动开口状态` `/主动开口测试` | — | 小模型 |
 | `dsh-emotion` | 582 | `/情绪状态` | — | — |
+| `dsh-fatigue` | 约 260 | `/厌烦状态` | — | — |
 | `dsh-quote` | 231 | `/引用状态` | — | — |
 | `dsh-glossary` | 408 | `/黑话状态` | — | — |
 | `dsh-human` | 332 | `/拟人状态` | — | — |
@@ -60,7 +62,7 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 |---|---|---|---|---|
 | `dsh-memory` | 1810 | `/我的档案` `/忘记我` `/记住` `/记忆状态` `/群记忆` 等 | — | 抽取用小模型 |
 | `dsh-social` | 418 | `/我和鱼` `/社交退出` `/关系状态` `/关系标签` | — | — |
-| `dsh-guard` | 828 | `/禁言状态` | — | 小模型 |
+| `dsh-guard` | 1106 + 619(mood_logic) | `/禁言状态` | — | 小模型 |
 | `dsh-poke` | 319 | `/戳一戳状态` | — | — |
 | `dsh-welcome` | 351 | `/欢迎测试` `/欢迎状态` | — | 聊天模型 |
 | `dsh-acl` | 534 | `/权限` `/权限状态` `/reset` | — | — |
@@ -79,9 +81,9 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-interest` | 370 | `/馋什么` | — | — |
 | `dsh-steal` | 610 | `/表情包` | — | 视觉模型(识图) |
 
-零外部依赖的插件(`acl`、`aiflavour`、`armor`、`claimguard`、`ctxclean`、`drift`、`emotion`、`factguard`、`glossary`、`homophone`、`human`、`humanizer`、`interest`、`leakguard`、`merge`、`mention`、`noise`、`pay`、`poke`、`proactive`、`quote`、`quoteref`、`scene`、`selfaware`、`selfguard`、`selfworth`、`social`、`spine`、`sticker`、`style`、`typo`)拷进去就能用,不需要额外配 API —— **48 个里有 31 个属于这一类**。
+零外部依赖的插件(`acl`、`agency`、`aiflavour`、`armor`、`claimguard`、`ctxclean`、`drift`、`emotion`、`fatigue`、`factguard`、`glossary`、`homophone`、`human`、`humanizer`、`interest`、`leakguard`、`merge`、`mention`、`noise`、`pay`、`poke`、`proactive`、`quote`、`quoteref`、`scene`、`selfaware`、`selfguard`、`selfworth`、`social`、`spine`、`sticker`、`style`、`typo`)拷进去就能用,不需要额外配 API —— **54 个里有 33 个属于这一类**。
 
-Plugins with no external dependencies (`acl`, `aiflavour`, `armor`, `claimguard`, `ctxclean`, `drift`, `emotion`, `factguard`, `glossary`, `homophone`, `human`, `humanizer`, `interest`, `leakguard`, `merge`, `mention`, `noise`, `pay`, `poke`, `proactive`, `quote`, `quoteref`, `scene`, `selfaware`, `selfguard`, `selfworth`, `social`, `spine`, `sticker`, `style`, `typo`) work as soon as they are copied in — no extra API setup. That's **31 of the 48**.
+Plugins with no external dependencies (`acl`, `agency`, `aiflavour`, `armor`, `claimguard`, `ctxclean`, `drift`, `emotion`, `fatigue`, `factguard`, `glossary`, `homophone`, `human`, `humanizer`, `interest`, `leakguard`, `merge`, `mention`, `noise`, `pay`, `poke`, `proactive`, `quote`, `quoteref`, `scene`, `selfaware`, `selfguard`, `selfworth`, `social`, `spine`, `sticker`, `style`, `typo`) work as soon as they are copied in — no extra API setup. That's **33 of the 54**.
 
 ## 建议的启用顺序 / Suggested rollout order
 
@@ -128,6 +130,8 @@ python3 dsh-emotion/test_emotion.py         # 36 项:抽取规则 + 状态机 + 
 python3 dsh-fwd/test_fwd.py                 # 嵌套展开 + 保头保尾 + 图片视频预算
 python3 dsh-glossary/test_glossary.py       # 真命中 + 防假命中 + 注入块形状 + 说明文字不许膨胀
 python3 dsh-guard/test_guard.py             # 关键词预筛 + 决策函数
+python3 dsh-guard/test_mood.py              # 113 项:五路状态→宽容度 + 档位/门槛/时长边界
+python3 dsh-guard/test_mood_check.py        # 47 项:跑真实 check()（假事件+桩判定+影子模式，不碰真群）
 python3 dsh-interest/test_interest.py       # 热度计算 + 口味轮换 + 注入预算
 python3 dsh-leakguard/test_leakguard.py     # 强/弱标题档 + 指令句影子层
 python3 dsh-memory/test_memory.py           # 抽取/去重/容量/过期 + 注入预算

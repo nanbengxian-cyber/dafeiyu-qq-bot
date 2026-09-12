@@ -36,9 +36,20 @@ _GAME_HIST_RE=re.compile(
     r"这关|那关|第.关|打了|通关|开局|阵营|路线|steam|游戏|模拟|策略"
     r"|三国|春秋|战国|唐朝|宋朝|明朝|清朝|历史课|课本|一战|二战")
 
-# 人身攻击：不能枚举脏话（这个群日常互骂），用「伤害词 + 指向家人」的组合
+# 人身攻击：家人死亡诅咒使用组合；明确指向个人的高置信度辱骂另走代码闸门
 _HARM_RE=re.compile(r"死|去世|癌|艾滋|残废|绝症|车祸|截肢|火化|坟|棺")
 _TARGET_RE=re.compile(r"你妈|你爸|你爹|你娘|你家|你父母|你全家|全家|一家人|祖宗|家人")
+_DIRECT_INSULT_RE=re.compile(
+    r"(?:傻\s*[逼比币]|煞\s*笔|沙\s*比|[sS][bB]|脑残|弱智|智障|废物|狗东西"
+    r"|畜生|杂种|贱种|贱人|人渣|去死|滚蛋|妈的|你妈|操你|草你|[nN][mM][sS][lL]"
+    r"|[cC][nN][mM])")
+_DIRECT_TARGET_RE=re.compile(r"(?:你|他|她|这人|那人|这货|那货).{0,8}$")
+_DIRECT_QUOTE_RE=re.compile(r"(?:(?:别|不要|不许|停止|禁止|没|没有|不会|不能|为什么|为啥).{0,4}(?:骂|说)|(?:他|她|有人|群里).{0,4}(?:说|骂|发))")
+def direct_insult(text):
+    raw=(text or "").strip(); m=_DIRECT_INSULT_RE.search(raw)
+    if not m or _DIRECT_QUOTE_RE.search(raw): return ""
+    compact=re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+","",raw)
+    return m.group(0) if (_DIRECT_INSULT_RE.fullmatch(compact) or "@" in raw or _DIRECT_TARGET_RE.search(raw)) else ""
 # 群体仇恨：**不能用裸伤害词**（「好吃死了」「笑死我了」全命中），
 # 必须是「群体指称 + 集体贬损谓语」
 _GROUP_RE=re.compile(r"美国|中国|俄罗斯|俄国|乌克兰|伊朗|伊拉克|以色列|巴勒斯坦|叙利亚"
@@ -97,6 +108,14 @@ check("A 组合命中需要两个条件都在", pre_hit("伊朗"), False)
 check("A 只有政治名词不命中", pre_hit("局势不太好"), False)
 check("A 游戏历史标记能撤销组合命中",
       pre_hit("美国和伊朗的战争") and not pre_hit("美国和伊朗的战争那关我打了三遍"), True)
+
+print("A1. 明确指向辱骂（纯代码闸门）")
+for s in ("sb", "傻逼", "@黄了 (1418045381) 你是废物", "@大肥鱼 (3752949717) 废物",
+          "你真是个弱智", "他就是狗东西", "你妈死了"):
+    check("A1 命中 %r" % s, bool(direct_insult(s)), True)
+for s in ("这个游戏真垃圾", "今天累死了", "别骂人", "为什么说sb", "他说了sb",
+          "傻鱼", "你真菜", "扶他滚呐", "废物利用", "垃圾分类"):
+    check("A1 放过 %r" % s, bool(direct_insult(s)), False)
 
 _BOOLS=("politics","stance","nsfw","illegal","ad","attack","joking")
 def _parse(raw):
