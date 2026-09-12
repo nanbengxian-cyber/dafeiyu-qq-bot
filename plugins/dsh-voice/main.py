@@ -595,6 +595,31 @@ def _cooldown_left(sid: str) -> int:
     left = COOLDOWN - int(time.time() - _last_call.get(sid, 0.0))
     return left if left > 0 else 0
 
+_COOL_LAST = ""
+# 冷却提示的说法。为什么不再用「慢点，还有 N 秒冷却」——
+# ①「N 秒冷却」是纯机器词，真人不会说"冷却"；
+# ②这是机器人最常重复的一句真文本：全量日志 114 次，2026-09-12 一天 34 次，
+#    等于每天当着全群念几十遍"我是程序"；
+# ③倒计时其实没必要，群友只需要知道"现在不行、等会儿"，不需要精确秒数；
+# ④必须给变体：只换成另一句固定的话，过两天它自己就成了新的口头禅。
+_COOL_POOL = (
+    "急啥，一个一个来",
+    "别催，让我缓口气",
+    "刚念完，等一下嘛",
+    "马上，这就好",
+    "来了来了",
+    "稍等会儿",
+)
+
+
+def _cool_line() -> str:
+    """冷却时挑一句人话，且不跟上一句重复。"""
+    global _COOL_LAST
+    cand = [x for x in _COOL_POOL if x != _COOL_LAST] or list(_COOL_POOL)
+    pick = random.choice(cand)
+    _COOL_LAST = pick
+    return pick
+
 
 def _notice_allowed(sid: str, now: float | None = None) -> bool:
     """同一群 NOTICE_GAP 秒内最多发一条机械提示，返回是否该发。
@@ -1223,7 +1248,7 @@ class Main(star.Star):
             # 冷却倒计时按群去重：90s 内只提示一次，其余静默。
             # 之前群友轮流敲 /说话 会刷出一串「慢点，还有 N 秒冷却」。
             if _notice_allowed(sid):
-                yield event.plain_result(f"慢点，还有 {left} 秒冷却")
+                yield event.plain_result(_cool_line())
             else:
                 logger.info("[voice] 冷却提示 %.0fs 内已发过，静默忽略（剩 %ds）",
                             NOTICE_GAP, left)

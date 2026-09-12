@@ -904,6 +904,31 @@ def _cooldown_left(key: str) -> int:
     left = COOLDOWN - int(time.time() - last)
     return left if left > 0 else 0
 
+_COOL_LAST = ""
+# 冷却提示的说法。为什么不再用「慢点，还有 N 秒冷却」——
+# ①「N 秒冷却」是纯机器词，真人不会说"冷却"；
+# ②这是机器人最常重复的一句真文本：全量日志 114 次，2026-09-12 一天 34 次，
+#    等于每天当着全群念几十遍"我是程序"；
+# ③倒计时其实没必要，群友只需要知道"现在不行、等会儿"，不需要精确秒数；
+# ④必须给变体：只换成另一句固定的话，过两天它自己就成了新的口头禅。
+_COOL_POOL = (
+    "急啥，一张一张来",
+    "别催，笔还没干",
+    "刚画完，让我喘口气",
+    "马上，这就好",
+    "来了来了",
+    "稍等会儿",
+)
+
+
+def _cool_line() -> str:
+    """冷却时挑一句人话，且不跟上一句重复。"""
+    global _COOL_LAST
+    cand = [x for x in _COOL_POOL if x != _COOL_LAST] or list(_COOL_POOL)
+    pick = random.choice(cand)
+    _COOL_LAST = pick
+    return pick
+
 
 # ---------------------------------------------------------------- 插件主体
 
@@ -1174,7 +1199,7 @@ class Main(star.Star):
         sid = event.unified_msg_origin or "global"
         left = _cooldown_left(sid)
         if left > 0:
-            yield event.plain_result(f"慢点，还有 {left} 秒冷却")
+            yield event.plain_result(_cool_line())
             return
         _last_call[sid] = time.time()
         event.set_extra("imagegen_done", True)
