@@ -256,16 +256,19 @@ _SLUR_RE = re.compile(
 # 6) 明确指向个人的直接辱骂：纯代码、低延迟、无需调用模型。
 #
 # 只匹配高置信度侮辱核心，不把普通否定词（笨、菜、丑）塞进来；还必须满足：
-#   - 消息含 @（AstrBot 的 message_str 会展开为 @昵称(QQ)）；或
-#   - 侮辱词前有「你/他/她/这人」；或
-#   - 去掉标点后整句就是侮辱词（真群漏判样本「sb」）。
+#   - 消息组件明确 @ 某人且辱骂词位于指向性表达中；或
+#   - 侮辱词前有第二人称「你」或现场指称「这人/那人/这货/那货」；或
+#   - 去掉标点后整句就是辱骂词（真群漏判样本「sb」）。
+# 第三人称「他/她」不能进这个无需上下文、直接禁言的高置信闸门：
+# 「好大儿谈个恋爱给他乐成傻逼了怎么办」描述的是别人，曾因此被误禁 300 秒。
+# 这类话仍可进入后面的上下文/模型判定，但不能仅凭代词直接处罚发言者。
 # 这样「别骂人」「他说了sb」「这个游戏真垃圾」不会仅因出现词而禁人。
 _DIRECT_INSULT_RE = re.compile(
-    r"(?:傻\s*[逼比币]|煞\s*笔|沙\s*比|[sS][bB]|脑残|弱智|智障|废物|狗东西"
-    r"|畜生|杂种|贱种|贱人|人渣|去死|滚蛋|妈的|你妈|操你|草你|[nN][mM][sS][lL]"
-    r"|[cC][nN][mM])"
+    r"(?:傻\s*[逼比币]|煞\s*笔|沙\s*比|(?<![A-Za-z])[sS][bB](?![A-Za-z])|脑残|弱智|智障|废物|狗东西"
+    r"|畜生|杂种|贱种|贱人|人渣|去死|滚蛋|妈的|你妈|操你|草你|(?<![A-Za-z])[nN][mM][sS][lL](?![A-Za-z])"
+    r"|(?<![A-Za-z])[cC][nN][mM](?![A-Za-z]))"
 )
-_DIRECT_TARGET_RE = re.compile(r"(?:你|他|她|这人|那人|这货|那货).{0,8}$")
+_DIRECT_TARGET_RE = re.compile(r"(?:你|这人|那人|这货|那货).{0,8}$")
 _DIRECT_QUOTE_RE = re.compile(
     r"(?:(?:别|不要|不许|停止|禁止|没|没有|不会|不能|为什么|为啥).{0,4}(?:骂|说)"
     r"|(?:他|她|有人|群里).{0,4}(?:说|骂|发))"
@@ -275,28 +278,39 @@ _DIRECT_QUOTE_RE = re.compile(
 def direct_insult(text: str) -> str:
     """返回高置信度直接辱骂词；不是明确指向个人时返回空字符串。"""
     raw = (text or "").strip()
-    m = _DIRECT_INSULT_RE.search(raw)
+    # 某些适配器把开头的 At 展开成「@昵称 (QQ)」。只检查 mention 后的正文，
+    # 而不是把整条消息里“出现过 @”当成辱骂指向证据。
+    body = re.sub(r"^@\S+(?:\s*\(\d{5,20}\))?\s*", "", raw, count=1)
+    m = _DIRECT_INSULT_RE.search(body)
     if not m:
         return ""
     # 「别骂人/为什么说sb」是在谈论辱骂，不是实施辱骂。
-    if _DIRECT_QUOTE_RE.search(raw):
+    if _DIRECT_QUOTE_RE.search(body):
         return ""
-    compact = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw)
+    compact = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", body)
     insult_only = bool(_DIRECT_INSULT_RE.fullmatch(compact))
-    # 中文代词紧贴谓语是常态（「你是废物」「他真弱智」），不能要求前方空格。
-    targeted = "@" in raw or bool(_DIRECT_TARGET_RE.search(raw))
+    # 中文代词紧贴谓语是常态（「你是废物」），不能要求前方空格。
+    targeted = bool(_DIRECT_TARGET_RE.search(body))
     return m.group(0) if (insult_only or targeted) else ""
 
 
-def _has_at_component(event: AstrMessageEvent) -> bool:
-    """message_str 在不同适配器下未必保留 @；组件是权威指向证据。"""
+def _at_component_insult(event: AstrMessageEvent) -> str:
+    """适配器不展开 @ 时，只检查 At 组件之后紧随的纯文本。"""
     try:
+        after_at: list[str] = []
+        seen_at = False
         for comp in event.get_messages() or ():
-            if comp.__class__.__name__ == "At":
-                return True
+            kind = comp.__class__.__name__
+            if kind == "At":
+                seen_at = True
+                after_at = []
+            elif seen_at and kind == "Plain":
+                after_at.append(str(getattr(comp, "text", "") or ""))
+            elif seen_at:
+                break
+        return direct_insult("".join(after_at)) if after_at else ""
     except BaseException:
-        pass
-    return False
+        return ""
 
 
 def _is_group_admin(event) -> bool:
@@ -419,6 +433,7 @@ _stat = {
 }
 _warns: dict[str, deque] = {}       # "gid:uid" -> sev>=2 的时间窗口
 _bans: dict[str, deque] = {}        # gid -> 禁言时间窗口
+_ban_locks: dict[str, asyncio.Lock] = {}  # gid -> 配额检查/预留串行化
 _ctx: dict[str, deque] = {}         # gid -> 最近几条 (name, text)
 _last: list[str] = []
 _flood: dict[str, deque] = {}       # "gid:uid" -> 消息时间戳窗口
@@ -476,7 +491,11 @@ def _parse(raw: str) -> dict | None:
     # （dsh-decide 踩过同一个坑，抄过来时把这个位置错误也抄了。）
     if not any(k in out for k in _BOOLS) and "severity" not in out:
         return None
-    r: dict = {k: bool(out.get(k, False)) for k in _BOOLS}
+    # JSON 字段必须真的是 bool；"false"、0、null 都是模型 schema 漂移，
+    # 不能用 bool() 把非空字符串反转成 True 后执行处罚。
+    if any(k in out and type(out[k]) is not bool for k in _BOOLS):
+        return None
+    r: dict = {k: out.get(k, False) for k in _BOOLS}
     try:
         r["severity"] = max(0, min(3, int(out.get("severity", 0))))
     except BaseException:
@@ -652,11 +671,7 @@ class Main(star.Star):
             # 配额以及平台权限仍统一由 _do_ban() 兜住。
             # ★ 动态判罚层不参与这一路 ★：明确指向的辱骂是**行为事实**，
             # 心情好也不该放行（用户把「违法、刷屏等行为」划在心情之外）。
-            insult = direct_insult(text)
-            if not insult and _has_at_component(event):
-                m = _DIRECT_INSULT_RE.search(text)
-                if m and not _DIRECT_QUOTE_RE.search(text):
-                    insult = m.group(0)
+            insult = direct_insult(text) or _at_component_insult(event)
             if insult:
                 _stat["direct_insult"] += 1
                 brief = "direct-insult word=%s ← %s：%s" % (
@@ -915,42 +930,56 @@ class Main(star.Star):
         return (call if callable(call) else None), routing
 
     async def _role_of(self, event: AstrMessageEvent, gid: str, uid: str) -> str:
-        """查这个人在群里是什么身份。查不到就当 member（宁可查错也不能漏查）。"""
+        """查成员身份；缺 API/查询失败返回 unknown，处罚路径必须 fail-closed。"""
         call, routing = self._routed(event)
         if call is None:
-            return "member"
+            return "unknown"
         try:
             info = await asyncio.wait_for(
                 call("get_group_member_info", group_id=int(gid), user_id=int(uid),
                      **routing),
                 timeout=6,
             )
-            return str((info or {}).get("role") or "member")
-        except BaseException as e:
-            logger.debug("[guard] 查身份失败(%s)，按普通成员处理: %r", uid, e)
-            return "member"
+            role = str((info or {}).get("role") or "")
+            return role if role in ("owner", "admin", "member") else "unknown"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[guard] 查身份失败(%s)，本次不处罚: %r", uid, e)
+            return "unknown"
 
     async def _do_ban(self, event, gid, uid, name, sec, kind, brief,
                       bypass_cap: bool = False) -> None:
         # 硬约束 1：管理员/群主禁不了。实测对 admin 调 set_group_ban 返回
         # cannot ban admin —— 先查身份能省掉无意义的 API 调用和满屏报错。
         role = await self._role_of(event, gid, uid)
+        if role == "unknown":
+            _stat["ban_fail"] += 1
+            logger.warning("[guard] 无法确认 %s(%s) 的群身份，本次不禁言｜%s", name, uid, brief)
+            return
         if role in ("owner", "admin"):
             _stat["skip_admin"] += 1
             logger.info("[guard] %s 是%s，禁不了（也不该禁）｜%s", name, role, brief)
             return
 
-        # 硬约束 2：同群 1 小时内最多禁 GROUP_BAN_MAX 人，防判定跑偏群灭
+        # 硬约束 2：同群 1 小时内最多禁 GROUP_BAN_MAX 人，防判定跑偏群灭。
+        # 名额必须在锁内预留；否则并发消息会同时看到旧长度并一起越过上限。
         now = time.time()
         bq = _bans.setdefault(gid, deque())
-        _prune(bq, now, BAN_WINDOW)
-        if len(bq) >= GROUP_BAN_MAX:
-            _stat["skip_ban_quota"] += 1
-            logger.warning(
-                "[guard] 同群 %.0f 分钟内已禁 %d 人，达上限不再禁（可能是判定跑偏了）｜%s",
-                BAN_WINDOW / 60, len(bq), brief,
-            )
-            return
+        reserved = False
+        lock = _ban_locks.setdefault(gid, asyncio.Lock())
+        async with lock:
+            _prune(bq, now, BAN_WINDOW)
+            if len(bq) >= GROUP_BAN_MAX:
+                _stat["skip_ban_quota"] += 1
+                logger.warning(
+                    "[guard] 同群 %.0f 分钟内已禁 %d 人，达上限不再禁（可能是判定跑偏了）｜%s",
+                    BAN_WINDOW / 60, len(bq), brief,
+                )
+                return
+            if not SHADOW:
+                bq.append(now)
+                reserved = True
 
         # 硬上限，兜死。刷屏禁言是一天（用户明确的惩罚），绕过 MAX_BAN_SEC。
         if bypass_cap:
@@ -967,6 +996,12 @@ class Main(star.Star):
         if call is None:
             _stat["ban_fail"] += 1
             logger.warning("[guard] 这个平台没有 call_action，禁不了")
+            if reserved:
+                async with lock:
+                    try:
+                        bq.remove(now)
+                    except ValueError:
+                        pass
             return
         try:
             await asyncio.wait_for(
@@ -974,14 +1009,28 @@ class Main(star.Star):
                      duration=sec, **routing),
                 timeout=8,
             )
-        except BaseException as e:
+        except asyncio.CancelledError:
+            # 动作可能已经发到平台，无法证明没有执行；保守保留预留并传播取消，
+            # 否则热重载可释放一个实际已使用的名额，突破同群硬上限。
+            raise
+        except asyncio.TimeoutError as e:
+            # 超时同样属于“结果未知”，不能回滚预留；宁可少禁一次也不能群灭。
             _stat["ban_fail"] += 1
-            # 异常消息经常是空的，必须连类型一起打，否则日志里只有
-            # 「禁言失败: 」什么线索都没有
+            logger.warning("[guard] 禁言结果超时未知(%s): %r｜%s",
+                           type(e).__name__, e, brief)
+            return
+        except Exception as e:  # noqa: BLE001
+            _stat["ban_fail"] += 1
+            if reserved:
+                async with lock:
+                    try:
+                        bq.remove(now)
+                    except ValueError:
+                        pass
+            # 明确调用失败才回滚配额；异常消息经常为空，连类型一起打。
             logger.warning("[guard] 禁言失败(%s): %r｜%s",
                            type(e).__name__, e, brief)
             return
-        bq.append(now)
         _stat["banned"] += 1
         logger.warning("[guard] 已禁言 %s(%s) %d 秒｜%s", name, uid, sec, brief)
         await self._say(event, "%s，%s，先安静 %d 分钟"
@@ -991,6 +1040,10 @@ class Main(star.Star):
         """踢出群。用于刷屏再犯（用户明确要求：再犯一次直接踢出去）。"""
         # 管理员/群主踢不了，先查身份
         role = await self._role_of(event, gid, uid)
+        if role == "unknown":
+            _stat["flood_fail"] += 1
+            logger.warning("[guard] 无法确认 %s(%s) 的群身份，本次不踢｜%s", name, uid, brief)
+            return
         if role in ("owner", "admin"):
             _stat["skip_admin"] += 1
             logger.info("[guard] %s 是%s，踢不了（也不该踢）｜%s", name, role, brief)

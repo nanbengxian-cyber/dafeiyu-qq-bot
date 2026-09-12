@@ -34,6 +34,7 @@
 #   响应体截断、Content-Type 白名单。
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -456,15 +457,8 @@ def _is_public_ip(host: str) -> tuple[bool, str]:
             ip = ipaddress.ip_address(addr.split("%")[0])
         except ValueError:
             return False, "解析出的地址不合法"
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return False, "指向内网地址，已拒绝"
+        if not ip.is_global:
+            return False, "指向非公网地址，已拒绝"
     return True, ""
 
 
@@ -483,6 +477,52 @@ async def _check_url(url: str) -> tuple[bool, str]:
     if not ok:
         return False, why
     return True, ""
+
+
+class _PublicResolver(aiohttp.abc.AbstractResolver):
+    """只把本次实际解析出的公网地址交给 aiohttp 连接。
+
+    `_check_url()` 的预检不足以防 DNS rebinding：若连接器随后再次独立解析，
+    攻击域名可以先返回公网、连接时再返回内网。这个 resolver 在连接器真正取
+    地址时重新执行同一条“所有地址均须 global”规则，并直接返回已校验的 IP。
+    """
+
+    async def resolve(self, host, port=0, family=socket.AF_UNSPEC):
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, port, family, socket.SOCK_STREAM
+        )
+        out = []
+        seen = set()
+        for fam, _socktype, proto, _canonname, sockaddr in infos:
+            addr = sockaddr[0].split("%")[0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError as exc:
+                raise OSError("解析出的地址不合法") from exc
+            if not ip.is_global:
+                raise OSError("DNS 解析到非公网地址，已拒绝")
+            key = (fam, addr, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "hostname": host,
+                "host": addr,
+                "port": port,
+                "family": fam,
+                "proto": proto,
+                "flags": socket.AI_NUMERICHOST,
+            })
+        if not out:
+            raise OSError("域名解析不到地址")
+        return out
+
+    async def close(self):
+        return None
+
+
+def _public_connector() -> aiohttp.TCPConnector:
+    return aiohttp.TCPConnector(resolver=_PublicResolver(), use_dns_cache=False)
 
 
 # ---------------------------------------------------------------- 正文提取
@@ -623,14 +663,15 @@ async def _fetch(url: str) -> tuple[str, str, str]:
     }
     try:
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            connector=_public_connector(),
         ) as session:
             for _ in range(MAX_REDIRECTS):
                 ok, why = await _check_url(current)
                 if not ok:
                     return "", "", why
                 async with session.get(
-                    current, headers=headers, allow_redirects=False, ssl=False
+                    current, headers=headers, allow_redirects=False
                 ) as resp:
                     if resp.status in (301, 302, 303, 307, 308):
                         loc = resp.headers.get("Location")
@@ -793,23 +834,29 @@ def _bili_id(text: str) -> tuple[str, str]:
 
 
 async def _resolve_b23(url: str) -> str:
-    """b23.tv 短链换成真实地址。带重试：B 站 CDN 会对香港出口做分钟级风控，
-    连接可能被掐到超时（约几分钟后自行恢复），重试可吸收这类抖动。"""
-    last = url
-    for attempt in range(3):
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=12)
-            ) as session:
+    """逐跳解析 b23.tv 短链；每次跳转都重新执行公网 URL 校验。"""
+    current = url
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=12),
+            connector=_public_connector(),
+        ) as session:
+            for _ in range(MAX_REDIRECTS):
+                ok, _ = await _check_url(current)
+                if not ok:
+                    return url
                 async with session.get(
-                    url, headers={"User-Agent": UA}, allow_redirects=True, ssl=False
+                    current, headers={"User-Agent": UA}, allow_redirects=False
                 ) as resp:
-                    return str(resp.url)
-        except Exception:  # noqa: BLE001
-            last = url
-            if attempt < 2:
-                await asyncio.sleep(2)
-    return last
+                    if resp.status not in (301, 302, 303, 307, 308):
+                        return str(resp.url)
+                    loc = resp.headers.get("Location")
+                    if not loc:
+                        return url
+                    current = urljoin(str(resp.url), loc)
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return url
+    return url
 
 
 def _fmt_dur(sec: int) -> str:
@@ -860,7 +907,6 @@ async def _bili_info(text: str) -> tuple[str, str]:
                         "Accept": "application/json, text/plain, */*",
                         "Accept-Language": "zh-CN,zh;q=0.9",
                     },
-                    ssl=False,
                 ) as resp:
                     if resp.status != 200:
                         last_err = f"HTTP {resp.status}"
@@ -978,7 +1024,7 @@ QQ 内容安全对时政、敏感人物、色情、赌博、诈骗极其严格�
 
 
 def _mod_parse(raw: str) -> dict | None:
-    """解析审核模型的 JSON 输出。容忍 ```json``` 围栏和前后空白。"""
+    """解析并严格校验审核模型 JSON；类型含混时必须 fail-closed。"""
     if not raw:
         return None
     s = raw.strip()
@@ -995,6 +1041,13 @@ def _mod_parse(raw: str) -> dict | None:
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(d, dict):
+        return None
+    bool_keys = (
+        "politics", "sensitive_figure", "nsfw", "illegal", "hate", "can_send"
+    )
+    if any(type(d.get(k)) is not bool for k in bool_keys):
+        return None
+    if type(d.get("reason")) is not str:
         return None
     return d
 
@@ -1017,7 +1070,9 @@ async def _moderate(
         return True, ""
     if _MOD_BLOCK_RE.search(blob):
         return False, "命中敏感词(正则)"
-    key = url.strip() if (url or "").strip() else "c:%d" % hash(blob[:500])
+    # 缓存必须绑定完整待发送内容；URL 相同不代表正文没变。
+    key_material = "\0".join((url.strip(), MOD_PROVIDER, blob)).encode("utf-8")
+    key = "sha256:" + hashlib.sha256(key_material).hexdigest()
     now = time.time()
     hit = _mod_cache.get(key)
     if hit and now - hit[0] < MOD_TTL:
@@ -1035,7 +1090,7 @@ async def _moderate(
         resp = await asyncio.wait_for(
             context.llm_generate(
                 chat_provider_id=pid,
-                prompt=_MOD_PROMPT.format(content=blob[:2000]),
+                prompt=_MOD_PROMPT.format(content=blob),
                 system_prompt=_MOD_SYS,
                 temperature=0,  # 审核是判定不是创作，随机性只带来摇摆
                 max_tokens=200,
@@ -1231,19 +1286,24 @@ class Main(star.Star):
 
         if bare_bv:
             info, err = await _bili_info(bare_bv)
-            if info and _regex_block_hit(info):
-                info = ""
-                logger.info("[web] B 站信息命中敏感词，已拦下（%s）", bare_bv[:30])
+            if info:
+                ok, why = await _moderate(self.context, umo, info, bare_bv, timeout=8)
+                if not ok:
+                    info = ""
+                    err = why
+                    logger.info("[web] B 站信息审核未通过（%s）", why)
             blocks.append(info if info else f"（{bare_bv} 查不到：{err or '内容不予展示'}）")
 
         for url in urls:
             if _is_bili(url):
                 info, err = await _bili_info(url)
-                if info and _regex_block_hit(info):
-                    logger.info("[web] B 站信息命中敏感词，退回抓网页(%s)", url[:60])
-                elif info:
-                    blocks.append(info)
-                    continue
+                if info:
+                    ok, why = await _moderate(self.context, umo, info, url, timeout=8)
+                    if ok:
+                        blocks.append(info)
+                        continue
+                    err = why
+                    logger.info("[web] B 站信息审核未通过，退回抓网页(%s)", why)
                 logger.info("[web] B 站查询失败(%s)，退回抓网页", err or "内容不予展示")
             title, body, err = await _fetch(url)
             if body and (
@@ -1447,10 +1507,13 @@ class Main(star.Star):
         """
         if _is_bili(url):
             info, err = await _bili_info(url)
-            if info and _regex_block_hit(info):
-                logger.info("[web] 工具读页 %s 命中敏感词(B站)，已拦下", url[:60])
-                return "这个链接的内容不予展示。请如实告诉用户你读不了，不要编造。"
             if info:
+                ok, why = await _moderate(
+                    self.context, event.unified_msg_origin or "", info, url, timeout=10
+                )
+                if not ok:
+                    logger.info("[web] 工具读页 %s 审核未通过(%s)", url[:60], why)
+                    return "这个链接的内容不予展示。请如实告诉用户你读不了，不要编造。"
                 return info
         title, body, err = await _fetch(url)
         if not body:
@@ -1482,8 +1545,11 @@ class Main(star.Star):
         info, err = await _bili_info(video)
         if not info:
             return f"查不到这个视频：{err}。请如实告诉用户，不要编造。"
-        if _regex_block_hit(info):
-            logger.info("[web] 工具查B站命中敏感词，已拦下")
+        ok, why = await _moderate(
+            self.context, event.unified_msg_origin or "", info, video, timeout=10
+        )
+        if not ok:
+            logger.info("[web] 工具查B站审核未通过(%s)", why)
             return "这个视频的信息不予展示。请如实告诉用户你查不到，不要编造。"
         return info
 
@@ -1509,21 +1575,27 @@ class Main(star.Star):
             # 路径（敏感人物的维基百科网址一发，整群没）。只有带网址时才
             # 送审，平时零开销。审核不过：先把网址全摘掉再正则复查；
             # 正文本身也过不了正则就整条换成拒答短话。
-            gate_changed = False
             if cleaned.strip() and MOD_ENABLED and _REPLY_URL_RE.search(cleaned):
                 cleaned = await self._outbound_gate(event, cleaned)
-                gate_changed = True
-            if cleaned != raw or gate_changed:
+            if cleaned != raw:
                 try:
                     response.completion_text = cleaned
                 except Exception:  # noqa: BLE001
                     response._completion_text = cleaned
-                if gate_changed:
-                    logger.warning("[web] 回复已被出口闸改写")
-                else:
-                    logger.warning("[web] 已清理模型泄漏的伪工具调用标记")
-        except BaseException as e:  # noqa: BLE001
+                logger.warning("[web] 回复已被出口闸或泄漏清理改写")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
             logger.error("[web] 清理钩子异常：%s", e)
+            # 出口钩子异常也不能保留未经审核的网址。
+            safe = _REPLY_URL_RE.sub(
+                "", getattr(response, "completion_text", "") or ""
+            )
+            safe = BARE_RE.sub("", safe).strip() or random.choice(_REFUSALS)
+            try:
+                response.completion_text = safe
+            except Exception:  # noqa: BLE001
+                response._completion_text = safe
 
     async def _outbound_gate(self, event: AstrMessageEvent, text: str) -> str:
         """回复出口闸：回复带网址时调用。返回最终要发出去的文字。"""
@@ -1571,9 +1643,14 @@ class Main(star.Star):
             return
         if _is_bili(urls[0]):
             info, err = await _bili_info(urls[0])
-            if info and _regex_block_hit(info):
-                yield event.plain_result("查不到：这个视频的信息不予展示")
-                return
+            if info:
+                ok, why = await _moderate(
+                    self.context, event.unified_msg_origin or "", info, urls[0]
+                )
+                if not ok:
+                    logger.info("[web] /看网页 B站审核未通过(%s)", why)
+                    yield event.plain_result(random.choice(_REFUSALS))
+                    return
             yield event.plain_result(info or f"查不到：{err}")
             return
         title, body, err = await _fetch(urls[0])
@@ -1640,9 +1717,14 @@ class Main(star.Star):
             yield event.plain_result("用法：/b站 BV1xx411c7mD")
             return
         info, err = await _bili_info(arg)
-        if info and _regex_block_hit(info):
-            yield event.plain_result("查不到：这个视频的信息不予展示")
-            return
+        if info:
+            ok, why = await _moderate(
+                self.context, event.unified_msg_origin or "", info, arg
+            )
+            if not ok:
+                logger.info("[web] /b站审核未通过(%s)", why)
+                yield event.plain_result(random.choice(_REFUSALS))
+                return
         yield event.plain_result(info or f"查不到：{err}")
 
     @filter.command("联网状态")

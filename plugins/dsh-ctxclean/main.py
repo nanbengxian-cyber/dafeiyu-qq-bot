@@ -251,21 +251,30 @@ def _is_plain(msg) -> bool:
 
 
 def _keep_recent_turns(msgs: list, turns: int) -> list:
-    """只留最近 turns 轮，且从 user 开头切。
+    """保留持久 system/developer 前缀和最近 turns 个 user 轮。
 
-    从 user 切是硬要求：OpenAI 规定 tool 消息必须跟在带 tool_calls 的
-    assistant 之后，从中间切会造出孤儿 tool 消息，直接 400。
+    尾部必须从 user 切，避免造出孤儿 tool；首个 user 之前的 system/developer
+    是每轮都应存在的持久约束，不能随历史截断一起删除。
     """
     if turns <= 0:
         return msgs
-    body = [m for m in msgs if _is_plain(m) or isinstance(m, dict)]
-    n_user = sum(1 for m in body if isinstance(m, dict) and m.get("role") == "user")
+    n_user = sum(
+        1 for m in msgs if isinstance(m, dict) and m.get("role") == "user"
+    )
     if n_user <= turns:
         return msgs
 
-    # 从后往前数 turns 个 user，记下位置
+    prefix_end = next(
+        (i for i, m in enumerate(msgs)
+         if isinstance(m, dict) and m.get("role") == "user"),
+        len(msgs),
+    )
+    prefix = [
+        m for m in msgs[:prefix_end]
+        if not isinstance(m, dict) or m.get("role") in ("system", "developer")
+    ]
     seen = 0
-    cut = 0
+    cut = len(msgs)
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
         if isinstance(m, dict) and m.get("role") == "user":
@@ -273,7 +282,7 @@ def _keep_recent_turns(msgs: list, turns: int) -> list:
             if seen == turns:
                 cut = i
                 break
-    return msgs[cut:]
+    return prefix + msgs[cut:]
 
 
 class Main(star.Star):

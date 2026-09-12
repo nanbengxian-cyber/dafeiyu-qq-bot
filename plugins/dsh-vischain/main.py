@@ -256,7 +256,10 @@ async def _retry_with_normalized_images(provider, args, kwargs):
     retry_kwargs = dict(kwargs)
     retry_kwargs["image_urls"] = normalized
     try:
-        return await provider.text_chat(*args, **retry_kwargs)
+        # 1210 特殊补试也必须遵守单次尝试预算。
+        return await asyncio.wait_for(
+            provider.text_chat(*args, **retry_kwargs), timeout=ATTEMPT_TIMEOUT
+        )
     finally:
         for path in made:
             try:
@@ -388,6 +391,9 @@ class ChainProvider(Provider):
         for lk in links:
             pid = lk.provider_config.get("id", "?")
             st = self.stat.setdefault(pid, {"ok": 0, "fail": 0, "sec": 0.0})
+            # 连败按“逻辑请求”而不是 attempt 计数。否则默认 RETRY=2 时，
+            # 一张图的三次瞬时超时就能把健康 provider 永久摘除。
+            provider_failure_counted = False
             for attempt in range(RETRY + 1):
                 t0 = time.time()
                 try:
@@ -424,17 +430,21 @@ class ChainProvider(Provider):
                             e = fixed_err
                             img = _image_level(e)
                     st["fail"] += 1
-                    # [ban:consec-v1] 连续失败计数器
-                    _consec[pid] = _consec.get(pid, 0) + 1
-                    if _consec[pid] >= CONSEC_BAN and CONSEC_BAN > 0:
-                        _banned.add(pid)
-                        _consec[pid] = 0
-                        logger.warning(
-                            "[vischain] %s 连续失败 %d 次，永久移除（额度/通道疑似耗尽，回落到后续档）",
-                            pid, CONSEC_BAN,
-                        )
-                    last = e
+                    # 只有明确的 provider/channel 级永久故障参与摘除；超时、429、
+                    # 图片 1210/1301/contentfilter 都可能只是瞬时或图级问题。
+                    # 且一次逻辑请求对同一档最多累计一次连败。
                     perm = _permanent(e)
+                    if perm and not img and not provider_failure_counted:
+                        provider_failure_counted = True
+                        _consec[pid] = _consec.get(pid, 0) + 1
+                        if _consec[pid] >= CONSEC_BAN and CONSEC_BAN > 0:
+                            _banned.add(pid)
+                            _consec[pid] = 0
+                            logger.warning(
+                                "[vischain] %s 连续 %d 个请求确认通道故障，永久移除（进程重启后重试）",
+                                pid, CONSEC_BAN,
+                            )
+                    last = e
                     tr = _transient(e)
                     # [patch:slow-v1] 白花过时间的档：不是坏，是贵。降权而不是拉黑，
                     # 所以它仍留在候选里兜底，只是这一轮排到最后。
@@ -459,6 +469,10 @@ class ChainProvider(Provider):
                     )
                     if not tr:
                         break  # 非瞬时错误原地重试没意义，换档
+                    # timeout/429 已经白花墙钟或触发限流，立刻原地再撞只会把
+                    # 延迟和限流放大；只有 403/1010 等瞬时秒失败值得原地重试。
+                    if exp:
+                        break
                     continue
                 dt = time.time() - t0
                 st["ok"] += 1

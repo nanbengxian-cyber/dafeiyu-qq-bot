@@ -40,16 +40,18 @@ _GAME_HIST_RE=re.compile(
 _HARM_RE=re.compile(r"死|去世|癌|艾滋|残废|绝症|车祸|截肢|火化|坟|棺")
 _TARGET_RE=re.compile(r"你妈|你爸|你爹|你娘|你家|你父母|你全家|全家|一家人|祖宗|家人")
 _DIRECT_INSULT_RE=re.compile(
-    r"(?:傻\s*[逼比币]|煞\s*笔|沙\s*比|[sS][bB]|脑残|弱智|智障|废物|狗东西"
-    r"|畜生|杂种|贱种|贱人|人渣|去死|滚蛋|妈的|你妈|操你|草你|[nN][mM][sS][lL]"
-    r"|[cC][nN][mM])")
-_DIRECT_TARGET_RE=re.compile(r"(?:你|他|她|这人|那人|这货|那货).{0,8}$")
+    r"(?:傻\s*[逼比币]|煞\s*笔|沙\s*比|(?<![A-Za-z])[sS][bB](?![A-Za-z])|脑残|弱智|智障|废物|狗东西"
+    r"|畜生|杂种|贱种|贱人|人渣|去死|滚蛋|妈的|你妈|操你|草你|(?<![A-Za-z])[nN][mM][sS][lL](?![A-Za-z])"
+    r"|(?<![A-Za-z])[cC][nN][mM](?![A-Za-z]))")
+_DIRECT_TARGET_RE=re.compile(r"(?:你|这人|那人|这货|那货).{0,8}$")
 _DIRECT_QUOTE_RE=re.compile(r"(?:(?:别|不要|不许|停止|禁止|没|没有|不会|不能|为什么|为啥).{0,4}(?:骂|说)|(?:他|她|有人|群里).{0,4}(?:说|骂|发))")
 def direct_insult(text):
-    raw=(text or "").strip(); m=_DIRECT_INSULT_RE.search(raw)
-    if not m or _DIRECT_QUOTE_RE.search(raw): return ""
-    compact=re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+","",raw)
-    return m.group(0) if (_DIRECT_INSULT_RE.fullmatch(compact) or "@" in raw or _DIRECT_TARGET_RE.search(raw)) else ""
+    raw=(text or "").strip()
+    body=re.sub(r"^@\S+(?:\s*\(\d{5,20}\))?\s*", "", raw, count=1)
+    m=_DIRECT_INSULT_RE.search(body)
+    if not m or _DIRECT_QUOTE_RE.search(body): return ""
+    compact=re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+","",body)
+    return m.group(0) if (_DIRECT_INSULT_RE.fullmatch(compact) or _DIRECT_TARGET_RE.search(body)) else ""
 # 群体仇恨：**不能用裸伤害词**（「好吃死了」「笑死我了」全命中），
 # 必须是「群体指称 + 集体贬损谓语」
 _GROUP_RE=re.compile(r"美国|中国|俄罗斯|俄国|乌克兰|伊朗|伊拉克|以色列|巴勒斯坦|叙利亚"
@@ -111,10 +113,13 @@ check("A 游戏历史标记能撤销组合命中",
 
 print("A1. 明确指向辱骂（纯代码闸门）")
 for s in ("sb", "傻逼", "@黄了 (1418045381) 你是废物", "@大肥鱼 (3752949717) 废物",
-          "你真是个弱智", "他就是狗东西", "你妈死了"):
+          "你真是个弱智", "这人就是狗东西", "你妈死了"):
     check("A1 命中 %r" % s, bool(direct_insult(s)), True)
 for s in ("这个游戏真垃圾", "今天累死了", "别骂人", "为什么说sb", "他说了sb",
-          "傻鱼", "你真菜", "扶他滚呐", "废物利用", "垃圾分类"):
+          "傻鱼", "你真菜", "扶他滚呐", "废物利用", "垃圾分类",
+          "好大儿谈个恋爱给他乐成傻逼了怎么办", "她考试考砸被人说弱智",
+          "@小明 (12345678) 好大儿谈恋爱给他乐成傻逼了",
+          "USB坏了你怎么办", "ISBN编号", "sbatch任务"):
     check("A1 放过 %r" % s, bool(direct_insult(s)), False)
 
 _BOOLS=("politics","stance","nsfw","illegal","ad","attack","joking")
@@ -139,7 +144,8 @@ def _parse(raw):
         m=re.search(r'"why"\s*:\s*"([^"]*)"',body)
         if m: out["why"]=m.group(1)
     if not any(k in out for k in _BOOLS) and "severity" not in out: return None
-    r={k:bool(out.get(k,False)) for k in _BOOLS}
+    if any(k in out and type(out[k]) is not bool for k in _BOOLS): return None
+    r={k:out.get(k,False) for k in _BOOLS}
     try: r["severity"]=max(0,min(3,int(out.get("severity",0))))
     except BaseException: r["severity"]=0
     w=out.get("why"); r["why"]=w.strip()[:24] if isinstance(w,str) else ""
@@ -194,6 +200,11 @@ check("B10 severity 负数被夹紧", _parse('{"severity":-5,"politics":true}')[
 check("B11 severity 非数字回落0", _parse('{"severity":"高","politics":true}')["severity"], 0)
 check("B12 why 超长被截", len(_parse('{"severity":2,"why":"'+"啊"*50+'"}')["why"]), 24)
 check("B13 缺字段默认False", _parse('{"severity":2}')["nsfw"], False)
+for i, bad in enumerate((
+    '{"attack":"false","severity":3}', '{"attack":1,"severity":3}',
+    '{"attack":null,"severity":3}', '{"attack":{},"severity":3}',
+), 14):
+    check("B%d 非 bool 判解析失败" % i, _parse(bad), None)
 
 BAN_SEC,BAN_SEC_HIGH,MAX_BAN_SEC,WARN_TIMES=600,1800,1800,2
 _HARD=("politics","nsfw","illegal","ad")
@@ -332,7 +343,7 @@ check("G3 一小时后恢复", ban_ok(1000.0+3700), True)
 
 print("H. 管理员豁免（技术上也禁不了：实测返回 cannot ban admin）")
 def can_ban(role,uid,me,white):
-    if role in ("owner","admin"): return False
+    if role in ("owner","admin","unknown"): return False
     if uid==me: return False
     if uid in white: return False
     return True
@@ -341,7 +352,7 @@ check("H2 管理员不禁", can_ban("admin","1","me",set()), False)
 check("H3 普通成员可禁", can_ban("member","1","me",set()), True)
 check("H4 机器人自己不禁", can_ban("member","me","me",set()), False)
 check("H5 白名单不禁", can_ban("member","9","me",{"9"}), False)
-check("H6 查不到身份按member处理(宁可查错不能漏查)", can_ban("member","1","me",set()), True)
+check("H6 查不到身份必须不处罚", can_ban("unknown","1","me",set()), False)
 
 print()
 if fails: print("FAILED %d: %s"%(len(fails),fails)); sys.exit(1)

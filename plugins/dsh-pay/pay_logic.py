@@ -39,13 +39,6 @@ _EXPLICIT_INTENT_RES = [
 # V你50 是给机器人转钱；V我50 是向机器人要钱，方向相反，绝不能触发。
 _V_TO_BOT_RE = re.compile(r"(?:^|[^a-z0-9])v(?:你|大肥鱼)\d+(?:元)?(?:$|[^a-z0-9])", re.I)
 
-_DEFAULT_CONFIRM_PHRASES = [
-    "已到账", "到账了", "到账", "已收到", "收到了", "收到赞助", "收到打赏",
-    "收到转账", "赞助到账", "打赏到账", "确认收到", "感谢已到账", "钱到账",
-    "收款成功", "已确认",
-]
-
-
 def detect_intent(text: str, extra_words=None) -> str:
     """返回明确的「给机器人赞助」意向；讨论赞助/钱/版本号一律不算。"""
     n = norm(text)
@@ -77,10 +70,21 @@ def detect_method(text: str) -> str:
     return ""
 
 
+_OWNER_CONFIRM_RE = re.compile(
+    r"(?:钱|赞助|打赏|转账)?(?:已经|已)?(?:到账(?:了)?|收到(?:了)?|收到了)(?:钱|赞助|打赏|转账)?"
+    r"|(?:钱|赞助|打赏|转账)?(?:收款成功|确认收到|确认到账)"
+)
+_OWNER_CONFIRM_PREFIX_RE = re.compile(r"(?:感谢)?(?:已经|已)(?:到账(?:了)?|收到(?:了)?)")
+_OWNER_CONFIRM_NEG_RE = re.compile(r"(?:没|没有|未|还没|尚未|失败|不到账|没到|未到|没收|未收|不是)")
+_OWNER_CONFIRM_META_RE = re.compile(r"(?:吗|么|嘛|？|\?|如果|假如|怎么|如何|逻辑|代码|测试|讨论|判断|检测)")
+
+
 def is_owner_confirm(text: str) -> bool:
-    """群主确认到账短语。返回是否命中。"""
-    n = norm(text)
-    return any("".join(p.split()) in n for p in _DEFAULT_CONFIRM_PHRASES)
+    """只接受明确肯定且短小的到账确认，否定/疑问/元讨论一律不算。"""
+    n = norm(text).strip("，,。.!！")
+    if not n or _OWNER_CONFIRM_NEG_RE.search(n) or _OWNER_CONFIRM_META_RE.search(n):
+        return False
+    return bool(_OWNER_CONFIRM_RE.fullmatch(n) or _OWNER_CONFIRM_PREFIX_RE.fullmatch(n))
 
 
 # --------------------------------------------------------------------------- #

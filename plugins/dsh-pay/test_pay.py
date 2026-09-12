@@ -44,7 +44,14 @@ for text, want in (
     check("方式 %r" % text, detect_method(text), want)
 
 print("E. 确认与状态机")
-check("群主确认短语", is_owner_confirm("钱到账了"), True)
+for text in ("钱到账了", "已收到赞助", "转账已到账", "确认收到"):
+    check("群主确认 %r" % text, is_owner_confirm(text), True)
+for text in (
+    "还没到账", "未到账", "到账了吗", "到账失败", "如果到账了",
+    "讨论到账逻辑", "怎么判断到账", "不是已收到", "他已到账了吧",
+    "确认", "已确认",
+):
+    check("不确认 %r" % text, is_owner_confirm(text), False)
 clock = [1000.0]
 m = PayMachine(now=lambda: clock[0], global_cooldown=0)
 check("进入待选", m.trigger_intent("1", "阿鱼"), "ask")
