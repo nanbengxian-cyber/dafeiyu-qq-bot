@@ -45,6 +45,12 @@ MECH_HINT = re.compile(r"慢点，还有 \d+ 秒冷却|这次语音没确认发�
 # 指令回执类输出（/权限、/情绪状态…）不是「聊天措辞重复」，统计重复率时排除
 COMMAND_OUT = re.compile(r"^(你是群主|我这边和你的互动档位|用法：|我记住的你|已删除|复读 |违规看守|自主系统)")
 VOICE_BLOCK = re.compile(r"\[voice\] 审核未通过不发语音|\[voice\] 审核超时|\[voice\] 审核异常")
+# 机器人输出里的结构化标记（框架与插件塞的），不是它自己的措辞。
+# 引用标记来自 dsh-quote：`[引用消息] 正文`。
+_MARKER = re.compile(
+    r"\[(?:引用消息|引用图片|图片|语音|表情|视频|文件|At:\d+)\]"
+)
+
 FAILED = re.compile(r"主动回复失败")
 TB = re.compile(r"\[ERRO\].*Traceback|Traceback \(most recent call last\)")
 # decide/selfguard 主动停传播后框架仍尝试发空消息导致的「主动回复失败」是预期静默
@@ -178,7 +184,10 @@ def score(ev, hours, raw_lines=None):
     # 所以改成 4 字滑窗，且要求出现在 >=3 条**不同回复**里，避免单条长回复刷高。
     gram_replies = Counter()
     for b in bots:
-        s = re.sub(r"\[At:\d+\]", "", b["text"])
+        # 先摘掉结构化标记再看措辞：`[引用消息]` 是真的会被念进 4 字滑窗的
+        # （日志里 328 条），不摘的话「引用消息」永远是最高频假 gram，
+        # 把真正的复读（爪子拿开 / 图没看着）挤下去。
+        s = _MARKER.sub("", b["text"])
         s = re.sub(r"[^\u4e00-\u9fff]", "", s)
         if MECH_HINT.search(b["text"]) or COMMAND_OUT.search(b["text"].strip()):
             continue
