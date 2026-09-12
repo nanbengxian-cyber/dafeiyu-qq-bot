@@ -35,6 +35,9 @@
 # 现在按「这张图是不是本轮要回答的东西」分开：
 #   · 当前消息自带的图、用户精确引用的图 —— 照旧等（回答就靠它）
 #   · 历史里顺带的图 —— 只吃缓存；没缓存的丢后台转述，本轮不等
+# 历史图有两个例外也照旧等，因为不等会变成「答非所问」：
+#   · 这一轮就是在说图（「这图是啥」）—— 判不准时一律退回旧行为
+#   · 图刚发出来没多久（默认 45s 内）—— 大概率就是眼下在聊的那张
 # 后台转述完照样写进 _caption_cache，所以同一张图下一轮是白拿。
 
 import asyncio
@@ -68,6 +71,12 @@ BUDGET = float(os.environ.get("DSH_IMGCTX_BUDGET", "15"))
 # 后台预转述最多同时跑几个。历史图不阻塞本轮，但也不能无限起任务
 # （有人连刷十张时，靠这个上限 + MAX_IMAGES 兜住）。
 WARM_MAX = int(os.environ.get("DSH_IMGCTX_WARM", "4"))
+# 历史图也照等的第一种情形：这一轮就是在说图。
+# 不等之后，有人发完图再@它问「这图是啥」，那张图算「历史图」，就会变成没看图
+# 直接答 —— 那正是答非所问。所以判不准的时候一律退回旧行为，慢一点好过瞎答。
+ASK_IMAGE_RE = re.compile(r"图|截图|表情|照片|画的|p的", re.IGNORECASE)
+# 第二种情形：图刚发出来没多久，大概率就是眼下在聊的那张。
+RECENT_IMAGE_S = int(os.environ.get("DSH_IMGCTX_RECENT", "45"))
 # 单张图下载超时
 FETCH_TIMEOUT = float(os.environ.get("DSH_IMGCTX_FETCH_TIMEOUT", "8"))
 # 转述前把图缩到这个最长边。实测（125KB 原图 vs 缩到 768）：
@@ -249,6 +258,16 @@ def _framework_image_paths(req, quoted: bool | None = None) -> list[str]:
 def _quoted_image_paths(req) -> list[str]:
     """只取被引用消息里的图片，防止和当前消息的图混淆。"""
     return _framework_image_paths(req, quoted=True)
+
+
+def _turn_asks_about_image(req) -> bool:
+    """当前这句是不是在说图。拿不到原文时返回 True（保守：退回阻塞等图）。"""
+    text = getattr(req, "prompt", None)
+    if text is None:
+        return True
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(ASK_IMAGE_RE.search(text))
 
 
 def _already_has_image_context(req) -> bool:
@@ -655,8 +674,23 @@ class Main(star.Star):
 
         只有「本轮要回答的那张图」（当前消息自带 / 用户精确引用）才阻塞等待；
         历史里顺带的图只吃缓存，其余丢后台 —— 见文件头 2026-09-13 那段。
+        历史图有两种例外照旧等（判不准就退回旧行为，慢一点好过瞎答）：
+        这一轮在说图（ASK_IMAGE_RE），或者图是刚发出来的（RECENT_IMAGE_S）。
         """
+        why = ""
         if rescue or quote_rescue:
+            blocking = True
+        else:
+            if _turn_asks_about_image(req):
+                blocking, why = True, "当前在说图"
+            elif any(int(it.get("age") or 0) <= RECENT_IMAGE_S for it in items):
+                blocking, why = True, "图刚发出来"
+            else:
+                blocking = False
+
+        if blocking:
+            if why:
+                logger.info("[imgctx] 历史图本轮仍等（%s）", why)
             cached = sum(1 for it in items if it["file"] in _caption_cache)
             await self._caption(provider_id, items)
         else:
@@ -748,6 +782,7 @@ class Main(star.Star):
             f"回看最近 {LOOKBACK} 条消息，每轮最多转述 {MAX_IMAGES} 张\n"
             f"图片时效 {MAX_AGE}s，总预算 {BUDGET:.0f}s\n"
             f"当前消息/引用图：等到转述完；历史顺带图：只吃缓存、其余后台转述\n"
+            f"历史图例外（照旧等）：当轮提到图，或图在 {RECENT_IMAGE_S}s 内\n"
             f"后台预转述并发上限 {WARM_MAX}（在跑 {len(_inflight)}）\n"
             f"动图抽 {GIF_FRAMES} 帧拼图后识别\n"
             f"转述模型：{pid}\n"

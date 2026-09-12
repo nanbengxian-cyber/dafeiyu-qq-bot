@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""dsh-imgctx 阻塞策略回归：历史顺带图不阻塞本轮，当前图/引用图照等。
+"""dsh-imgctx 阻塞策略回归：历史顺带图不阻塞本轮，当前图/引用图/在说图照等。
 
 背景（生产实测，2026-09-13）：
     被@的**纯文字**回复，中间夹了识图的 中位 25.8s，没有识图的 中位 8.6s。
     也就是群里有人在打字间隙发张图，机器人回一句跟图无关的话要多等 17 秒。
-所以把「这张图是不是本轮要回答的东西」当分界线。
+所以把「这张图是不是本轮要回答的东西」当分界线。但不等会带来一个新风险：
+发完图再问「这图是啥」，那张图算「历史图」，就会变成没看图直接答。因此有
+两个例外照旧等 —— 判不准时一律退回旧行为，慢一点好过瞎答。
 
 跑法（容器内 py3.12）：
     docker exec astrbot python3 /tmp/ic/test_blocking.py
@@ -33,8 +35,9 @@ except Exception:
 
 
 class FakeReq:
-    def __init__(self):
+    def __init__(self, prompt=""):
         self.extra_user_content_parts = []
+        self.prompt = prompt
 
 
 def make_plugin(caption_seconds=0.0, record=None):
@@ -55,10 +58,11 @@ def make_plugin(caption_seconds=0.0, record=None):
     return obj
 
 
-def item(key, current=False, quoted=False):
+def item(key, age=200, current=False, quoted=False):
+    """age 默认 200s —— 大于 RECENT_IMAGE_S，才走「历史图不阻塞」那条路。"""
     return {
         "file": key, "url": "", "local": None, "who": "群友A",
-        "age": 30, "summary": "", "current": current, "quoted": quoted,
+        "age": age, "summary": "", "current": current, "quoted": quoted,
     }
 
 
@@ -67,11 +71,10 @@ def injected(req):
 
 
 async def case_history_does_not_block():
-    """历史图：不等转述，本轮不注入，但后台起任务；转述完进缓存。"""
+    """历史图（不是刚发的、当轮没提图）：不等转述，本轮不注入，但后台起任务。"""
     m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
-    seen = []
-    obj = make_plugin(caption_seconds=0.6, record=seen)
-    req = FakeReq()
+    obj = make_plugin(caption_seconds=0.6)
+    req = FakeReq(prompt="没激活的区块不是不计算吗")
     items = [item("k1"), item("k2")]
     t0 = time.time()
     await obj._emit(req, "pid", items)
@@ -86,11 +89,11 @@ async def case_history_does_not_block():
 
 
 async def case_history_uses_cache():
-    """历史图命中缓存：立刻注入，且不起后台任务。"""
+    """历史图命中缓存：立刻注入，且只把没缓存的丢后台。"""
     m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
     m._cache_put("k1", "缓存里的猫")
     obj = make_plugin(caption_seconds=0.6)
-    req = FakeReq()
+    req = FakeReq(prompt="刚那个谁说的")
     t0 = time.time()
     await obj._emit(req, "pid", [item("k1"), item("k2")])
     cost = time.time() - t0
@@ -103,31 +106,64 @@ async def case_history_uses_cache():
     return cost
 
 
-async def case_current_image_still_waits():
-    """当前消息自带的图：必须等到转述完 —— 回答就靠它。"""
+async def case_asking_about_image_blocks():
+    """例外一：这一轮就是在说图 —— 必须等，否则就是没看图直接答。"""
+    for prompt in ("这图是啥", "发个截图看看", "这表情包哪来的", "照片里有谁"):
+        m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
+        obj = make_plugin(caption_seconds=0.4)
+        req = FakeReq(prompt=prompt)
+        await obj._emit(req, "pid", [item("ask", age=200)])
+        assert "转述:ask" in injected(req), "「%s」这类问法必须等到转述：%r" % (
+            prompt, injected(req))
+        assert not m._inflight, "走阻塞路径时不该再起后台任务"
+    return 4
+
+
+async def case_recent_image_blocks():
+    """例外二：图刚发出来（<= RECENT_IMAGE_S）—— 大概率就是眼下在聊的那张。"""
+    m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
+    obj = make_plugin(caption_seconds=0.4)
+    req = FakeReq(prompt="嗯")
+    await obj._emit(req, "pid", [item("fresh", age=m.RECENT_IMAGE_S)])
+    assert "转述:fresh" in injected(req), "刚发的图应等到转述"
+    m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
+    obj = make_plugin(caption_seconds=0.4)
+    req = FakeReq(prompt="嗯")
+    await obj._emit(req, "pid", [item("stale", age=m.RECENT_IMAGE_S + 1)])
+    assert injected(req) == "", "过了新鲜期的图不该再阻塞本轮"
+    return m.RECENT_IMAGE_S
+
+
+async def case_unknown_prompt_is_conservative():
+    """拿不到当轮原文时保守处理：按「在说图」算，退回阻塞。"""
     m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
     obj = make_plugin(caption_seconds=0.4)
     req = FakeReq()
-    t0 = time.time()
-    await obj._emit(req, "pid", [item("cur", current=True)], rescue=True)
-    cost = time.time() - t0
-    assert cost >= 0.35, "当前消息的图必须阻塞等待，实测只花了 %.2fs" % cost
-    assert "转述:cur" in injected(req), "当前消息的图必须注入"
-    assert not m._inflight, "当前图是同步转述的，不该再有后台任务"
-    return cost
+    del req.prompt
+    await obj._emit(req, "pid", [item("unk", age=200)])
+    assert "转述:unk" in injected(req), "拿不到原文时应保守等图"
+    return True
 
 
-async def case_quoted_image_still_waits():
-    """用户精确引用的图：同样必须等。"""
+async def case_current_and_quoted_still_wait():
+    """当前消息自带的图 / 用户精确引用的图：照旧等。"""
     m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
     obj = make_plugin(caption_seconds=0.4)
-    req = FakeReq()
+    req = FakeReq(prompt="")
     t0 = time.time()
-    await obj._emit(req, "pid", [item("q", quoted=True)], quote_rescue=True)
-    cost = time.time() - t0
-    assert cost >= 0.35, "引用图必须阻塞等待，实测只花了 %.2fs" % cost
+    await obj._emit(req, "pid", [item("cur", age=0, current=True)], rescue=True)
+    cur = time.time() - t0
+    assert cur >= 0.35, "当前消息的图必须阻塞等待，实测只花了 %.2fs" % cur
+    assert "转述:cur" in injected(req)
+    m._caption_cache.clear(); m._cache_order.clear(); m._inflight.clear()
+    obj = make_plugin(caption_seconds=0.4)
+    req = FakeReq(prompt="")
+    t0 = time.time()
+    await obj._emit(req, "pid", [item("q", age=0, quoted=True)], quote_rescue=True)
+    q = time.time() - t0
+    assert q >= 0.35, "引用图必须阻塞等待，实测只花了 %.2fs" % q
     assert "转述:q" in injected(req)
-    return cost
+    return cur, q
 
 
 async def case_warm_dedup_and_cap():
@@ -150,14 +186,17 @@ async def case_warm_dedup_and_cap():
 async def main():
     h = await case_history_does_not_block()
     c = await case_history_uses_cache()
-    cur = await case_current_image_still_waits()
-    q = await case_quoted_image_still_waits()
+    n_ask = await case_asking_about_image_blocks()
+    fresh = await case_recent_image_blocks()
+    await case_unknown_prompt_is_conservative()
+    cur, q = await case_current_and_quoted_still_wait()
     cap = await case_warm_dedup_and_cap()
     print("IMGCTX_BLOCKING_TEST_OK")
-    print("  历史图（无缓存）耗时 %.2fs（不阻塞）" % h)
-    print("  历史图（命中缓存）耗时 %.2fs（不阻塞）" % c)
-    print("  当前消息的图 耗时 %.2fs（阻塞，回答靠它）" % cur)
-    print("  精确引用的图 耗时 %.2fs（阻塞，回答靠它）" % q)
+    print("  历史图（远图·无缓存）耗时 %.2fs（不阻塞）" % h)
+    print("  历史图（命中缓存）  耗时 %.2fs（不阻塞）" % c)
+    print("  当前消息的图        %.2fs（阻塞）｜精确引用的图 %.2fs（阻塞）" % (cur, q))
+    print("  例外：在说图的 %d 种问法 / 图在 %ds 内 / 拿不到原文 → 全部阻塞"
+          % (n_ask, fresh))
     print("  后台预转述并发上限 = %d" % cap)
 
 
