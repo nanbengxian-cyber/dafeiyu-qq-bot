@@ -102,10 +102,11 @@ async def main():
     await chain3.text_chat("x", image_urls=["/tmp/vsit.png"])
     check("秒失败不记 _slow", "vision-scnet" not in vis._slow)
 
-    # ---------- ④ 降权会过期；被降权期间不撞它，所以它不会自己撤销 ----------
-    # 这一条是**有意**的行为：降权的意思就是「这段时间别碰它」。它只在
-    # ①SLOW_TTL 到期 或 ②前面的档也挂了、不得不走到它 这两种情况下才会被
-    # 重新调用，成功一次才撤销。否则「降权」就等于「每轮还是先撞一次」。
+    # ---------- ④ 冷静期过了也**不回原位**；再白花就翻倍等 ----------
+    # 第一版是「180 秒后收回原位」。2026-09-12 23:57 上线后实测 13 分钟，
+    # 每次成功平均白花反而从 5.7s 涨到 8.5s —— 因为 zhipu-vision 每 180 秒
+    # 准时回到第 2 档再白花 10 秒。常犯的档「定期回来撞一次」本身就是浪费。
+    # 现在过期只进候补（排在所有干净档后面），只有真被调用且成功才撤销。
     vis._slow.clear(), vis._banned.clear(), vis._consec.clear()
     import time as _t
     flaky = MockProv("vision-scnet", fail=asyncio.TimeoutError())
@@ -113,27 +114,45 @@ async def main():
     chain4 = vis.ChainProvider([flaky, good2], {})
     await chain4.text_chat("x", image_urls=["/tmp/vsit.png"])
     check("先降权", "vision-scnet" in vis._slow)
+    check("白花次数记为 1", vis._slow["vision-scnet"][1] == 1)
+    check("第1次冷静期 = SLOW_TTL", vis._slow_ttl(1) == vis.SLOW_TTL)
+    check("第2次翻倍", vis._slow_ttl(2) == vis.SLOW_TTL * 2)
+    check("翻倍有封顶", vis._slow_ttl(99) == vis.SLOW_MAX)
 
-    flaky._fail = None                       # 它恢复了，但还在降权期内
+    flaky._fail = None                       # 它恢复了，但还在冷静期内
     flaky_calls = flaky.calls
     await chain4.text_chat("x", image_urls=["/tmp/vsit.png"])
-    check("降权期内仍然不去撞它", flaky.calls == flaky_calls)
-    check("降权期内 _slow 保持（等窗口过）", "vision-scnet" in vis._slow)
+    check("冷静期内仍然不去撞它", flaky.calls == flaky_calls)
+    check("冷静期内 _slow 保持（等窗口过）", "vision-scnet" in vis._slow)
 
-    vis._slow["vision-scnet"] = _t.time() - vis.SLOW_TTL - 1   # 窗口过期
-    check("窗口过期后回到声明顺序",
-          order_ids(chain4) == ["vision-scnet", "zhipu-vision"])
-    check("窗口过期后 _slow 记录被清掉", "vision-scnet" not in vis._slow)
+    vis._slow["vision-scnet"] = (_t.time() - vis.SLOW_TTL - 1, 1)   # 冷静期过了
+    check("冷静期过了也不回原位（让干净档先上）",
+          order_ids(chain4) == ["zhipu-vision", "vision-scnet"], str(order_ids(chain4)))
+    check("冷静期过了 _slow 不撤销（等它真成功一次）",
+          "vision-scnet" in vis._slow)
+
+    # 又白花一次 → 计数 +1，下次等更久
+    n0 = vis._slow["vision-scnet"][1]
+    vis._slow["vision-scnet"] = (_t.time() - vis.SLOW_MAX - 1, n0)
+    flaky._fail = asyncio.TimeoutError()
+    good2._fail = "model_not_found"          # 逼它不得不走到被降权那档
+    try:
+        await chain4.text_chat("x", image_urls=["/tmp/vsit.png"])
+    except Exception:
+        pass
+    check("再白花一次计数就 +1", vis._slow["vision-scnet"][1] == n0 + 1)
+    check("翻倍后的冷静期更长",
+          vis._slow_ttl(n0 + 1) > vis._slow_ttl(n0))
 
     # 前面的档也挂了 → 不得不走到被降权的档 → 它成功了就撤销
     vis._slow.clear(), vis._banned.clear(), vis._consec.clear()
     ok_again = MockProv("vision-scnet")
-    vis._slow["vision-scnet"] = _t.time()          # 先手动打上降权
+    vis._slow["vision-scnet"] = (_t.time(), 3)     # 先手动打上降权
     dying = MockProv("zhipu-vision", fail="model_not_found")
     chain4b = vis.ChainProvider([ok_again, dying], {})
     r = await chain4b.text_chat("x", image_urls=["/tmp/vsit.png"])
     check("兜底走到它时能救场", r == "ok")
-    check("救场成功后撤销降权", "vision-scnet" not in vis._slow)
+    check("救场成功后撤销降权（计数也清）", "vision-scnet" not in vis._slow)
 
     # ---------- ⑤ fail-open：全被降权时顺序可换、档不能丢 ----------
     vis._slow.clear(), vis._banned.clear(), vis._consec.clear()

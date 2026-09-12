@@ -1,5 +1,5 @@
 name: dsh-vischain
-desc: 识图模型主用+备用链：按可用性自动降级；永久无通道的档记 DEAD_TTL，白花过时间（超时/限流）的档记 SLOW_TTL 并排到最后，避免每张图都先空等一次超时。
-version: 1.1.0
+desc: 识图模型主用+备用链：按可用性自动降级；永久无通道的档记 DEAD_TTL，白花过时间（超时/限流）的档退居其后，冷静期按白花次数 180s→360s→720s 翻倍封顶（DSH_VIS_SLOW_MAX），避免每张图都先空等一次超时。
+version: 1.1.1
 author: dsh
 repo: local

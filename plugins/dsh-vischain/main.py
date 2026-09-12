@@ -156,8 +156,26 @@ _PERMANENT = (
 _IMAGE_LEVEL = ("1210", "1301", "contentfilter")
 # pid -> 判定为「没通道」的时刻。只影响跳过顺序，不影响 fail-open。
 _dead: dict[str, float] = {}
-# [patch:slow-v1] pid -> 最近一次「白花时间」的时刻（超时/限流）。同 _dead 只影响顺序。
-_slow: dict[str, float] = {}
+# [patch:slow-v1] pid -> (最近一次「白花时间」的时刻, 连续白花次数)。
+# 同 _dead 只影响顺序，不影响 fail-open。
+#
+# 为什么带次数：第一版是「180 秒后收回原位」。实测（2026-09-12 23:57 部署后
+# 13 分钟）反而更差 —— zhipu-vision 每 180 秒准时回到第 2 档，再白花 10 秒，
+# 每次成功平均白花从 5.7s 涨到 8.5s。**「定期回来撞一次」本身就是浪费**。
+# 现在改成：冷静期按 180s→360s→720s… 翻倍（封顶 SLOW_MAX），而且冷静期过了
+# 也**不回原位**，只排到所有干净档后面；只有真正被调用且成功才彻底撤销。
+# 于是常犯的档越来越难被撞到，偶尔抽一次的档 3 分钟就恢复。
+_slow: dict[str, tuple[float, int]] = {}
+# 白花降权的冷静期上限（秒）。再久就该靠 DEAD_TTL/_banned 那套了。
+SLOW_MAX = float(os.environ.get("DSH_VIS_SLOW_MAX", "900"))
+
+
+def _slow_ttl(n: int) -> float:
+    """第 n 次白花之后的冷静期：SLOW_TTL × 2^(n-1)，封顶 SLOW_MAX。"""
+    if n <= 1:
+        return SLOW_TTL
+    return min(SLOW_TTL * (2 ** (n - 1)), SLOW_MAX)
+
 # 同一档连续失败 CONSEC_BAN 次后永久移除（进程内存）。用于有限额度/
 # 一次性套餐 provider：额度耗尽后不需要每次都傻试到超时再回落。
 CONSEC_BAN = int(os.environ.get("DSH_VIS_CONSEC_BAN", "3"))
@@ -323,8 +341,9 @@ class ChainProvider(Provider):
     def _order(self) -> list:
         """按可用性给各档排序：最近被判瞬态「没通道」的排到最后（fail-open）；
         [ban:consec-v1] 连续失败达 CONSEC_BAN 次的档永久移除，不再进入候选。
-        [patch:slow-v1] 最近**白花过时间**（超时/限流）的档同样排到最后，
-        只是用更短的 SLOW_TTL —— 它未必坏，但每次撞它都要掏 10 秒。
+        [patch:slow-v1] 最近**白花过时间**（超时/限流）的档同样退到后面，
+        冷静期按白花次数翻倍（_slow_ttl）；冷静期过了也不回原位，只排到
+        干净档后面。它未必坏，但每次撞它都要掏 10 秒。
         """
         # 永久剔除连败过阈值的档
         base = [lk for lk in self.links
@@ -334,7 +353,7 @@ class ChainProvider(Provider):
         if DEAD_TTL <= 0 and SLOW_TTL <= 0:
             return list(base)
         now = time.time()
-        alive, dead = [], []
+        alive, cooled, dead = [], [], []
         for lk in base:
             pid = lk.provider_config.get("id", "?")
             t = _dead.get(pid, 0.0)
@@ -343,21 +362,25 @@ class ChainProvider(Provider):
                 continue
             if t:
                 _dead.pop(pid, None)   # 过期了，恢复正常顺序
-            s = _slow.get(pid, 0.0)
-            if s and now - s < SLOW_TTL:
-                dead.append(lk)
-                continue
+            s = _slow.get(pid)
             if s:
-                _slow.pop(pid, None)   # 冷够了，重新给它一次机会
+                ts, n = s
+                if now - ts < _slow_ttl(n):
+                    dead.append(lk)
+                    continue
+                # 冷静期过了，但**不回原位** —— 先排在所有干净档后面。
+                # 真好使的话，被调用一次成功就彻底撤销；再白花就翻倍等。
+                cooled.append(lk)
+                continue
             alive.append(lk)
-        if dead:
+        if dead or cooled:
             # 必须留痕：不打日志的话，下次「识图怎么换档了」又只能靠猜。
             logger.info(
-                "[vischain] 本轮先跳过 %s（%.0f 分钟无通道 / %.0f 分钟白花过时间，仍会兜底再试）",
-                ",".join(lk.provider_config.get("id", "?") for lk in dead),
-                DEAD_TTL / 60.0, SLOW_TTL / 60.0,
+                "[vischain] 本轮先跳过 %s（%.0f 分钟无通道／白花过时间的档退居其后，仍会兜底再试）",
+                ",".join(lk.provider_config.get("id", "?") for lk in dead + cooled),
+                DEAD_TTL / 60.0,
             )
-        return alive + dead
+        return alive + cooled + dead
 
     async def text_chat(self, *args, **kwargs):
         last = None
@@ -417,7 +440,8 @@ class ChainProvider(Provider):
                     # 所以它仍留在候选里兜底，只是这一轮排到最后。
                     exp = SLOW_TTL > 0 and _expensive(e, dt)
                     if exp:
-                        _slow[pid] = time.time()
+                        _prev_n = _slow.get(pid, (0.0, 0))[1]
+                        _slow[pid] = (time.time(), _prev_n + 1)
                     if perm and not img:
                         _dead[pid] = time.time()
                     logger.warning(
@@ -594,13 +618,15 @@ class Main(star.Star):
             avg = (s.get("sec", 0.0) / ok) if ok else 0.0
             t = _dead.get(pid, 0.0)
             left = (DEAD_TTL - (time.time() - t)) if t else 0.0
-            sl = _slow.get(pid, 0.0)
-            sl_left = (SLOW_TTL - (time.time() - sl)) if sl else 0.0
+            sl = _slow.get(pid)
+            sl_left = (_slow_ttl(sl[1]) - (time.time() - sl[0])) if sl else 0.0
             lines.append(
                 "%d. %s 成功%d/失败%d%s%s%s"
                 % (i, pid, ok, fail, ("，平均%.1fs" % avg) if ok else "",
                    ("，判定无通道还剩%.0f分钟" % (left / 60.0)) if left > 0 else "",
-                   ("，白花过时间还剩%.0f分钟排最后" % (sl_left / 60.0))
-                   if sl_left > 0 else "")
+                   ("，白花过%d次时间，退居其后%s" % (
+                       sl[1],
+                       ("（还剩%.0f分钟）" % (sl_left / 60.0)) if sl_left > 0 else "（已在候补）"),
+                   ) if sl else "")
             )
         yield event.plain_result("\n".join(lines))
