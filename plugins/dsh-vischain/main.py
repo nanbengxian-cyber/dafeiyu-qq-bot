@@ -42,7 +42,10 @@
 
 import asyncio
 import os
+import tempfile
 import time
+
+from PIL import Image as PILImage
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
@@ -76,9 +79,23 @@ WATCH_INTERVAL = float(os.environ.get("DSH_VIS_WATCH", "30"))
 
 # 一档被判「没通道」后多久内直接跳过。0=不缓存。
 DEAD_TTL = float(os.environ.get("DSH_VIS_DEAD_TTL", "600"))
+# 只用现有 provider id 不够：同一个智谱 key 其实还有几个可用视觉模型，
+# 而免费主模型 429 时原链没有第二条独立模型可走。这里允许给任意 OpenAI 兼容
+# provider 补“同源不同模型”档，格式 provider_id:model；不创建新密钥、不改源配置。
+MODEL_FALLBACKS = []
+for _item in os.environ.get(
+    "DSH_VIS_MODEL_FALLBACKS",
+    "zhipu-vision:glm-4.1v-thinking-flash,zhipu-vision:glm-4v-flash",
+).split(","):
+    _item = _item.strip()
+    if ":" in _item:
+        _pid, _model = _item.split(":", 1)
+        if _pid.strip() and _model.strip():
+            MODEL_FALLBACKS.append((_pid.strip(), _model.strip()))
 
 # 瞬时错误特征。403/1010 是 Cloudflare 指纹弹回，429 是限流，
-# 都属于「同一档再试一次就可能成」。
+# 都允许链条层再试；但真实 provider 自身已默认做 5 次指数退避，调用时会把
+# request_max_retries 压到 1，避免 5×(RETRY+1) 的嵌套放大。
 _TRANSIENT = ("403", "1010", "429", "timeout", "timed out", "connection", "502", "503", "504")
 # [patch:perm-v1 503 不等于瞬时]
 # 永久错误：同一档再试一百次也不会变，重试只是白拖时间。
@@ -96,9 +113,20 @@ _PERMANENT = (
     "model_not_found", "no available channel", "does not exist",
     "invalid_api_key", "invalid api key", "insufficient_quota",
     "unsupported", "code: 401", "error code: 404",
+    # 智谱 1210（图片格式/解析）和 1301（内容审核）对同一张图重试无益，
+    # 应直接换下一档；但它们不是整条渠道故障，不能把 provider 拉黑。
+    "'1210'", "'1301'", "contentfilter",
 )
+_IMAGE_LEVEL = ("1210", "1301", "contentfilter")
 # pid -> 判定为「没通道」的时刻。只影响跳过顺序，不影响 fail-open。
 _dead: dict[str, float] = {}
+# 同一档连续失败 CONSEC_BAN 次后永久移除（进程内存）。用于有限额度/
+# 一次性套餐 provider：额度耗尽后不需要每次都傻试到超时再回落。
+CONSEC_BAN = int(os.environ.get("DSH_VIS_CONSEC_BAN", "3"))
+# 进程内已永久移除的 provider id 集合（重启后重置，此时会重新尝试 CONSEC_BAN 次）。
+_banned: set[str] = set()
+# pid -> 当前连续失败次数。
+_consec: dict[str, int] = {}
 
 
 def _permanent(e: Exception) -> bool:
@@ -106,11 +134,79 @@ def _permanent(e: Exception) -> bool:
     return any(k in s for k in _PERMANENT)
 
 
+def _image_level(e: Exception) -> bool:
+    """这张图本身的问题：换档可能有救，但不应拉黑整档。"""
+    s = str(e).lower()
+    return any(k in s for k in _IMAGE_LEVEL)
+
+
 def _transient(e: Exception) -> bool:
     if _permanent(e):
         return False
     s = str(e).lower()
     return any(k in s for k in _TRANSIENT) or isinstance(e, asyncio.TimeoutError)
+
+
+def _normalize_image(path: str) -> str | None:
+    """把模型容易拒绝的 GIF/WebP/损坏扩展名图片统一转成 RGB JPEG。"""
+    if not path or path.startswith(("http://", "https://", "data:image")):
+        return None
+    try:
+        with PILImage.open(path) as opened:
+            frame = opened.convert("RGB")
+            frame.thumbnail((1536, 1536), PILImage.LANCZOS)
+            fd, out = tempfile.mkstemp(prefix="vischain_", suffix=".jpg")
+            os.close(fd)
+            frame.save(out, format="JPEG", quality=88, optimize=True)
+            return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[vischain] 图片标准化失败，继续使用原图：%s", e)
+        return None
+
+
+async def _retry_with_normalized_images(provider, args, kwargs):
+    """遇到智谱 1210 时将本地图片转 JPEG 后只补试一次。"""
+    urls = list(kwargs.get("image_urls") or [])
+    made: list[str] = []
+    normalized: list[str] = []
+    for url in urls:
+        out = await asyncio.to_thread(_normalize_image, url)
+        normalized.append(out or url)
+        if out:
+            made.append(out)
+    if not made:
+        return None
+    retry_kwargs = dict(kwargs)
+    retry_kwargs["image_urls"] = normalized
+    try:
+        return await provider.text_chat(*args, **retry_kwargs)
+    finally:
+        for path in made:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+class ModelOverrideProvider:
+    """复用真实 provider 的连接配置，只在本次调用临时改模型名。"""
+
+    def __init__(self, base: Provider, model: str, stat_id: str):
+        self.base = base
+        self.model = model
+        self.provider_config = dict(base.provider_config)
+        self.provider_config["id"] = stat_id
+        self.provider_config["model"] = model
+
+    def get_model(self) -> str:
+        return self.model
+
+    async def text_chat(self, *args, **kwargs):
+        # AstrBot OpenAI provider 原生支持逐请求 model=，无需改共享实例；这样多个
+        # 群同时识图也不会互相串模型。非 OpenAI 实现若不支持，会自行忽略/报错并换档。
+        call_kwargs = dict(kwargs)
+        call_kwargs["model"] = self.model
+        return await self.base.text_chat(*args, **call_kwargs)
 
 
 class ChainProvider(Provider):
@@ -166,16 +262,19 @@ class ChainProvider(Provider):
 
     # ---------------------------------------------------------------- 链条
     def _order(self) -> list:
-        """把最近判定「没通道」的档排到最后，而不是删掉。
-
-        删掉就等于自己给自己造了个单点：渠道恢复了也永远试不到。
-        排后面则是「先试可能通的，仍然全试一遍」—— fail-open。
+        """按可用性给各档排序：最近被判瞬态「没通道」的排到最后（fail-open）；
+        [ban:consec-v1] 连续失败达 CONSEC_BAN 次的档永久移除，不再进入候选。
         """
+        # 永久剔除连败过阈值的档
+        base = [lk for lk in self.links
+                if lk.provider_config.get("id", "?") not in _banned]
+        if len(base) == 1:
+            return list(base)
         if DEAD_TTL <= 0:
-            return list(self.links)
+            return list(base)
         now = time.time()
         alive, dead = [], []
-        for lk in self.links:
+        for lk in base:
             pid = lk.provider_config.get("id", "?")
             t = _dead.get(pid, 0.0)
             if t and now - t < DEAD_TTL:
@@ -202,32 +301,69 @@ class ChainProvider(Provider):
             for attempt in range(RETRY + 1):
                 t0 = time.time()
                 try:
+                    # AstrBot 4.27 的 OpenAI/Anthropic provider 在单次 text_chat
+                    # 内还会默认重试 5 次；外层链条再重试会放大成最多 10 次/档，
+                    # 429 时尤其雪崩。把底层固定为一次，由这里统一掌控重试。
+                    call_kwargs = dict(kwargs)
+                    call_kwargs["request_max_retries"] = 1
                     resp = await asyncio.wait_for(
-                        lk.text_chat(*args, **kwargs), timeout=ATTEMPT_TIMEOUT
+                        lk.text_chat(*args, **call_kwargs), timeout=ATTEMPT_TIMEOUT
                     )
                 except Exception as e:  # noqa: BLE001
                     dt = time.time() - t0
+                    img = _image_level(e)
+                    # 智谱 1210 多见于 GIF/WebP 或“扩展名是 jpg、内容不是 JPEG”。
+                    # 换模型仍会吃同一坏载荷，所以先统一转 RGB JPEG，再在当前档补试一次。
+                    if img and "1210" in str(e) and call_kwargs.get("image_urls"):
+                        try:
+                            fixed = await _retry_with_normalized_images(
+                                lk, args, call_kwargs
+                            )
+                            if fixed is not None:
+                                st["ok"] += 1
+                                _consec[pid] = 0       # 成功后清零连败计数
+                                st["sec"] += time.time() - t0
+                                _dead.pop(pid, None)
+                                logger.info(
+                                    "[vischain] %s 图片转 JPEG 后成功（%.1fs）",
+                                    pid, time.time() - t0,
+                                )
+                                return fixed
+                        except Exception as fixed_err:  # noqa: BLE001
+                            e = fixed_err
+                            img = _image_level(e)
                     st["fail"] += 1
+                    # [ban:consec-v1] 连续失败计数器
+                    _consec[pid] = _consec.get(pid, 0) + 1
+                    if _consec[pid] >= CONSEC_BAN and CONSEC_BAN > 0:
+                        _banned.add(pid)
+                        _consec[pid] = 0
+                        logger.warning(
+                            "[vischain] %s 连续失败 %d 次，永久移除（额度/通道疑似耗尽，回落到后续档）",
+                            pid, CONSEC_BAN,
+                        )
                     last = e
                     perm = _permanent(e)
                     tr = _transient(e)
-                    if perm:
+                    if perm and not img:
                         _dead[pid] = time.time()
                     logger.warning(
                         "[vischain] %s 第%d次失败(%.1fs, %s): %s",
                         pid,
                         attempt + 1,
                         dt,
-                        "没通道／永久错误，直接换下一档并记 %.0f 分钟"
-                        % (DEAD_TTL / 60.0) if perm
-                        else ("瞬时可重试" if tr else "非瞬时，直接换下一档"),
-                        str(e)[:120],
+                        "这张图它读不了（不重试，换下一档看看）" if img
+                        else ("没通道／永久错误，直接换下一档并记 %.0f 分钟"
+                              % (DEAD_TTL / 60.0) if perm
+                              else ("瞬时可重试" if tr else "非瞬时，直接换下一档")),
+                        str(e)[:120] or "(超时，无消息)",
                     )
                     if not tr:
                         break  # 非瞬时错误原地重试没意义，换档
                     continue
                 dt = time.time() - t0
                 st["ok"] += 1
+                _consec[pid] = 0       # 成功后清零连败计数
                 st["sec"] += dt
                 _dead.pop(pid, None)     # 成功一次就洗掉黑名单
                 # 不触发/降级路径也要留痕：走到第几档、试了几次，
@@ -243,7 +379,12 @@ class ChainProvider(Provider):
                         dt,
                     )
                 return resp
-        logger.error("[vischain] %d 档全挂，识图放弃", len(self.links))
+        logger.error(
+            "[vischain] %d 档全挂，识图放弃（最后一个错误：%s: %s）",
+            len(self.links),
+            type(last).__name__ if last is not None else "无",
+            (str(last)[:160] if last is not None else "") or "(无消息)",
+        )
         if last is not None:
             raise last
         raise RuntimeError("vischain: 没有可用的识图 provider")
@@ -275,17 +416,25 @@ class Main(star.Star):
         # 只比 ALIAS 一个不够 —— 单独改 zhipu-vision 时 ALIAS 没被碰，
         # 但链条第三档已经是 terminate 掉的死实例了。
         if isinstance(cur, ChainProvider) and cur is self.chain:
-            # _live 已经会剥掉壳，所以 ALIAS 那一档取到的就是壳里的真实实例，
-            # 不需要特别处理。（早先版本在这里写了 CHAIN.index(ALIAS)，
-            # 一旦有人把 ALIAS 设成不在 CHAIN 里的 id 就每 30s 抛一次 ValueError。）
+            # 只核对显式 provider；ModelOverrideProvider 是我们按配置即时造的包装档，
+            # 不会出现在 inst_map。真实底座变更时，前面的身份比较仍会触发重建。
+            explicit = [lk for lk in cur.links if not isinstance(lk, ModelOverrideProvider)]
             want = [lk for lk in (self._live(pm, pid) for pid in CHAIN) if lk is not None]
-            if want == list(cur.links):
+            if want == explicit:
                 return False
 
         links, missing = [], []
         for pid in CHAIN:
             inst = self._live(pm, pid)
             (links.append(inst) if inst is not None else missing.append(pid))
+        # 同源模型档排在显式 provider 链之后，作为最后兜底。默认补智谱的两个
+        # 低延迟视觉模型；主 glm-4.6v-flash 限流时可直接换模型，而不是全挂。
+        for pid, model in MODEL_FALLBACKS:
+            inst = self._live(pm, pid)
+            if inst is None:
+                missing.append("%s:%s" % (pid, model))
+                continue
+            links.append(ModelOverrideProvider(inst, model, "%s:%s" % (pid, model)))
         if not links:
             self.note = "链条里一个 provider 都没找到：%s" % ",".join(CHAIN)
             logger.error("[vischain] %s，识图保持原样", self.note)
