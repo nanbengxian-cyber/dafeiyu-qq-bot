@@ -229,6 +229,43 @@ class AwarenessFilter(CustomFilter):
             return True
 
 
+def _claim_front_of_queue() -> int:
+    """把自己的 handler 提到最前面，抢在会 stop_event 的插件之前看到事件。
+
+    AstrBot 的 handler 注册表按 extras_configs["priority"] 降序排，但框架里
+    没有任何入口能设置它（恒为 0），实际顺序就等于插件加载顺序 —— 而每次热重载
+    本插件都会被 append 到末尾。
+
+    dsh-poke 对戳一戳事件在 finally 里无条件 event.stop_event()（它要防止空消息
+    走到 LLM，这么做是对的），排在它后面的 handler 就再也看不到戳一戳了：
+    实测 DB 里 poke 一直是 0 条，而同期真实被戳了多次。
+
+    观测方只需要「先看一眼」，不消费事件，所以这里给自己一个真实的优先级。
+    返回被提权的 handler 数量。
+    """
+    try:
+        from astrbot.core.star.star_handler import star_handlers_registry
+    except BaseException as exc:
+        logger.warning("[awareness] 无法导入 handler 注册表: %r", exc)
+        return 0
+    try:
+        handlers = getattr(star_handlers_registry, "_handlers", None)
+        if not handlers:
+            return 0
+        mine = 0
+        for handler in handlers:
+            path = str(getattr(handler, "handler_module_path", ""))
+            if "dsh-awareness" in path or "dsh_awareness" in path:
+                handler.extras_configs["priority"] = 100
+                mine += 1
+        if mine:
+            handlers.sort(key=lambda h: -h.extras_configs.get("priority", 0))
+        return mine
+    except BaseException as exc:
+        logger.warning("[awareness] 调整 handler 顺序失败: %r", exc)
+        return 0
+
+
 class Main(star.Star):
     def __init__(self, context, config=None):
         super().__init__(context, config)
@@ -238,15 +275,18 @@ class Main(star.Star):
         except BaseException as exc:
             logger.error("[awareness] 初始化失败，感知停用: %r", exc)
             return
+        bumped = _claim_front_of_queue()
         logger.info(
             "[awareness] 已加载：%s 群=%s 保留%d分钟/%d条 索引=%s(%d分钟) "
-            "明细=%s(%d分钟/最多%d条/预算%d字) 戳一戳=%s(%d分钟内告知谁戳的) 库=%s",
+            "明细=%s(%d分钟/最多%d条/预算%d字) 戳一戳=%s(%d分钟内告知谁戳的) "
+            "抢位=%d个handler 库=%s",
             "开" if ENABLED else "关",
             "、".join(sorted(GROUPS)) or "全部",
             KEEP_MIN, KEEP_MAX,
             "开" if INDEX_ENABLED else "关", INDEX_MIN,
             "开" if DETAIL_ENABLED else "关", DETAIL_MIN, DETAIL_MAX, DETAIL_BUDGET,
             "开" if POKE_ENABLED else "关", POKE_MIN,
+            bumped,
             DB,
         )
 
