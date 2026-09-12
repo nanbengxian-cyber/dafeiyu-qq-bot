@@ -25,6 +25,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import main as vis  # noqa: E402
 
+# 这个测试是在 astrbot 容器里跑的，而 vis.logger 是 astrbot 的 loguru ——
+# 它挂着一个**生产日志文件**的 sink。不掐掉的话，测试每跑一次都会往
+# /AstrBot/data/logs/astrbot.log 里灌一批假日志，把群动态记分卡和
+# vischain_waste.py 的统计口径污染掉（2026-09-12 第一版就踩了这个坑）。
+vis.logger = type("_Quiet", (), {
+    "info": staticmethod(lambda *a, **k: None),
+    "warning": staticmethod(lambda *a, **k: None),
+    "error": staticmethod(lambda *a, **k: None),
+    "debug": staticmethod(lambda *a, **k: None),
+})()
+
 CHECKS = []
 
 
