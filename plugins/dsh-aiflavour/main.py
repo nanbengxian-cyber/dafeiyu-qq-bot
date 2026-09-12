@@ -18,6 +18,12 @@ humanizer 是"固定词表"闸门——只有词表里写死的词会拦，新�
      ≥ DSH_AIFLAVOUR_LEARN_MIN 次（默认 3）自动升级进剥除名单，
      之后命中直接剥；连续 ≥ DSH_AIFLAVOUR_DEACTIVATE_DAYS 天
      （默认 7）没再命中自动降级回观察，防误伤累积。
+  4. 口癖层（TIC，只剥不刹）——**机器人自己的**口头禅。它跟 AI 腔是两回事：
+     AI 腔命中要"整条拦"（说教一而再再而三，不发是对的），口癖只是赘词，
+     整条拦过重，剥掉、剩下的正文照发才对。所以口癖不进会话刹车。
+     同样走动态学习：同群累计 >= LEARN_MIN 次才开剥，连续 DEACTIVATE_DAYS
+     天没再命中自动降级（不永久拉黑一个正常词组）。
+     首批是「大半夜(的)」——实测 71 倍于真人且一小时内 8 次（见 docs/74）。
   会话刹车：同一群 SHORT_WINDOW（默认 180s）内剥除名单词根再次命中
      → 整条 block（模型在同轮里还在说教，治本）。
 
@@ -29,6 +35,7 @@ humanizer 是"固定词表"闸门——只有词表里写死的词会拦，新�
   DSH_AIFLAVOUR_STRONG         静态强词追加（逗号分隔）
   DSH_AIFLAVOUR_WEAK           静态影词追加（逗号分隔）
   DSH_AIFLAVOUR_ROOTS          学习词根追加（逗号分隔）
+  DSH_AIFLAVOUR_TICS           口癖词追加（逗号分隔，只剥不刹）
   DSH_AIFLAVOUR_LEARN_MIN      升级阈值（默认 3）
   DSH_AIFLAVOUR_DEACTIVATE_DAYS 自动降级天数（默认 7）
   DSH_AIFLAVOUR_SHORT_WINDOW   会话刹车窗口秒（默认 180）
@@ -53,7 +60,7 @@ from astrbot.core import logger
 
 from .aiflavour_logic import (
     _flag, _int, _set, _norm,
-    STRONG_BASE, WEAK_BASE, ROOT_BASE,
+    STRONG_BASE, WEAK_BASE, ROOT_BASE, TIC_BASE,
     DynState, Matcher,
 )
 
@@ -66,6 +73,7 @@ MODE = os.environ.get("DSH_AIFLAVOUR_MODE", "strip").strip().lower()
 STRONG = STRONG_BASE | {_norm(x) for x in _set("DSH_AIFLAVOUR_STRONG")}
 WEAK = WEAK_BASE | {_norm(x) for x in _set("DSH_AIFLAVOUR_WEAK")}
 ROOTS = ROOT_BASE | {_norm(x) for x in _set("DSH_AIFLAVOUR_ROOTS")}
+TICS = TIC_BASE | {_norm(x) for x in _set("DSH_AIFLAVOUR_TICS")}
 LEARN_MIN = _int("DSH_AIFLAVOUR_LEARN_MIN", 3)
 DEACTIVATE_DAYS = _int("DSH_AIFLAVOUR_DEACTIVATE_DAYS", 7)
 SHORT_WINDOW = _int("DSH_AIFLAVOUR_SHORT_WINDOW", 180)
@@ -73,7 +81,8 @@ SHORT_WINDOW = _int("DSH_AIFLAVOUR_SHORT_WINDOW", 180)
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 _DYN_PATH = os.path.join(_PLUGIN_DIR, "data", "aiflavour_dyn.json")
 
-_stat = {"seen": 0, "strip": 0, "block": 0, "upgraded": 0, "brake": 0, "shadow": 0}
+_stat = {"seen": 0, "strip": 0, "block": 0, "upgraded": 0, "brake": 0,
+         "shadow": 0, "tic": 0}
 _last: list[str] = []
 
 
@@ -86,12 +95,12 @@ class Main(star.Star):
         self._m = Matcher(STRONG, WEAK, ROOTS, self._dyn,
                           min_count=LEARN_MIN,
                           deactivate_days=DEACTIVATE_DAYS,
-                          short_window=float(SHORT_WINDOW))
+                          short_window=float(SHORT_WINDOW), tics=TICS)
         logger.info(
-            "[aiflavour] 已加载：%s 群=%s｜模式=%s｜强词%d 影词%d 词根%d 升级阈值%d 降级%d天 刹车%.0fs｜动态名单%d个",
+            "[aiflavour] 已加载：%s 群=%s｜模式=%s｜强词%d 影词%d 词根%d 口癖%d 升级阈值%d 降级%d天 刹车%.0fs｜动态名单%d个",
             "开" if ENABLED else "关",
             "、".join(sorted(GROUPS)) or "无",
-            self._mode, len(STRONG), len(WEAK), len(ROOTS),
+            self._mode, len(STRONG), len(WEAK), len(ROOTS), len(TICS),
             LEARN_MIN, DEACTIVATE_DAYS, SHORT_WINDOW,
             len(self._dyn.active_roots()),
         )
@@ -125,8 +134,10 @@ class Main(star.Star):
             # 动态刚升级：记一笔，且本轮就当命中处理
             if info["dyn_upgraded"]:
                 _stat["upgraded"] += 1
-                self._note("新学到AI腔「%s」→ 进剥除名单" % info["dyn_upgraded"])
-                logger.info("[aiflavour] 动态升级「%s」（已累计≥%d次）", info["dyn_upgraded"], LEARN_MIN)
+                _kind = "口癖" if info["dyn_upgraded"] in TICS else "AI腔"
+                self._note("新学到%s「%s」→ 进剥除名单" % (_kind, info["dyn_upgraded"]))
+                logger.info("[aiflavour] 动态升级%s「%s」（已累计≥%d次）",
+                            _kind, info["dyn_upgraded"], LEARN_MIN)
 
             # 会话刹车：窗口内重复命中升级词 → 整条拦（说教一而再再而三）
             if info["brake"] and (info["dyn_hits"] or info["strong_hits"]):
@@ -142,7 +153,13 @@ class Main(star.Star):
                     event.stop_event()
                     return
 
-            # 静态强信号 + 剥除名单词根：剥
+            # 口癖：只剥不刹 —— 刻意不走上面的会话刹车（口癖是赘词，整条拦过重）
+            if info["tic_hits"]:
+                _stat["tic"] += 1
+                logger.info("[aiflavour] 口癖命中（只剥不刹）：%s｜%s",
+                            "、".join(info["tic_hits"][:3]), text[:36])
+
+            # 静态强信号 + 剥除名单词根/口癖：剥
             stripped, hits = self._m.strip_strong(text)
             if hits:
                 self._handle_strong(event, text, stripped, hits)
@@ -217,16 +234,16 @@ class Main(star.Star):
         s = _stat
         yield event.plain_result(
             "[AI味] 开=%s 群=%s 模式=%s\n"
-            "强词%d 影词%d 词根%d｜升级阈值%d 降级%d天 刹车%.0fs\n"
-            "看过%d段｜剥%d｜整条拦%d｜新学%d｜刹车%d｜影子%d\n"
+            "强词%d 影词%d 词根%d 口癖%d｜升级阈值%d 降级%d天 刹车%.0fs\n"
+            "看过%d段｜剥%d｜整条拦%d｜新学%d｜刹车%d｜影子%d｜口癖%d\n"
             "剥除名单(%d)：%s\n"
             "最近：%s"
             % ("开" if ENABLED else "关",
                "、".join(sorted(GROUPS)) or "无", self._mode,
-               len(STRONG), len(WEAK), len(ROOTS),
+               len(STRONG), len(WEAK), len(ROOTS), len(TICS),
                LEARN_MIN, DEACTIVATE_DAYS, SHORT_WINDOW,
                s["seen"], s["strip"], s["block"],
-               s["upgraded"], s["brake"], s["shadow"],
+               s["upgraded"], s["brake"], s["shadow"], s["tic"],
                len(self._dyn.active_roots()), self._fmt_dyn(),
                "｜".join(_last[-5:]) or "还没有"))
 

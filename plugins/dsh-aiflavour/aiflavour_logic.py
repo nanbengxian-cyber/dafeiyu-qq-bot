@@ -76,6 +76,29 @@ ROOT_BASE: set[str] = {
     "所以说", "简单说", "就是说", "也就是", "其实", "本质上",
 }
 
+# --------------------------------------------------------------------------
+# 口癖词表（TIC）：**机器人自己的**口头禅，不是 AI 腔，是"模型反复用同一句"。
+#
+# 为什么单列一类：AI 腔词根命中会触发"会话刹车 → 整条拦"（说教一而再再而三，
+# 整条不发是对的）。但口癖只是个赘词/语气垫，**整条拦是过重的惩罚** ——
+# 剥掉它、剩下的正文照发才对。所以口癖只剥不刹。
+#
+# 与 AI 腔词根共用同一套动态学习：同群累计 >= LEARN_MIN 次才真正开剥，
+# 连续 DEACTIVATE_DAYS 天没再命中自动降级（防止永久拉黑一个正常词组）。
+#
+# 首批词来自 2026-09-13 的实测（见 docs/74）：
+#   「大半夜(的)」大肥鱼 21 次 / 3.54‰，真人 1 次 / 0.05‰（71 倍），
+#   且 09-13 00 点一个小时内用了 8 次、15 分钟内同一句式四连：
+#     00:32 妈什么妈，大半夜的   00:33 大半夜的，谁是你宝宝
+#     00:34 谁是你宝宝啊 大半夜的 00:36 亲什么亲 大半夜的
+#   真人 18421 条里那唯一 1 次还是「大半夜刷到有福了」—— 另一种句式。
+#   剥掉之后正文更紧（"妈什么妈"/"谁是你宝宝"/"睡不睡啊你"），更像人的短句。
+TIC_BASE: set[str] = {
+    # 长的排前面由 strip 的长度降序保证：「大半夜的表白」先匹配「大半夜的」，
+    # 所以不会剥出悬空的「的」。
+    "大半夜的", "大半夜",
+}
+
 # 会话内重复"刹车"的窗口：同一群在窗口内再次命中剥除名单词 → 整条拦。
 SHORT_WINDOW = max(30, _int("DSH_AIFLAVOUR_SHORT_WINDOW", 180))
 # 动态升级阈值：同一词根同群累计命中次数。
@@ -149,10 +172,12 @@ class Matcher:
 
     def __init__(self, strong: set[str], weak: set[str], roots: set[str],
                  dyn: DynState, min_count: int = 3, deactivate_days: int = 7,
-                 short_window: float = 180.0) -> None:
+                 short_window: float = 180.0, tics: set[str] | None = None) -> None:
         self.strong = strong
         self.weak = weak
         self.roots = roots
+        # 口癖：只剥不刹（理由见 TIC_BASE 注释）
+        self.tics = tics or set()
         self.dyn = dyn
         self.min_count = min_count
         self.deactivate_days = deactivate_days
@@ -181,6 +206,7 @@ class Matcher:
             "shadow_hits": [],
             "dyn_upgraded": None,
             "dyn_hits": [],
+            "tic_hits": [],
             "brake": False,
             "active": sorted(self.dyn.active_roots()),
         }
@@ -203,6 +229,15 @@ class Matcher:
                     res["dyn_upgraded"] = root
                 if st in ("upgraded", "hot"):
                     res["dyn_hits"].append(root)
+        # 口癖：同样累计热度、同样进剥除名单，但**不进 dyn_hits**，
+        # 所以不会触发下面的会话刹车（口癖只剥不刹）。
+        for tic in self.tics:
+            if _norm(tic) in norm:
+                st = self.dyn.observe(tic, ts, self.min_count, self.deactivate_days)
+                if st == "upgraded":
+                    res["dyn_upgraded"] = tic
+                if st in ("upgraded", "hot"):
+                    res["tic_hits"].append(tic)
         if res["dyn_upgraded"]:
             self.dyn.save()
         self.dyn.deactivate_stale(ts, self.deactivate_days)
@@ -218,19 +253,51 @@ class Matcher:
 
     # ---- 给 main 的剥除工具 ----
 
+    def _strip_all(self, cur: str, pat: str) -> tuple[str, list[str]]:
+        """剥掉 cur 里全部 pat 命中，并把命中点上悬空的分隔符一并收干净。
+
+        为什么不能只用一条 `re.sub(r"pat\\s*[,，。；!！?？]?", "", cur)`：
+        那个写法只吃**右邻**标点，于是口癖落在句尾时会剥出尾逗号 ——
+        「妈什么妈，大半夜的」→「妈什么妈，」。真人不会发一条以逗号结尾的话。
+
+        规则：
+          · 右邻是分隔符 → 吃掉（「大半夜的，谁是你宝宝」→「谁是你宝宝」）；
+          · 右邻是空白/什么都没有（命中在句尾）→ 改吃**左邻**分隔符
+            （「妈什么妈，大半夜的」→「妈什么妈」）；
+          · 右邻是正常文字 → 两侧都不动
+            （「活着呢，大半夜的测试呢」必须剥成「活着呢，测试呢」，
+              左边那个逗号是有用的，不能吃）。
+        """
+        rx = re.compile(pat)
+        got: list[str] = []
+        for _ in range(8):                      # 同一条里重复出现时反复剥
+            m = rx.search(cur)
+            if not m:
+                break
+            if m.group(0):
+                got.append(m.group(0))
+            left, right = cur[:m.start()], cur[m.end():]
+            right = re.sub(r"^[ \t]*[,，。；!！?？][ \t]*", "", right)
+            if not right.strip():
+                left = re.sub(r"[,，。；、][ \t]*$", "", left).rstrip()
+            nxt = left + right
+            if nxt == cur:                      # 空模式等异常，别空转
+                break
+            cur = nxt
+        return cur, got
+
     def strip_strong(self, text: str) -> tuple[str, list[str]]:
-        """剥掉正文里所有静态强信号整词 + 当前剥除名单词根。返回 (新文本, 命中原词列表)。"""
+        """剥掉正文里所有静态强信号整词 + 当前剥除名单词根/口癖。返回 (新文本, 命中原词列表)。"""
         hits: list[str] = []
         cur = text or ""
-        # 词根按长度降序，先剥长词
+        # 词根按长度降序，先剥长词（「大半夜的」先于「大半夜」，才不会有悬空的「的」）
         pats = list(self._strong_pat)
         for root in sorted(self.dyn.active_roots(), key=len, reverse=True):
             pats.append(re.escape(root))
         pats = sorted(set(pats), key=len, reverse=True)
         for pat in pats:
-            new = re.sub(r"\s*" + pat + r"\s*[,，。；!！?？]?", "", cur)
-            if new != cur:
-                m = re.search(pat, cur)
-                hits.append(m.group(0) if m else pat)
+            new, got = self._strip_all(cur, pat)
+            if got:
+                hits.extend(got)
                 cur = new
         return cur, hits
