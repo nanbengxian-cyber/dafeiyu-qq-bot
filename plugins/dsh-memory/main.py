@@ -1948,14 +1948,15 @@ class Main(star.Star):
             return
         m = await self.store.member(gid, uid)
         if m and m["opted_out"]:
-            yield event.plain_result("你已经退出记忆了，我什么都没记。想重新开启发 /记住我。")
+            yield event.plain_result("你已经退出记忆了，我什么都没记。想重新开启就发 /记住我。")
             return
         facts = await self.store.facts(gid, uid)
         if not facts:
-            yield event.plain_result(
-                "还没记下你什么。多聊几句我就慢慢认识你了（每 %d 条消息、间隔 %d 分钟才整理一次）。"
-                % (EXTRACT_MIN_MSGS, int(EXTRACT_MIN_GAP // 60))
-            )
+            # 原来这里带一句「（每 %d 条消息、间隔 %d 分钟才整理一次）」。
+            # 透明不等于把内部批次参数念给群里听 —— 那是机器在报配置。
+            # 系统可查/可改/可退出的设计靠的是 /我的档案 本身和下面那句
+            # /忘记我，不靠这两个数字。
+            yield event.plain_result("还没记下你什么。多聊几句，我慢慢就认识你了。")
             return
         lines = ["我记住的你（%d/%d 条）：" % (len(facts), MAX_FACTS_PER_USER)]
         for f in facts:

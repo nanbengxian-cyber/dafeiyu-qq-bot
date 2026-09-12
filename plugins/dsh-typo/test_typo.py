@@ -118,16 +118,27 @@ for f in (0.0, 0.5, 0.99):
     assert right in fix, (fix, right)
     assert wrong not in fix, fix          # 纠正里绝不能再出现错字
     assert len(fix) <= 6, fix
+    assert "*" not in fix, fix            # 群友不用「*字」，见下
 # 只带那一个正确字，不许跨词边界带上文（曾经补出过「*西真」）
-assert m.correction_for("这个东西真的很好用啊", at, form=0.0) == "*" + right
 assert "西" not in m.correction_for("这个东西真的很好用啊", at, form=0.0)
-print("  纠正例：%s ｜ %s ｜ %s"
-      % tuple(m.correction_for("这个东西真的很好用啊", at, form=f)
-              for f in (0.0, 0.5, 0.99)))
+# 2026-09-13：去掉「*字」。实测群友 27732 条里「*」开头只有 1 条且是 `***`
+# 屏蔽脏话——这个记法在群里根本不存在，机器人用它就是破绽。留着这条断言
+# 防止以后有人「觉得更自然」又加回来。
+assert m.correction_for("这个东西真的很好用啊", at, form=0.0) == "%s，打错了" % right
+assert m.correction_for("这个东西真的很好用啊", at, form=0.99) == "打错，%s" % right
+assert all("*" not in m.correction_for("这个东西真的很好用啊", at, form=f / 20.0)
+           for f in range(20))
+print("  纠正例：%s ｜ %s" % tuple(m.correction_for("这个东西真的很好用啊", at, form=f)
+                                   for f in (0.0, 0.99)))
 
 # ------------------------------------------------ 概率与旋钮
 assert 0.0 < m.RATE <= 0.15, "错字率不该超过 15%%，当前 %.2f" % m.RATE
 assert 0.0 <= m.FIX_RATE <= 1.0
+# 自我纠正的总频率要贴着群友（实测 0.87‰）。RATE×FIX_RATE 是「一条回复里
+# 出现纠正」的上界，超过 0.6% 就说明又在往群里报备「我打错了」。
+assert m.RATE * m.FIX_RATE <= 0.006, \
+    "自我纠正上界 %.2f%% 太高，群友只有 0.09%%，当前 RATE=%.2f FIX=%.2f" \
+    % (100 * m.RATE * m.FIX_RATE, m.RATE, m.FIX_RATE)
 assert m.MIN_LEN >= 2
 # 群名单必须显式配置：**不配 env 就是空集**（fail-safe，不作用于任何群）。
 # 这样断言而不是写死某个群号，开源版把默认值清空后同一份测试照样通过。
