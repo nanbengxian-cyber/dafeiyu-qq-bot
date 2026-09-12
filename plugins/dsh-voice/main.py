@@ -705,6 +705,30 @@ BANNED_HINT = "这句话不太适合念出来，换一句嘛"
 _INFRA_REASONS = (
     "审核通道超时", "审核通道异常", "审核通道不可用", "审核未给出结论",
 )
+# [patch:receipt-silent] QQ NT 内核等发送回执超时（ActionFailed retcode=1200）的
+# 专用哨兵。它**不是失败**：语音多半已经送达，只是内核没等到回执。所有调用方
+# 见到它都必须当作「已发出、不必再说任何话」，绝不能拿去生成群里的口播 ——
+# 真人不会汇报自己发没发出去，而且这句话在多数情况下是假的。
+RECEIPT_TIMEOUT = "__receipt_timeout__"
+# [patch:receipt-silent] 可以直接念给群里听的失败原因。不在名单里的一律换成
+# 通用短句 —— 「未配置 DSH_VOICE_API_KEY」「Edge 返回空音频」「未知错误」
+# 这种内部词不该出现在群里。
+_HUMAN_REASONS = frozenset({
+    "这句先没念出来，换个说法或者稍后再试",
+    BANNED_HINT,
+    "清洗后文本太短，没什么可念的",
+    "这次声音没送出去，等一下再试试",
+})
+GENERIC_FAIL = "这次声音没送出去，等一下再试试"
+
+
+def _human_err(err: str) -> str:
+    """把内部失败原因翻译成一句群里能看的话。"""
+    e = (err or "").strip()
+    if e in _HUMAN_REASONS:
+        return e
+    logger.info("[voice] 内部失败原因不外发，只进日志：%s", e[:160])
+    return GENERIC_FAIL
 
 CENSOR_SYS = (
     "你是内容审查员。用户会给你一段文本，请判断这段文本是否适合由"
@@ -1033,10 +1057,20 @@ class Main(star.Star):
             detail = str(exc).strip().replace("\n", " ")
             lower = detail.lower()
             if "retcode=1200" in lower or "nodeikernelmsgservice/sendmsg" in lower:
-                logger.warning("[voice] QQ 发送回执超时，不自动重发（可能已送达）：%s", detail[:300])
-                return False, "QQ 发送回执超时，可能已经送达；为避免重复语音未自动重发"
+                # [patch:receipt-silent] 回执超时**按已送达处理，不往群里播报**。
+                # 实测：群里刚听到语音，紧接着就蹦出一句
+                # 「这次语音没确认发出去：QQ 发送回执超时，可能已经送达；为避免
+                # 重复语音未自动重发」—— 群友看到的是机器人在念自己的故障码，
+                # 而且它说的多半是假的（回执超时通常只是内核没等到回执，语音已经
+                # 送出去了）。真人不会汇报自己发没发出去。
+                # 和下面 _INFRA_REASONS 那条注释是同一个原则：机制绝不能变成口播。
+                logger.warning(
+                    "[voice] QQ 发送回执超时，按已送达处理（不重发、不播报）：%s",
+                    detail[:300],
+                )
+                return False, RECEIPT_TIMEOUT
             logger.warning("[voice] QQ 语音发送失败(%s)：%s", type(exc).__name__, detail[:300])
-            return False, "QQ 语音通道暂时发送失败"
+            return False, "这次声音没送出去，等一下再试试"
         task = asyncio.create_task(_cleanup_old())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -1067,6 +1101,11 @@ class Main(star.Star):
         logger.info("[voice] 工具调用：%s", text[:80])
 
         ok, err = await self._send_voice(event, text)
+        if not ok and err == RECEIPT_TIMEOUT:
+            # [patch:receipt-silent] 回执超时按**已送达**处理。语音多半已经进群了，
+            # 这时候让模型去说「没发出去」就是在群里报假警。
+            logger.info("[voice] 工具调用：回执超时，按已送达收口")
+            return "语音已经发出去了。请只回一句很短的话，不要重复语音里的内容。"
         if not ok:
             _last_call[sid] = 0.0  # 失败不占冷却
             logger.error("[voice] 工具调用失败：%s", err)
@@ -1193,12 +1232,22 @@ class Main(star.Star):
         event.set_extra("voice_done", True)
 
         ok, err = await self._send_voice(event, text)
+        if not ok and err == RECEIPT_TIMEOUT:
+            # [patch:receipt-silent] 回执超时 = 多半已经送达，一个字都不说。
+            # 实测噪声（2026-09-13 00:30:53）：群里刚听到语音，紧接着就是
+            # 「这次语音没确认发出去：QQ 发送回执超时，可能已经送达；为避免重复
+            # 语音未自动重发」—— 群友看到的是机器人在念自己的故障码，而且它说的
+            # 大概率是假的。真人不会汇报自己发没发出去。
+            logger.info("[voice] 回执超时，按已送达处理：不重发、不播报机制")
+            return
         if not ok:
             _last_call[sid] = 0.0
             # 命令处理器必须自己收口发送异常；否则框架会把插件异常包装成
             # “:( 在调用插件…”并发进群。这里给一句稳定、可读的降级说明。
+            # [patch:receipt-silent] 不再套「这次语音没确认发出去：」这个前缀 ——
+            # err 本身已经是给人看的一句话，前缀一加就变成机制播报。
             if _notice_allowed(sid):
-                yield event.plain_result(f"这次语音没确认发出去：{err[:160]}")
+                yield event.plain_result(_human_err(err)[:160])
             else:
                 logger.info("[voice] 失败提示 %.0fs 内已发过，静默（%s）",
                             NOTICE_GAP, err[:80])

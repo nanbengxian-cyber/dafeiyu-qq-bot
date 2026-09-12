@@ -246,7 +246,14 @@ async def _maybe_auto_send(event: AstrMessageEvent, text: str) -> bool:
     if not path:
         _stat["unknown"] += 1
         return False
-    await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
+    # [patch:marker-leak-v3] 自动补图失败也必须咽下去：这个函数在兜底钩子的
+    # 末尾被调用，异常会冒到外层 except，把「已经剥好的文字」的收尾工作一起带走。
+    try:
+        await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
+    except BaseException as exc:
+        _stat["send_fail"] = _stat.get("send_fail", 0) + 1
+        logger.warning("[贴纸] 自动补图发送失败：%s", str(exc)[:200])
+        return False
     _last_auto[gid] = now
     _cooldown_remember(gid, tag)
     _stat["sent"] += 1
@@ -255,16 +262,32 @@ async def _maybe_auto_send(event: AstrMessageEvent, text: str) -> bool:
     return True
 
 
-async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
-    """剥标记 + 按配额发贴纸。返回清理后的文字（无标记时返回 None）。
+def strip_markers(text: str) -> tuple[str, list[str]]:
+    """纯函数：剥掉 [贴纸:x] 标记，返回 (清理后的文字, 标记里的贴纸名)。
 
-    标记无条件剥掉；配额只决定 GIF 发不发。
+    [patch:marker-leak-v3] 不碰网络、不碰 event，因此**不可能失败**。
+    任何要发东西的调用方都必须先拿这里的结果把文字替换掉，再去做发送。
+
+    2026-09-12 的实测泄漏链（群里真的出现过
+    「乖宝宝这称号我自己都叫上了？[贴纸:装萌]」）：旧版把「剥」和「发」
+    塞在同一个 _handle 里，`event.send` 抛 ActionFailed(retcode=1200) →
+    异常冒到调用方 → 调用方的 `comp.text = cleaned` /
+    `response.completion_text = cleaned` 整个被跳过 → 标记原样进群。
+    剥标记是纯字符串操作、不可能失败；发图是网络动作、随时会失败。
+    两件事必须分开：剥的结果先落盘，再去尝试发送。
     """
-    markers = MARKER_RE.findall(text or "")
-    if not markers:
-        return None
+    raw = text or ""
+    return MARKER_RE.sub("", raw).strip(), MARKER_RE.findall(raw)
 
-    cleaned = MARKER_RE.sub("", text).strip()
+
+async def _send_markers(
+    event: AstrMessageEvent, markers: list[str], cleaned: str, where: str
+) -> int:
+    """按配额把标记对应的贴纸发出去。返回真正发出去的张数。
+
+    **本函数绝不向外抛异常**：贴纸发不出去只是少一张图，
+    绝不能连累调用方的文字处理（见 _handle 的 [patch:marker-leak-v3]）。
+    """
     gid = _gid(event)
     _stat["attempt"] += 1
     if where == "decorate":
@@ -277,7 +300,7 @@ async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
         logger.info(
             f"[贴纸] 不发(本轮已出{media}) tags={markers} where={where} gid={gid}"
         )
-        return cleaned
+        return 0
 
     if not _quota_allows(gid):
         _stat["quota_drop"] += 1
@@ -285,7 +308,7 @@ async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
             f"[贴纸] 不发(配额 {MAX_IN_WINDOW}/{WINDOW}) tags={markers} "
             f"where={where} gid={gid} 窗口={[int(x) for x in _attempts.get(gid, [])]}"
         )
-        return cleaned
+        return 0
 
     # 走到这里说明配额已放行，记一拍冷却计时（patch:dedup-v2）
     _cooldown_tick(gid)
@@ -305,7 +328,15 @@ async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
             continue
         path = _resolve_sticker(tag)
         if path:
-            await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
+            try:
+                await event.send(MessageChain(chain=[Image.fromFileSystem(path)]))
+            except BaseException as exc:
+                # 发不出去只是少一张图。绝不能让异常冒出去 —— 见 [patch:marker-leak-v3]。
+                _stat["send_fail"] = _stat.get("send_fail", 0) + 1
+                logger.warning(
+                    "[贴纸] 发送失败（标记已剥，不影响文字）：%s", str(exc)[:200]
+                )
+                continue
             _cooldown_remember(gid, tag)
             sent += 1
         else:
@@ -319,7 +350,7 @@ async def _handle(event: AstrMessageEvent, text: str, where: str) -> str | None:
             f"[贴纸] 发送 {sent} 张, tags={markers}, where={where}, "
             f"cleaned_text={cleaned!r}"
         )
-    return cleaned
+    return sent
 
 
 class Main(star.Star):
@@ -329,27 +360,35 @@ class Main(star.Star):
     @filter.on_llm_response()
     async def stickerize(self, event: AstrMessageEvent, response: LLMResponse) -> None:
         """最终回复：识别贴纸标记，按配额发贴纸，并**总是**去除标记文字。"""
-        try:
-            text = response.completion_text or ""
-            cleaned = await _handle(event, text, "llm_response")
-            if cleaned is None:
-                try:
-                    event.set_extra(AUTO_FLAG, True)
-                except BaseException:
-                    pass
-                return
-            # 只要出现过标记，就把回复文字换成去标记后的文本（即使没发成任何贴纸）
-            if cleaned != text:
-                try:
-                    response.completion_text = cleaned
-                except Exception:
-                    response._completion_text = cleaned
+        # [patch:marker-leak-v3] 顺序是刻意的：**先剥、后发**。
+        # 旧版把两件事都塞进 _handle，一旦 event.send 抛 ActionFailed(retcode=1200)，
+        # 异常会在 `response.completion_text = cleaned` 之前冒出来并被这里吞掉，
+        # 于是标记原样进群（[贴纸:装萌]）。现在剥标记是纯字符串操作，
+        # 排在发送之前且无条件执行；发送失败只记日志。
+        text = response.completion_text or ""
+        cleaned, markers = strip_markers(text)
+        if cleaned != text:
+            # 只要出现过标记，就把回复文字换成去标记后的文本（即使一张都没发成）
             try:
-                event.set_extra(STEP_FLAG, True)
+                response.completion_text = cleaned
+            except Exception:
+                response._completion_text = cleaned
+        if not markers:
+            try:
+                event.set_extra(AUTO_FLAG, True)
             except BaseException:
                 pass
+            return
+        try:
+            event.set_extra(STEP_FLAG, True)
+        except BaseException:
+            pass
+        try:
+            await _send_markers(event, markers, cleaned, "llm_response")
         except BaseException as e:
-            logger.error(f"[贴纸] 处理失败: {e}")
+            # _send_markers 本身不会抛，这里是最后一道保险：文字已经剥干净了，
+            # 就算这里出任何事也不该回滚文字。
+            logger.error(f"[贴纸] 发图出错（文字已剥干净）: {e}")
 
     @filter.on_decorating_result()
     async def stickerize_fallback(self, event: AstrMessageEvent) -> None:
@@ -365,15 +404,35 @@ class Main(star.Star):
 
             # chain_result() 收的是组件 list；上游若误传 MessageChain 会形成
             # 嵌套结构。钩子顺序不保证，故本插件也独立拆平并 fail-open。
+            # [patch:marker-leak-v3] 拆不平就**放弃整条链**等于放标记进群，
+            # 所以这里尽量多挖几层；实在挖不动才退化成「整段文本兜底剥」。
             chain = getattr(result, "chain", None)
-            if chain is not None and not isinstance(chain, list):
+            for _ in range(4):
+                if isinstance(chain, list) or chain is None:
+                    break
                 inner = getattr(chain, "chain", None)
-                if isinstance(inner, list):
-                    result.chain = inner
-                    logger.warning("[贴纸] 检测到嵌套 MessageChain，已拆平")
-                else:
-                    logger.error("[贴纸] result.chain 类型异常: %r", type(chain))
-                    return
+                if inner is None:
+                    break
+                logger.warning("[贴纸] 检测到嵌套 MessageChain，已拆平")
+                chain = inner
+            if isinstance(chain, list):
+                result.chain = chain
+            elif chain is not None:
+                # 挖不动：至少把整条结果当成一段文本剥一遍，别让标记漏出去。
+                logger.error("[贴纸] result.chain 类型异常: %r", type(chain))
+                raw = ""
+                try:
+                    raw = result.get_plain_text() or ""
+                except BaseException:
+                    raw = ""
+                cleaned, markers = strip_markers(raw)
+                if markers:
+                    try:
+                        result.chain = [Plain(cleaned)] if cleaned else []
+                        logger.warning("[贴纸] 兜底：整段重写成剥干净的文本")
+                    except BaseException:
+                        pass
+                return
 
             if not result.chain:
                 return
@@ -389,15 +448,20 @@ class Main(star.Star):
                 if not isinstance(comp, Plain):
                     continue
                 text = comp.text or ""
-                if not MARKER_RE.search(text):
+                # [patch:marker-leak-v3] 先剥、先落盘，再去发。
+                # 旧版是 `cleaned = await _handle(...)` 之后才 `comp.text = cleaned`：
+                # _handle 内部的 event.send 一抛，赋值就被跳过，标记原样进群。
+                cleaned, markers = strip_markers(text)
+                if not markers:
                     continue
+                comp.text = cleaned
                 if already:
-                    comp.text = MARKER_RE.sub("", text).strip()
                     logger.info("[贴纸] 兜底只剥不发(本步已处理)")
                     continue
-                cleaned = await _handle(event, text, "decorate")
-                if cleaned is not None:
-                    comp.text = cleaned
+                try:
+                    await _send_markers(event, markers, cleaned, "decorate")
+                except BaseException as e:
+                    logger.error(f"[贴纸] 兜底发图出错（文字已剥干净）: {e}")
 
             # 剥完可能只剩空 Plain，去掉以免发出空消息
             result.chain[:] = [
