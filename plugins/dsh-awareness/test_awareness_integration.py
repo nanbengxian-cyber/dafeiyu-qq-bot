@@ -191,6 +191,67 @@ def test_index_and_detail_injection():
     print("  injection ok")
 
 
+def test_poke_flow():
+    """复现真实事故：群友戳了机器人 → 十几秒后 @它说话，它必须知道是谁戳的。
+
+    线上原话是机器人反问「戳谁呀？」——因为 poke 通知正文为空、
+    AstrBot 又把 sender 昵称写成 QQ 号，没人告诉它。
+    """
+    model = fresh()
+    # 先让这个人发过言，好让昵称能从历史里补全（poke 通知只带 QQ 号）。
+    model._record_event(FakeEvent(comps=[comp("Plain", text="大家早")],
+                                  uid="2187671056", name="我叫萌新地狱",
+                                  mid="q-1", text="大家早"), GID)
+    # 戳一戳：user_id 是戳的人，target_id 是被戳的（这里是机器人）。
+    model._record_notice(
+        {"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+         "group_id": GID, "user_id": "2187671056", "target_id": BOT,
+         "self_id": BOT, "time": 1780000000}, GID)
+    rows = model._load(GID, time.time() - 600)
+    poke = [r for r in rows if r["kind"] == "poke"]
+    assert len(poke) == 1, rows
+    assert poke[0]["extra"]["to_me"] is True, poke[0]
+    # 关键：昵称必须补成「我叫萌新地狱」，不能留成 QQ 号。
+    assert poke[0]["name"] == "我叫萌新地狱", poke[0]
+
+    # 机器人回戳（自己的 poke 也会上报）→ 用于「你已经回戳过对方」。
+    model._record_notice(
+        {"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+         "group_id": GID, "user_id": BOT, "target_id": "2187671056",
+         "self_id": BOT, "time": 1780000001}, GID)
+    # 重复通知不重复入库。
+    model._record_notice(
+        {"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+         "group_id": GID, "user_id": BOT, "target_id": "2187671056",
+         "self_id": BOT, "time": 1780000001}, GID)
+    assert len([r for r in model._load(GID, time.time() - 600)
+                if r["kind"] == "poke"]) == 2
+
+    # 十几秒后群友 @它说「没事就想戳戳」：这一轮必须带上「谁戳了你」。
+    req = FakeReq()
+    asyncio.run(model.inject(
+        FakeEvent(comps=[comp("At", qq=BOT), comp("Plain", text="没事就想戳戳")],
+                  uid="2187671056", name="我叫萌新地狱",
+                  text="没事就想戳戳"), req))
+    joined = "\n".join(p.text for p in req.extra_user_content_parts)
+    assert "<poke_awareness>" in joined, joined
+    assert "我叫萌新地狱" in joined and "2187671056" in joined, joined
+    assert "戳了你一下" in joined, joined
+    assert "你已经回戳过对方" in joined, joined
+    # 别人互戳、没戳它时，不该多嘴。
+    model2 = fresh()
+    model2._record_notice(
+        {"post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+         "group_id": GID, "user_id": "111", "target_id": "222",
+         "self_id": BOT, "time": 1780000002}, GID)
+    req2 = FakeReq()
+    asyncio.run(model2.inject(
+        FakeEvent(comps=[comp("Plain", text="在吗")], text="在吗"), req2))
+    assert "<poke_awareness>" not in "\n".join(
+        p.text for p in req2.extra_user_content_parts), "别人互戳不该注入"
+    print("  poke flow ok")
+
+
 def test_filter():
     f = aw.AwarenessFilter()
     # 本群消息放行。
@@ -220,6 +281,7 @@ def main():
     print("dsh-awareness 集成测试（%s）" % sys.version.split()[0])
     test_record_and_recall()
     test_index_and_detail_injection()
+    test_poke_flow()
     test_filter()
     test_sensitive_not_stored()
     print("AWARENESS_INTEGRATION_TEST_OK")

@@ -39,9 +39,14 @@ from astrbot.core.platform.message_type import MessageType
 _PLUGIN_DIR = str(Path(__file__).resolve().parent)
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
+# 热重载时 AstrBot 只清 data.plugins.* 命名空间，而 event_ring 是顶层模块，
+# 会留在 sys.modules 里，导致新版 main.py 仍 import 到旧模块（实测报
+# "cannot import name 'render_poke_note'"）。先掀掉缓存再导入。
+sys.modules.pop("event_ring", None)
 
 from event_ring import (  # noqa: E402
     KIND_OTHER,
+    KIND_POKE,
     KIND_RECALL,
     clean_text,
     classify,
@@ -49,6 +54,7 @@ from event_ring import (  # noqa: E402
     needs_detail,
     render_detail,
     render_index,
+    render_poke_note,
     scrub_for_store,
 )
 
@@ -84,6 +90,9 @@ DETAIL_BUDGET = _int("DSH_AWARENESS_DETAIL_BUDGET", 700, 200, 3000)
 TEXT_MAX = _int("DSH_AWARENESS_TEXT_MAX", 40, 8, 200)
 INDEX_ENABLED = _flag("DSH_AWARENESS_INDEX")
 DETAIL_ENABLED = _flag("DSH_AWARENESS_DETAIL")
+# 戳一戳事实的窗口：被戳后这段时间内的每一轮都告诉它是谁戳的。
+POKE_MIN = _int("DSH_AWARENESS_POKE_MIN", 10, 1, 240)
+POKE_ENABLED = _flag("DSH_AWARENESS_POKE")
 # 单条事件正文入库上限（明细阶段再截到 TEXT_MAX）。
 STORE_TEXT_MAX = 120
 
@@ -92,6 +101,8 @@ _stat = {
     "stored": 0,
     "recall": 0,
     "recall_lost": 0,
+    "poke": 0,
+    "poke_note": 0,
     "skipped_group": 0,
     "index": 0,
     "detail": 0,
@@ -205,12 +216,13 @@ class Main(star.Star):
             return
         logger.info(
             "[awareness] 已加载：%s 群=%s 保留%d分钟/%d条 索引=%s(%d分钟) "
-            "明细=%s(%d分钟/最多%d条/预算%d字) 库=%s",
+            "明细=%s(%d分钟/最多%d条/预算%d字) 戳一戳=%s(%d分钟内告知谁戳的) 库=%s",
             "开" if ENABLED else "关",
             "、".join(sorted(GROUPS)) or "全部",
             KEEP_MIN, KEEP_MAX,
             "开" if INDEX_ENABLED else "关", INDEX_MIN,
             "开" if DETAIL_ENABLED else "关", DETAIL_MIN, DETAIL_MAX, DETAIL_BUDGET,
+            "开" if POKE_ENABLED else "关", POKE_MIN,
             DB,
         )
 
@@ -301,6 +313,9 @@ class Main(star.Star):
 
     def _record_notice(self, raw, gid: str) -> None:
         notice_type = _rg(raw, "notice_type")
+        if _rg(raw, "sub_type") == "poke":
+            self._record_poke(raw, gid)
+            return
         if notice_type != "group_recall":
             return
         mid = str(_rg(raw, "message_id") or "")
@@ -357,6 +372,55 @@ class Main(star.Star):
                 ("有(%d字)" % len(text)) if text else "未留存",
             )
 
+    def _name_for(self, gid: str, uid: str) -> str:
+        """戳一戳通知里平台把昵称写成了 QQ 号；用这个人以前发言时的昵称补全。"""
+        if not gid or not uid:
+            return ""
+        con = _conn()
+        try:
+            row = con.execute(
+                "SELECT name FROM event WHERE group_id=? AND uid=? AND name!='' AND name!=?"
+                " ORDER BY ts DESC LIMIT 1",
+                (gid, uid, uid),
+            ).fetchone()
+        except BaseException:
+            row = None
+        finally:
+            con.close()
+        return str(row[0]) if row and row[0] else ""
+
+    def _record_poke(self, raw, gid: str) -> None:
+        """戳一戳：记下谁戳了谁。
+
+        被戳的是机器人时尤其重要——通知的正文是空的、昵称是 QQ 号，
+        不补这一条，机器人在后续轮次里只会反问「戳谁呀？」。
+        """
+        who = str(_rg(raw, "user_id") or "")
+        target = str(_rg(raw, "target_id") or "")
+        if not who or not target:
+            return
+        me = str(_rg(raw, "self_id") or "")
+        name = self._name_for(gid, who) or who
+        extra = {"by": who, "by_name": name, "target": target}
+        if me and target == me:
+            extra["to_me"] = True
+        row = {
+            "ts": time.time(),
+            "group_id": gid,
+            "uid": who,
+            "name": name,
+            "kind": KIND_POKE,
+            "text": "",
+            "message_id": "poke:%s:%s" % (who, _rg(raw, "time") or int(time.time())),
+            "extra": extra,
+        }
+        if self._insert(row):
+            _stat["poke"] += 1
+            logger.info(
+                "[awareness] 记录戳一戳 gid=%s %s(%s) -> %s%s",
+                gid, name, who, target, "（戳的是机器人）" if extra.get("to_me") else "",
+            )
+
     # --- 采集入口 ---------------------------------------------------------
     @filter.custom_filter(AwarenessFilter)
     async def on_event(self, event: AstrMessageEvent) -> None:
@@ -409,6 +473,7 @@ class Main(star.Star):
                 _stat["skipped_group"] += 1
                 return
             now = time.time()
+            me = str(event.get_self_id() or "")
             rows = self._load(gid, now - INDEX_MIN * 60)
             if not rows:
                 return
@@ -420,9 +485,16 @@ class Main(star.Star):
                     blocks.append(block)
                     _stat["index"] += 1
 
+            # 被戳的事实：平台不给正文、昵称又被写成 QQ 号，
+            # 不补这一条它就会反问「戳谁呀？」
+            if POKE_ENABLED:
+                note = render_poke_note(rows, now=now, me=me, window_min=POKE_MIN)
+                if note:
+                    blocks.append(note)
+                    _stat["poke_note"] += 1
+
             if DETAIL_ENABLED:
                 uid = str(event.get_sender_id() or "")
-                me = str(event.get_self_id() or "")
                 body = event.get_message_str() or ""
                 at_bot = _at_bot(event, me)
                 from_owner = bool(uid and uid in OWNERS)
@@ -466,10 +538,11 @@ class Main(star.Star):
         lines = [
             describe(rows, now),
             "",
-            "采集：看到%d条，入库%d条，撤回%d条（原文未留存%d次）"
-            % (_stat["seen"], _stat["stored"], _stat["recall"], _stat["recall_lost"]),
-            "注入：索引%d次，触发%d次，明细%d次"
-            % (_stat["index"], _stat["trigger"], _stat["detail"]),
+            "采集：看到%d条，入库%d条，撤回%d条（原文未留存%d次），戳一戳%d次"
+            % (_stat["seen"], _stat["stored"], _stat["recall"], _stat["recall_lost"],
+               _stat["poke"]),
+            "注入：索引%d次，触发%d次，明细%d次，戳一戳告知%d次"
+            % (_stat["index"], _stat["trigger"], _stat["detail"], _stat["poke_note"]),
             "配置：保留%d分钟/%d条，索引窗%d分钟，明细窗%d分钟最多%d条/%d字"
             % (KEEP_MIN, KEEP_MAX, INDEX_MIN, DETAIL_MIN, DETAIL_MAX, DETAIL_BUDGET),
         ]

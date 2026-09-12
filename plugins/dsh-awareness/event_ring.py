@@ -215,20 +215,24 @@ def summarize(rows: Iterable[dict], now: Optional[float] = None) -> dict:
     counts = {}
     last_ts = 0.0
     recalls = []
+    chats = 0
     for row in rows:
         if not isinstance(row, dict):
             continue
         kind = str(row.get("kind") or "")
-        if kind != KIND_RECALL:
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind not in (KIND_RECALL, KIND_POKE):
+            # 戳一戳和撤回不是「发言」：单独计数，免得把「消息N条」说虚。
+            chats += 1
             uid = str(row.get("uid") or "")
             if uid:
                 speakers.add(uid)
-        counts[kind] = counts.get(kind, 0) + 1
         last_ts = max(last_ts, float(row.get("ts") or 0))
         if kind == KIND_RECALL:
             recalls.append(row)
     return {
         "total": len(rows),
+        "chats": chats,
         "speakers": len(speakers),
         "counts": counts,
         "last_ts": last_ts,
@@ -250,7 +254,7 @@ def render_index(
     info = summarize(rows, now)
     if info["total"] <= 0:
         return ""
-    bits = ["消息%d条/%d人" % (info["total"], info["speakers"])]
+    bits = ["消息%d条/%d人" % (info["chats"], info["speakers"])]
     for kind in INDEX_ORDER:
         n = info["counts"].get(kind, 0)
         if n:
@@ -380,6 +384,72 @@ def render_detail(
 
 
 # --- 走查 -----------------------------------------------------------------
+def _ago_zh(seconds: float) -> str:
+    sec = max(0, int(seconds))
+    if sec < 45:
+        return "刚刚"
+    return _age_zh(sec) + "前"
+
+
+# --- 戳一戳（被戳时必须让机器人知道是谁）-----------------------------------
+# 平台给的消息体是空的：poke 通知只带 user_id（戳的人）和 target_id（被戳的人），
+# 而且 AstrBot 把 sender 昵称硬写成 QQ 号。不主动补这一条，机器人在后续轮次里
+# 只看到一条空消息，只能反问「戳谁呀？」——这正是要修的毛病。
+POKE_HEADER = (
+    "「戳一戳」的事实（有人在 QQ 里点了你头像两下）：它只是打招呼或引起注意的动作，"
+    "不是对方说的话。别把它当成发言内容，也别复述这条提示。"
+)
+
+
+def render_poke_note(
+    rows: Iterable[dict],
+    now: Optional[float] = None,
+    me: str = "",
+    window_min: int = 10,
+    limit: int = 3,
+) -> str:
+    """把「谁戳了你」渲染成一条明确事实；顺带标注你是否已经回戳过。"""
+    now = time.time() if now is None else float(now)
+    floor = now - window_min * 60
+    me = str(me or "")
+    pokes = []
+    mine = {}
+    for row in rows or []:
+        if not isinstance(row, dict) or str(row.get("kind") or "") != KIND_POKE:
+            continue
+        extra = row.get("extra") or {}
+        if isinstance(extra, str):
+            try:
+                extra = json.loads(extra or "{}")
+            except (TypeError, ValueError):
+                extra = {}
+        ts = float(row.get("ts") or 0)
+        if ts < floor:
+            continue
+        who = str(extra.get("by") or row.get("uid") or "")
+        target = str(extra.get("target") or "")
+        if me and who == me:
+            # 我自己戳了谁 —— 用来判断要不要补「你已经回戳过」。
+            if target and ts > mine.get(target, 0.0):
+                mine[target] = ts
+            continue
+        if extra.get("to_me") or (me and target == me):
+            pokes.append((ts, who, str(row.get("name") or who)))
+    if not pokes:
+        return ""
+    pokes.sort()
+    lines = []
+    for ts, who, name in pokes[-limit:]:
+        label = clean_text(name or who or "某人", 16)
+        line = "- %s「%s」(%s) 戳了你一下" % (_ago_zh(now - ts), label, who or "未知")
+        if me and mine.get(who, 0.0) >= ts:
+            line += "；你已经回戳过对方"
+        lines.append(line + "。")
+    return "\n".join(
+        ["<poke_awareness>", POKE_HEADER] + lines + ["</poke_awareness>"]
+    )
+
+
 def describe(rows: Iterable[dict], now: Optional[float] = None) -> str:
     """给 /群感知 指令用的可读状态。"""
     now = time.time() if now is None else float(now)

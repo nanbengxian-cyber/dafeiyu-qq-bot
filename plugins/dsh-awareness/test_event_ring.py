@@ -81,9 +81,15 @@ def test_index():
     ]
     block = er.render_index(rows, window_min=30, now=NOW)
     assert block.startswith("<group_awareness>") and block.endswith("</group_awareness>"), block
-    assert "消息4条" in block, block
+    # 撤回不算「发言」，所以是 3 条消息而不是 4。
+    assert "消息3条" in block, block
     assert "撤回1" in block, block
     assert "图片1" in block, block
+    # 戳一戳同样不算消息，但会单独报出来。
+    with_poke = rows + [_row(NOW - 60, "甲", er.KIND_POKE, "", by="1", target="2")]
+    block2 = er.render_index(with_poke, window_min=30, now=NOW)
+    assert "消息3条" in block2, block2
+    assert "戳一戳1" in block2, block2
     # 索引必须薄：它每轮都注入，不能超过 ~180 字。
     assert len(block) <= 260, len(block)
     # 索引不能泄露正文。
@@ -146,6 +152,39 @@ def test_limit_and_order():
     print("  limit/order ok")
 
 
+def test_poke_note():
+    BOT = "3752949717"
+    # 没人戳：不注入，零开销。
+    assert er.render_poke_note([], now=NOW, me=BOT) == ""
+    rows = [_row(NOW - 200, "区", er.KIND_POKE, "", by="1296432570",
+                 by_name="区", target=BOT, to_me=True)]
+    note = er.render_poke_note(rows, now=NOW, me=BOT)
+    assert note.startswith("<poke_awareness>"), note
+    # 关键：必须点名是谁戳的（昵称 + QQ），否则等于没说。
+    assert "区" in note and "1296432570" in note, note
+    assert "戳了你一下" in note, note
+    assert "3分钟前" in note, note
+
+    # 机器人已经回戳过 → 明说，省得它答「那我也戳回去」。
+    rows.append(_row(NOW - 190, "大肥鱼", er.KIND_POKE, "", by=BOT, target="1296432570"))
+    note = er.render_poke_note(rows, now=NOW, me=BOT)
+    assert "你已经回戳过对方" in note, note
+
+    # 别人互戳、与我无关 → 不注入。
+    other = [_row(NOW - 30, "甲", er.KIND_POKE, "", by="1", target="2")]
+    assert er.render_poke_note(other, now=NOW, me=BOT) == ""
+    # 超出窗口的旧戳不再注入（它已经过气了）。
+    old = [_row(NOW - 3600, "区", er.KIND_POKE, "", by="1", target=BOT, to_me=True)]
+    assert er.render_poke_note(old, now=NOW, me=BOT, window_min=10) == ""
+    # 只给最近几条，且最近的在前。
+    many = [_row(NOW - i, "p%d" % i, er.KIND_POKE, "", by=str(i),
+                 target=BOT, to_me=True) for i in range(8)]
+    note = er.render_poke_note(many, now=NOW, me=BOT, limit=3)
+    assert note.count("- ") == 3, note
+    assert "p0" in note and "p7" not in note, note
+    print("  poke ok")
+
+
 def test_describe():
     rows = [
         _row(NOW - 60, "区", er.KIND_TEXT, "hi"),
@@ -166,6 +205,7 @@ def main():
     test_trigger()
     test_detail()
     test_limit_and_order()
+    test_poke_note()
     test_describe()
     print("AWARENESS_EVENT_RING_TEST_OK")
 
