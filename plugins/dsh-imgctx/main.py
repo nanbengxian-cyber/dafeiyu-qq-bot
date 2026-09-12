@@ -27,6 +27,15 @@
 # 成本控制：同一张图只转述一次（按 QQ 的 file id 缓存）；每轮最多 MAX_IMAGES 张；
 # 整个过程有总超时，超时就放弃注入而不是拖着回复不发——宁可这次没看懂图，
 # 也不能让机器人半分钟不说话。
+#
+# 2026-09-13 又补一刀：**历史图不再阻塞本轮回复**。
+# 原来不管图是哪来的都先转述完才注入，实测被@的**纯文字**回复：
+#   中间夹了识图的 中位 25.8s ｜ 没有识图的 中位 8.6s
+# 也就是有人在打字间隙发张图，机器人回一句跟图无关的话要多等 17 秒。
+# 现在按「这张图是不是本轮要回答的东西」分开：
+#   · 当前消息自带的图、用户精确引用的图 —— 照旧等（回答就靠它）
+#   · 历史里顺带的图 —— 只吃缓存；没缓存的丢后台转述，本轮不等
+# 后台转述完照样写进 _caption_cache，所以同一张图下一轮是白拿。
 
 import asyncio
 import hashlib
@@ -56,6 +65,9 @@ MAX_IMAGES = int(os.environ.get("DSH_IMGCTX_MAX_IMAGES", "2"))
 MAX_AGE = int(os.environ.get("DSH_IMGCTX_MAX_AGE", "300"))
 # 整个「取历史+下载+转述」的总超时。超了就放弃，不能拖着回复
 BUDGET = float(os.environ.get("DSH_IMGCTX_BUDGET", "15"))
+# 后台预转述最多同时跑几个。历史图不阻塞本轮，但也不能无限起任务
+# （有人连刷十张时，靠这个上限 + MAX_IMAGES 兜住）。
+WARM_MAX = int(os.environ.get("DSH_IMGCTX_WARM", "4"))
 # 单张图下载超时
 FETCH_TIMEOUT = float(os.environ.get("DSH_IMGCTX_FETCH_TIMEOUT", "8"))
 # 转述前把图缩到这个最长边。实测（125KB 原图 vs 缩到 768）：
@@ -97,6 +109,9 @@ CACHE_MAX = int(os.environ.get("DSH_IMGCTX_CACHE", "300"))
 _caption_cache: dict[str, str] = {}
 # 插入顺序，用于超出 CACHE_MAX 时淘汰最旧的
 _cache_order: list[str] = []
+# 正在后台预转述的图：file key -> Task。避免同一张图被并行转述两次
+# （连发同一张表情包时很容易撞上），也兼作并发上限。
+_inflight: dict[str, "asyncio.Task"] = {}
 
 # 框架已经成功转述过图片的标记。命中任一即说明这一轮不用我们插手。
 _FRAMEWORK_OK_MARKERS = (
@@ -592,12 +607,66 @@ class Main(star.Star):
             return
         await self._emit(req, provider_id, items, rescue=rescue)
 
+    def _attach_cached(self, items: list[dict]) -> int:
+        """只把已经在缓存里的转述贴上，一个网络请求都不发。返回命中数。"""
+        hit = 0
+        for it in items:
+            cap = _caption_cache.get(it["file"])
+            if cap:
+                it["caption"] = cap
+                hit += 1
+        return hit
+
+    def _warm(self, provider_id: str, items: list[dict]) -> int:
+        """后台预转述：本轮不等，转述完进缓存，下一轮白拿。返回起了几个任务。
+
+        为什么敢不等：这条路径上的图是「群里最近出现过、但不是本条消息要回答的」，
+        注入文案本身就写着「和当前话题无关就忽略」。为它把回复拖慢 17 秒不划算。
+        """
+        started = 0
+        for it in items:
+            key = it.get("file") or ""
+            if not key or key in _caption_cache or key in _inflight:
+                continue
+            if len(_inflight) >= WARM_MAX:
+                break
+            # 传副本：_caption 会往 item 里写 caption，别影响本轮已定稿的输出。
+            task = asyncio.create_task(self._caption(provider_id, [dict(it)]))
+
+            def _done(t: "asyncio.Task", k: str = key) -> None:
+                _inflight.pop(k, None)
+                if not t.cancelled():
+                    try:
+                        # 必须取一次异常，否则 asyncio 在 GC 时会打
+                        # 「Task exception was never retrieved」，白污染日志。
+                        t.exception()
+                    except BaseException:
+                        pass
+
+            _inflight[key] = task
+            task.add_done_callback(_done)
+            started += 1
+        return started
+
     async def _emit(
         self, req, provider_id, items, rescue=False, quote_rescue=False
     ) -> None:
-        """转述这批图并把结果注入请求。"""
-        cached = sum(1 for it in items if it["file"] in _caption_cache)
-        await self._caption(provider_id, items)
+        """转述这批图并把结果注入请求。
+
+        只有「本轮要回答的那张图」（当前消息自带 / 用户精确引用）才阻塞等待；
+        历史里顺带的图只吃缓存，其余丢后台 —— 见文件头 2026-09-13 那段。
+        """
+        if rescue or quote_rescue:
+            cached = sum(1 for it in items if it["file"] in _caption_cache)
+            await self._caption(provider_id, items)
+        else:
+            cached = self._attach_cached(items)
+            warming = self._warm(provider_id, items)
+            if warming:
+                logger.info(
+                    "[imgctx] 历史图本轮不等：命中缓存 %d 张，%d 张转后台转述",
+                    cached, warming,
+                )
 
         described = [it for it in items if it.get("caption")]
         if not described:
@@ -678,6 +747,8 @@ class Main(star.Star):
             f"图片上下文：{'开' if ENABLED else '关'}\n"
             f"回看最近 {LOOKBACK} 条消息，每轮最多转述 {MAX_IMAGES} 张\n"
             f"图片时效 {MAX_AGE}s，总预算 {BUDGET:.0f}s\n"
+            f"当前消息/引用图：等到转述完；历史顺带图：只吃缓存、其余后台转述\n"
+            f"后台预转述并发上限 {WARM_MAX}（在跑 {len(_inflight)}）\n"
             f"动图抽 {GIF_FRAMES} 帧拼图后识别\n"
             f"转述模型：{pid}\n"
             f"已缓存 {len(_caption_cache)} 张图的描述"
