@@ -111,6 +111,10 @@ assert "SERVANT" in kinds("如果我弄疼你，那你会怎样？")
 assert "SERVANT" in kinds("我是顺，我要殴打你")
 assert "FODDER" in kinds("主要是想吃鱼片了", ctx=True)
 assert "INSULT" in kinds("你这条大臭，不得劲啊")
+# 2026-09-13 13:20 那轮（被 dsh-merge 吞掉，判据必须认得）
+assert "DEAL" in kinds("你看看你吃多少token了?！")
+assert "DEAL" in kinds("吃白饭的肥鱼")
+assert dev("行行行 吃白饭就吃白饭") == "LABEL"
 # 但没上下文又没指向它的时候，不许乱认
 assert kinds("必须得狠狠使用") == []
 assert kinds("得爆炒😡😡😡") == []
