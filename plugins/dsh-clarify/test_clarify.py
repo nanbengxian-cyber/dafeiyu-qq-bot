@@ -62,4 +62,12 @@ assert 'event.get_extra("dsh_initiate")' in src
 assert 'event.get_extra("dsh_proactive")' in src
 assert 'for row in rows:' in src and 'reversed(prior[-LOOKBACK:])' in src
 
+# 2026-09-13：「不知道谁艾特它」根因是分类器不知道最后一条是点名。
+# 被点名时 transcript 必须把最后一条标成「@ 机器人」，prompt 也要有对应规则。
+assert "_recent(gid, current, addressed: bool = False)" in src or "_recent(gid, text, addressed)" in src
+assert "（这条是 @ 机器人 才说的）%s" % "" in src or "（这条是 @ 机器人 才说的）" in src
+assert "特意 @ 机器人（点名）才说的" in src and "判 connected" in src
+# 调用点要把 addressed 传进去
+assert "transcript, context_count = _recent(gid, text, addressed)" in src
+
 print("CLARIFY_TEST_OK")

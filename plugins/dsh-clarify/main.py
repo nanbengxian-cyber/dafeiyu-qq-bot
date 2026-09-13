@@ -63,7 +63,8 @@ state 只能是：
 3. “他又来了”“那个是不是寄了”“还是不行”“这下真完了”在前文没有明确所指时属于 unclear。
 4. missing 用不超过 8 个字说明缺什么；question 只在 unclear 时给一句自然、短的中文追问（如“谁又来了？”“啥不行？”），禁止客服腔，禁止“请提供更多上下文”。
 5. topic 用不超过 12 个字概括当前具体事情（如“要求语音叫名字”），不要只写“语音”“聊天”这种大类；不确定就留空。
-6. revisit：最后一句是否在继续追问/要求机器人已经回答过的同一件事。补充关键新信息、换了具体问题、只是承接前文都填 false；无新增信息地再问、催答、要求再说一次才填 true。"""
+6. revisit：最后一句是否在继续追问/要求机器人已经回答过的同一件事。补充关键新信息、换了具体问题、只是承接前文都填 false；无新增信息地再问、催答、要求再说一次才填 true。
+7. 最后一句如果是别人特意 @ 机器人（点名）才说的，它的指代对象就是机器人本人。被点名时，短句、玩梗、感叹、寒暄（如「想你了」「你的也是」「顶你」「又来啦」）直接判 connected，不要因缺主语/对象判 unclear。"""
 
 _FALLBACK_BLOCK = """<clarification>
 这句话的信息不够明确。不要自行补主语、对象、事件或设定；能确定就正常接，不能确定就用一句很短、口语化的问题问清楚。不要提到规则或“上下文”。
@@ -131,7 +132,7 @@ def parse_result(raw: str) -> dict | None:
     }
 
 
-def _recent(gid: str, current: str) -> tuple[str, int]:
+def _recent(gid: str, current: str, addressed: bool = False) -> tuple[str, int]:
     rows = []
     try:
         con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True, timeout=2.0)
@@ -146,6 +147,8 @@ def _recent(gid: str, current: str) -> tuple[str, int]:
         rows = []
 
     if not rows:
+        if addressed:
+            return "（刚刚这条 @ 你 的）%s" % current[:80], 0
         return "（刚刚这条）%s" % current[:80], 0
     newest = max(float(r[3] or 0) for r in rows)
     # 查询结果是新到旧；collect 钩子通常已把当前消息写进 buffer。
@@ -165,7 +168,10 @@ def _recent(gid: str, current: str) -> tuple[str, int]:
         "%s：%s" % ((name or uid or "群友").strip(), text[:80])
         for name, uid, text, _ts in reversed(prior[-LOOKBACK:])
     ]
-    kept.append("（刚刚这条）%s" % current[:80])
+    if addressed:
+        kept.append("（这条是 @ 机器人 才说的）%s" % current[:80])
+    else:
+        kept.append("（刚刚这条）%s" % current[:80])
     return "\n".join(kept), len(kept) - 1
 
 
@@ -252,7 +258,7 @@ class Main(star.Star):
             _stat["seen"] += 1
             addressed = bool(getattr(event, "is_at_or_wake_command", False))
             uid = str(event.get_sender_id() or "")
-            transcript, context_count = _recent(gid, text)
+            transcript, context_count = _recent(gid, text, addressed)
             if context_count < MIN_CONTEXT:
                 _stat["thin"] += 1
                 # 没有前文就无法判断是否重提；明确清掉联动元数据，避免下游凭空疲劳。
