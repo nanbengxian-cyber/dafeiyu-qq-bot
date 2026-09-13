@@ -80,7 +80,7 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-proactive` | 572 | `/探头状态` | — | — |
 | `dsh-interest` | 370 | `/馋什么` | — | — |
 | `dsh-steal` | 610 | `/表情包` | — | 视觉模型(识图) |
-| `dsh-mind` | 470 + 500(mind_logic) | `/心智状态` | — | — |
+| `dsh-mind` | 480 + 719(mind_logic) | `/心智状态` | — | — |
 
 > `dsh-mind` 是**只读观测层**（P0）：把散落在 11 个状态库里的「岛」（情绪/欲望/关系/逆反/疲劳/兴趣/自身利益/群感知/自我认知/行动额度）读成一张快照，每个 LLM 轮次产出一行 `岛=N/11` 日志 + 一条只记「块标签 + 字数」的观测记录，用来量「一轮有几个岛在说话、合并成一个块能省多少字、岛与岛之间有多少条冲突」。**绝不注入、绝不写别人的状态、绝不阻止回复**；`DSH_MIND_MODE` 只接受 `observe`（配成别的会被拒绝）。设计取舍与决策判据见 [docs/83](../docs/83-内在状态总线与仲裁层-20260913.md)。
 
@@ -138,7 +138,7 @@ python3 dsh-guard/test_mood_check.py        # 47 项:跑真实 check()（假事�
 python3 dsh-interest/test_interest.py       # 热度计算 + 口味轮换 + 注入预算
 python3 dsh-leakguard/test_leakguard.py     # 强/弱标题档 + 指令句影子层
 python3 dsh-memory/test_memory.py           # 抽取/去重/容量/过期 + 注入预算
-python3 dsh-mind/test_mind.py               # 81 项:衰减口径对齐 + 岛判定 + 7 条冲突规则(均带反向用例) + 只读约束
+python3 dsh-mind/test_mind.py               # 90 项:衰减口径对齐 + 岛判定 + 7 条冲突规则(均带反向用例) + 只读约束
 python3 dsh-mind/test_mind_hook.py          # 18 项:跑真实 observe 钩子(须在容器里);含 priority=-1 与「req 一个字节没动」
 python3 dsh-poke/test_poke.py               # 三道闸门 + 回话文案
 python3 dsh-proactive/test_proactive.py     # 正则兴趣评分 + 限流 + 每日额度

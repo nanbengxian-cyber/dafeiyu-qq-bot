@@ -88,6 +88,7 @@ from astrbot.core.platform.message_type import MessageType
 
 from .mind_logic import (
     MindReader,
+    annotations,
     detect_conflicts,
     islands,
     render_draft,
@@ -186,6 +187,7 @@ class MindStore:
                             n_conflicts INTEGER NOT NULL,
                             islands TEXT NOT NULL DEFAULT '[]',
                             conflicts TEXT NOT NULL DEFAULT '[]',
+                            notes TEXT NOT NULL DEFAULT '[]',
                             errors TEXT NOT NULL DEFAULT '[]',
                             flags TEXT NOT NULL DEFAULT ''
                         );
@@ -199,10 +201,20 @@ class MindStore:
                         CREATE INDEX IF NOT EXISTS idx_block_obs ON observe_block(obs_id);
                         """
                     )
+                self._migrate()
             finally:
                 os.umask(old)
         except (OSError, sqlite3.Error) as exc:
             logger.warning("[mind] 观测库不可用，本插件退化为只打日志：%s", exc)
+
+    def _migrate(self) -> None:
+        """补上后加的列。CREATE TABLE IF NOT EXISTS 对既有库无效，
+        而生产库在第一次上线当天就已经有真实数据了（不能靠删库重建）。"""
+        with self._connect() as con:
+            have = {r[1] for r in con.execute("PRAGMA table_info(observe)").fetchall()}
+            for column, ddl in (("notes", "TEXT NOT NULL DEFAULT '[]'"),):
+                if column not in have:
+                    con.execute("ALTER TABLE observe ADD COLUMN %s %s" % (column, ddl))
 
     def add(self, row: dict, parts) -> None:
         with self.lock:
@@ -210,12 +222,12 @@ class MindStore:
                 with self._connect() as con:
                     cur = con.execute(
                         "INSERT INTO observe(ts,gid,uid,n_blocks,inject_chars,ctx_chars,"
-                        "n_islands,draft_len,n_conflicts,islands,conflicts,errors,flags) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "n_islands,draft_len,n_conflicts,islands,conflicts,notes,errors,flags) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (row["ts"], row["gid"], row["uid"], row["n_blocks"],
                          row["inject_chars"], row["ctx_chars"], row["n_islands"],
                          row["draft_len"], row["n_conflicts"], row["islands"],
-                         row["conflicts"], row["errors"], row["flags"]))
+                         row["conflicts"], row["notes"], row["errors"], row["flags"]))
                     obs_id = cur.lastrowid
                     con.executemany(
                         "INSERT INTO observe_block(obs_id,tag,chars) VALUES(?,?,?)",
@@ -330,6 +342,8 @@ class Main(star.Star):
             snap.gid = gid
             draft = render_draft(snap, BUDGET)
             conflicts = detect_conflicts(snap, parts)
+            # 观测（块/状态不匹配）与冲突分开：前者每轮都成立，混进冲突率就没意义了
+            notes = annotations(snap, parts)
             live = islands(snap)
 
             flags = []
@@ -344,7 +358,7 @@ class Main(star.Star):
             if text.startswith("/"):
                 flags.append("cmd")
 
-            line = snapshot_line(snap, parts, draft, conflicts)
+            line = snapshot_line(snap, parts, draft, conflicts, notes)
             if synthetic:
                 line += " [合成事件:%s]" % synthetic
             logger.info(line)
@@ -363,6 +377,7 @@ class Main(star.Star):
                     "n_conflicts": len(conflicts),
                     "islands": json.dumps([i["detail"] for i in live], ensure_ascii=False),
                     "conflicts": json.dumps(conflicts, ensure_ascii=False),
+                    "notes": json.dumps(notes, ensure_ascii=False),
                     "errors": json.dumps(list(snap.errors), ensure_ascii=False),
                     "flags": ",".join(flags),
                 }, parts)
@@ -403,10 +418,13 @@ class Main(star.Star):
         drafts = [r["draft_len"] for r in rows]
         ctxs = [r["ctx_chars"] for r in rows]
         conf = 0
+        note_hist = {}
         errs = {}
         island_hist = {}
         for r in rows:
             conf += r["n_conflicts"]
+            for note in json.loads((r["notes"] if "notes" in r.keys() else "[]") or "[]"):
+                note_hist[note] = note_hist.get(note, 0) + 1
             island_hist[r["n_islands"]] = island_hist.get(r["n_islands"], 0) + 1
             for e in json.loads(r["errors"] or "[]"):
                 errs[e] = errs.get(e, 0) + 1
@@ -425,7 +443,10 @@ class Main(star.Star):
                ("省 %.0f%%" % ((1 - (sum(drafts) / max(1, sum(inject)))) * 100))
                if sum(inject) else "无可比数据"),
             "岛数分布：" + "｜".join("%d岛=%d" % (k, v) for k, v in sorted(island_hist.items())),
-            "冲突 %d 条（%.0f%% 的轮次）" % (conf, (conf / max(1, len(rows))) * 100),
+            "冲突 %d 条（%.0f%% 的轮次）｜观测 %s"
+            % (conf, (conf / max(1, len(rows))) * 100,
+               "、".join("%s×%d" % (k, v) for k, v in
+                         sorted(note_hist.items(), key=lambda kv: -kv[1])[:3]) or "无"),
             "--- 注入块 Top（近 24h，按总字数） ---",
         ]
         for tag, cnt, total, avg in blocks[:12]:

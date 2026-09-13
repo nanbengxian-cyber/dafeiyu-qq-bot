@@ -50,6 +50,14 @@ check("逆反：半衰期 6h",
 check("逆反：未更新则原值",
       abs(m.reactance_effective(40.0, NOW, NOW) - 40.0) < 1e-6)
 
+# 基线以**库里的列**为准，常量表只兜底（2026-09-13 实测线上 recognition 是 8.0，
+# 而照抄过来的常量表写 16.0 —— 抄来的常数会过期，别拿它当权威）
+check("基线：库里有值就用库里的", m._baseline_of("recognition", 8.0) == 8.0)
+check("基线：列为空退回常量", m._baseline_of("recognition", None) == 16.0)
+check("基线：列为 0 视为没设", m._baseline_of("recognition", 0) == 16.0)
+check("基线：未知驱动退回默认 16", m._baseline_of("unknown_x", 0) == 16.0)
+check("基线：脏字符串不抛且退回常量", m._baseline_of("play", "abc") == 16.0)
+
 # ---------------------------------------------------------------- 社交档位
 check("档位：亲近要同时够好感和信任", m.social_tier(60, 50) == "亲近")
 check("档位：好感够但信任不够只算熟人", m.social_tier(60, 30) == "熟人")
@@ -189,13 +197,15 @@ check("冲突6 反向：能力失败且平静",
       not any("能力失败" in x for x in m.detect_conflicts(
           snap(selfaware_fails=2, emotion_live=False), [])))
 
+# 「块多岛少」不是冲突，是**观测**（上线当天实测它每轮都成立，混进冲突率就废了）。
 many = m.scan_parts([FakePart("<a_%s>x</a_%s>" % (i, i)) for i in range(9)])
-c = m.detect_conflicts(neutral, many)
-check("冲突7：块多岛少", any("无状态注入" in x for x in c), c)
-c = m.detect_conflicts(rich, [])
-check("冲突7 反向：岛多零注入", any("零注入" in x for x in c), c)
-check("冲突7 不误报：块少岛多",
-      not any("无状态注入" in x for x in m.detect_conflicts(rich, many[:2])))
+check("观测：块多岛少", any("≫" in x for x in m.annotations(neutral, many)),
+      m.annotations(neutral, many))
+check("观测：岛多零注入", any("零注入" in x for x in m.annotations(rich, [])),
+      m.annotations(rich, []))
+check("观测：对得上就不报", m.annotations(rich, many[:2]) == [], m.annotations(rich, many[:2]))
+check("观测：不污染冲突计数（每轮都成立的量不是异常）",
+      m.detect_conflicts(neutral, many) == [], m.detect_conflicts(neutral, many))
 
 # ---------------------------------------------------------------- 草稿预算
 full = m.render_draft(rich, 900)
@@ -211,9 +221,12 @@ check("草稿：预算极小也返回合法块",
 check("草稿：超预算丢最小的不截断半句",
       "…" not in tiny and ">" in tiny)
 
-line = m.snapshot_line(rich, many, full, ["a", "b"])
+line = m.snapshot_line(rich, many, full, ["a", "b"], ["块9≫状态11"])
 check("日志行：带岛数与冲突数",
       "岛=11/11" in line and "冲突=2" in line and "注入块=9" in line, line)
+check("日志行：观测单独打标", "[注:块9≫状态11]" in line, line)
+check("日志行：没有观测时不打空标",
+      "[注:" not in m.snapshot_line(rich, many, full, ["a"]), line)
 
 # ---------------------------------------------------------------- 只读读取器（真实 fixture）
 def build_fixture(root: Path):
@@ -252,7 +265,8 @@ def build_fixture(root: Path):
             baseline REAL, phase TEXT, updated_at REAL);
         INSERT INTO drive_state VALUES('g','play',40.0,16.0,'active',%f);
         INSERT INTO drive_state VALUES('g','fear',60.0,8.0,'active',%f);
-    """ % (NOW - 7200, NOW))
+        INSERT INTO drive_state VALUES('g','curiosity',50.0,0.0,'active',%f);
+    """ % (NOW - 7200, NOW, NOW))
     p["social"] = db("dsh_social.db", """
         CREATE TABLE relations(group_id TEXT, user_id TEXT, affinity REAL,
             trust REAL, manual_tier TEXT, avoid_until REAL);
@@ -302,6 +316,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     check("读取：情绪活着且指向我", snap.emotion_live and snap.directed and snap.intensity == 2)
     check("读取：欲望衰减后 play≈28", abs(snap.drives["play"][0] - 28.0) < 0.01, snap.drives)
+    check("读取：库里 baseline=0 时用常量兜底（不是算成偏离极大）",
+          snap.drives["curiosity"][1] == 16.0, snap.drives)
     check("读取：关系档位按阈值", snap.tier == "亲近", snap.tier)
     check("读取：逆反 6h 内不衰减", abs(snap.reactance - 38.0) < 0.01, snap.reactance)
     check("读取：疲劳优先用 event extra",

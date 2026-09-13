@@ -60,13 +60,31 @@ DRIVE_HALF_LIFE = {
     "connection": 21600.0, "recognition": 5400.0,
     "curiosity": 10800.0, "play": 7200.0, "appetite": 14400.0,
 }
-# 出处：dsh-desire/desire_logic.py:BASELINES
+# 出处：dsh-desire/desire_logic.py:BASELINES —— **只当兜底**。
+#
+# ★ 别把它当权威。2026-09-13 拿生产库比对，发现这份字典已经跟线上不一致：
+#   recognition 线上 8.0 / 这里 16.0，curiosity 线上 18.0 / 这里 16.0，
+#   appetite 线上 14.0 / 这里 16.0。drive_state 表**自己带 baseline 列**，
+#   那才是权威（dsh-desire 在改常数时会把值写进新行）。dsh-guard 也是读库里的列。
+#   所以这里只在行里的 baseline 缺失或 ≤0（等于没设）时兜底，
+#   免得「基线读不到」被算成「偏离极大」。
 DRIVE_BASELINE = {
     "continuity": 45.0, "integrity": 32.0, "competence": 28.0,
     "nociception": 4.0, "fear": 8.0, "autonomy": 12.0, "rest": 18.0,
     "connection": 16.0, "recognition": 16.0, "curiosity": 16.0,
     "play": 16.0, "appetite": 16.0,
 }
+
+
+def _baseline_of(drive, row_baseline):
+    """基线以库里的列为准；列缺失/为 0 时才退回常量表。"""
+    try:
+        base = float(row_baseline)
+    except (TypeError, ValueError):
+        base = 0.0
+    if base > 0:
+        return base
+    return DRIVE_BASELINE.get(str(drive), 16.0)
 # 出处：dsh-agency/main.py:_DESIRE_NAMES（展示名，保持两边一致）
 DRIVE_NAMES = {
     "continuity": "存续", "integrity": "身份与记忆完整", "competence": "能力稳态",
@@ -345,9 +363,10 @@ class MindReader:
                 "SELECT drive,intensity,baseline,updated_at,phase FROM drive_state "
                 "WHERE group_id=?", (gid,))
             for drive, eff, base, updated, phase in rows:
+                base = _baseline_of(drive, base)
                 snap.drives[str(drive)] = (
-                    drive_effective(float(eff), float(base), float(updated), str(drive), now),
-                    float(base), str(phase))
+                    drive_effective(float(eff), base, float(updated), str(drive), now),
+                    base, str(phase))
             sources.append("欲望")
         except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
             errors.append("欲望读失败(%s)" % type(exc).__name__)
@@ -615,15 +634,27 @@ def detect_conflicts(snap: MindSnapshot, parts) -> "list[str]":
     if snap.selfaware_fails and snap.emotion_live and snap.emotion in ("excited", "proud"):
         out.append("近窗口%d项能力失败 × 情绪%s" % (snap.selfaware_fails, EMOTION_NAMES.get(snap.emotion)))
 
-    # 7 块数与活跃岛数不匹配：有岛在无状态注入，或反之（口径漂移的哨兵）。
-    # 最值得报的一档恰恰是「0 个岛在说话却注入了 9 个块」—— 那是纯噪音。
+    return out
+
+
+def annotations(snap: MindSnapshot, parts) -> "list[str]":
+    """「块与活跃状态不匹配」——**不是冲突**，单独一列记。
+
+    ★ 为什么必须跟冲突分开（2026-09-13 上线当天就撞上）：
+    第一版把它当成第 7 条冲突规则，结果真实流量里**每轮都成立**
+    （实测每轮 18~22 个块注入、只有 4~5 个状态岛在说话），冲突率恒等于 100%。
+    一个永远为真的指标等于把这个指标废掉 —— 看的人两天后就不看它了。
+    每轮都成立的量是**基线**，不是异常；只有它偏离自己的常态才值得报。
+
+    所以这里只回答「块数和活跃岛数对得上吗」，冲突计数留给真正会互相打脸的规则。
+    """
     n_blocks = len(list(parts or []))
     n_live = len(islands(snap))
-    if n_blocks >= 3 and n_blocks > n_live + 3:
-        out.append("注入块%d个 > 活跃状态%d个（有块在无状态注入）" % (n_blocks, n_live))
+    out = []
+    if n_blocks > n_live + 3:
+        out.append("块%d≫状态%d" % (n_blocks, n_live))
     if n_live >= 4 and n_blocks == 0:
-        out.append("活跃状态%d个但本轮零注入（状态没走到 prompt）" % n_live)
-
+        out.append("状态%d但零注入" % n_live)
     return out
 
 
@@ -669,17 +700,20 @@ def render_draft(snap: MindSnapshot, budget: int = 900) -> str:
 
 
 # ---------------------------------------------------------------- 一行日志
-def snapshot_line(snap: MindSnapshot, parts, draft: str, conflicts) -> str:
+def snapshot_line(snap: MindSnapshot, parts, draft: str, conflicts, notes=()) -> str:
     """每个 LLM 轮次一行 —— 这一行就是 P0 的全部产出。
 
     刻意压到一行：这个仓库的日志已经 8MB 级，多一行×每轮会淹掉真正的信号。
+    `notes` 是 `annotations()` 的产出（块/状态不匹配之类的观测），
+    与 `conflicts`（真会互相打脸的矛盾）分开打标，免得基线被当成异常。
     """
     live = islands(snap)
     inject_chars = sum(p.chars for p in parts)
     names = "|".join(i["detail"] for i in live) or "无"
-    return ("[mind] gid=%s 岛=%d/%d 注入块=%d/%d字 草稿=%d字 冲突=%d%s%s %s"
+    return ("[mind] gid=%s 岛=%d/%d 注入块=%d/%d字 草稿=%d字 冲突=%d%s%s%s %s"
             % (snap.gid, len(live), 11, len(parts), inject_chars, len(draft),
                len(conflicts),
                (" [" + "；".join(conflicts) + "]") if conflicts else "",
+               (" [注:" + "；".join(notes) + "]") if notes else "",
                (" 读错=%d" % len(snap.errors)) if snap.errors else "",
                names))
