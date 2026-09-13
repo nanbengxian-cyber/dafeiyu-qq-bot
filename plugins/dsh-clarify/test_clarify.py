@@ -2,14 +2,21 @@
 """dsh-clarify 纯逻辑回归测试。"""
 import ast
 import json
+import re
 from pathlib import Path
 
 src = Path(__file__).with_name("main.py").read_text(encoding="utf-8")
 tree = ast.parse(src)
-want = {"sanitize_question", "parse_result", "render", "_signature", "decide_action"}
+want = {"sanitize_question", "parse_result", "render", "_signature", "decide_action",
+        "short_and_addressed"}
 nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in want]
 ns = {"re": __import__("re"), "json": json}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "logic", "exec"), ns)
+
+# 模块级常量：纯函数 short_and_addressed 依赖 _AMBIGUOUS，沙箱里要一起注入。
+_amb = re.search(r'^_AMBIGUOUS = .*$', src, re.M)
+assert _amb, "未找到 _AMBIGUOUS 定义"
+exec(_amb.group(0), ns)
 
 sanitize = ns["sanitize_question"]
 parse = ns["parse_result"]
@@ -69,5 +76,23 @@ assert "（这条是 @ 机器人 才说的）%s" % "" in src or "（这条是 @ 
 assert "特意 @ 机器人（点名）才说的" in src and "判 connected" in src
 # 调用点要把 addressed 传进去
 assert "transcript, context_count = _recent(gid, text, addressed)" in src
+
+# 生产==镜像 一致；被点名的短寒暄必须放行（0913 群主反馈「不知道谁艾特它」）
+sa = ns["short_and_addressed"]
+assert sa("爱你", True) is True
+assert sa("想你了", True) is True
+assert sa("踩踩背", True) is True
+assert sa("顶你", True) is True
+assert sa("戳你", True) is True
+# 没点名不算（未点名的短句另有 unclear/沉默逻辑管）
+assert sa("爱你", False) is False
+# 短但含指代/疑问指向的，仍交给分类器
+assert sa("这啥", True) is False
+assert sa("谁", True) is False
+assert sa("干嘛", True) is False
+assert sa("弄疼谁", True) is False
+# 长句不受影响
+assert sa("你是在跟谁说爱你", True) is False
+assert "short_and_addressed(text, addressed)" in src
 
 print("CLARIFY_TEST_OK")

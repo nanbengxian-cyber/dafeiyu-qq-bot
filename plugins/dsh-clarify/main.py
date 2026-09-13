@@ -207,6 +207,20 @@ def decide_action(state: str | None, addressed: bool, duplicate: bool = False) -
     return "ask" if addressed else "silent"
 
 
+# 被点名时值得追问的「缺信息」信号：这些词出现才可能是真的指代不明。
+_AMBIGUOUS = re.compile(r"这|那|啥|谁|哪|怎么|怎|为什么|干啥|干嘛|什么")
+
+
+def short_and_addressed(text: str, addressed: bool) -> bool:
+    """被点名的极短寒暄/玩梗（如「爱你」「想你了」「踩踩背」）不该当含糊。
+
+    分类模型对这类短句常因「缺指代对象」判 unclear，注入追问后回出来就像
+    机器人不知道谁在跟它说话（2026-09-13 群主反馈）。短且没有指代词时直接放行。
+    """
+    t = (text or "").strip()
+    return bool(addressed) and 0 < len(t) <= 4 and not _AMBIGUOUS.search(t)
+
+
 class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
@@ -258,6 +272,12 @@ class Main(star.Star):
             _stat["seen"] += 1
             addressed = bool(getattr(event, "is_at_or_wake_command", False))
             uid = str(event.get_sender_id() or "")
+            # 被点到名的短寒暄/玩梗/示好直接放行，不用等 LLM 分类 —— 分类器对
+            # 「爱你」「想你了」「踩踩背」这类短句仍会因缺指代对象判 unclear，
+            # 强塞追问后回出来就像不知道谁在跟它说话。
+            if short_and_addressed(text, addressed):
+                _stat["clear"] += 1
+                return
             transcript, context_count = _recent(gid, text, addressed)
             if context_count < MIN_CONTEXT:
                 _stat["thin"] += 1
