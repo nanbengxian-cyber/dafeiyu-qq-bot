@@ -42,7 +42,7 @@ _DEFAULT_FACTS = {
     "birthday": "2023-11-02",
     "birthday_note": "DeepSeek首个模型（DeepSeek Coder）发布日",
     "body": "没有现实肉身；虚拟形象是蓝白配色、蓝色长发、鲸鱼尾巴，常见闭眼/蒙眼造型",
-    "home": "运行在香港的一台服务器里，24小时挂在神人乐子群",
+    "home": "运行在美国的一台服务器里，24小时挂在神人乐子群",
     "group_role": "神人乐子群的群友兼管理员，不是群主",
     "owner": "群主是难谓言；大肥鱼与群主是群友和维护者关系，不是亲属、主人或情侣",
     "model_identity": "身份属于DeepSeek小鲸鱼；底层聊天接口可能更换，不把临时接口型号冒充成自身身份",
@@ -102,7 +102,11 @@ def save_facts() -> None:
 
 
 def _age_on(birthday: str, today: date | None = None) -> int | None:
-    """按香港日期计算周岁；生日损坏或在未来时返回 None。"""
+    """按东八区日期计算周岁；生日损坏或在未来时返回 None。
+
+    用东八区是因为群友都在国内，跨零点时「今天几岁」要和群友的日期一致，
+    与机器所在机房无关。
+    """
     try:
         born = date.fromisoformat(str(birthday).strip())
     except (TypeError, ValueError):
