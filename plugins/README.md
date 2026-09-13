@@ -1,8 +1,8 @@
 # 插件目录 / Plugin Directory
 
-54 个 AstrBot 插件的索引。每个插件的设计取舍、踩过的坑、实测数据都写在各自 `main.py` 顶部注释里 —— 那里比这张表详细得多。
+55 个 AstrBot 插件的索引。每个插件的设计取舍、踩过的坑、实测数据都写在各自 `main.py` 顶部注释里 —— 那里比这张表详细得多。
 
-Index of 54 AstrBot plugins. Design tradeoffs, pitfalls, and measured data live in the header comment of each `main.py`, which is far more detailed than this table.
+Index of 55 AstrBot plugins. Design tradeoffs, pitfalls, and measured data live in the header comment of each `main.py`, which is far more detailed than this table.
 
 ## 安装 / Install
 
@@ -80,10 +80,13 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-proactive` | 572 | `/探头状态` | — | — |
 | `dsh-interest` | 370 | `/馋什么` | — | — |
 | `dsh-steal` | 610 | `/表情包` | — | 视觉模型(识图) |
+| `dsh-mind` | 470 + 500(mind_logic) | `/心智状态` | — | — |
 
-零外部依赖的插件(`acl`、`agency`、`aiflavour`、`armor`、`claimguard`、`ctxclean`、`drift`、`emotion`、`fatigue`、`factguard`、`glossary`、`homophone`、`human`、`humanizer`、`interest`、`leakguard`、`merge`、`mention`、`noise`、`pay`、`poke`、`proactive`、`quote`、`quoteref`、`scene`、`selfaware`、`selfguard`、`selfworth`、`social`、`spine`、`sticker`、`style`、`typo`)拷进去就能用,不需要额外配 API —— **54 个里有 33 个属于这一类**。
+> `dsh-mind` 是**只读观测层**（P0）：把散落在 11 个状态库里的「岛」（情绪/欲望/关系/逆反/疲劳/兴趣/自身利益/群感知/自我认知/行动额度）读成一张快照，每个 LLM 轮次产出一行 `岛=N/11` 日志 + 一条只记「块标签 + 字数」的观测记录，用来量「一轮有几个岛在说话、合并成一个块能省多少字、岛与岛之间有多少条冲突」。**绝不注入、绝不写别人的状态、绝不阻止回复**；`DSH_MIND_MODE` 只接受 `observe`（配成别的会被拒绝）。设计取舍与决策判据见 [docs/83](../docs/83-内在状态总线与仲裁层-20260913.md)。
 
-Plugins with no external dependencies (`acl`, `agency`, `aiflavour`, `armor`, `claimguard`, `ctxclean`, `drift`, `emotion`, `fatigue`, `factguard`, `glossary`, `homophone`, `human`, `humanizer`, `interest`, `leakguard`, `merge`, `mention`, `noise`, `pay`, `poke`, `proactive`, `quote`, `quoteref`, `scene`, `selfaware`, `selfguard`, `selfworth`, `social`, `spine`, `sticker`, `style`, `typo`) work as soon as they are copied in — no extra API setup. That's **33 of the 54**.
+零外部依赖的插件(`acl`、`agency`、`aiflavour`、`armor`、`claimguard`、`ctxclean`、`drift`、`emotion`、`fatigue`、`factguard`、`glossary`、`homophone`、`human`、`humanizer`、`interest`、`leakguard`、`merge`、`mention`、`mind`、`noise`、`pay`、`poke`、`proactive`、`quote`、`quoteref`、`scene`、`selfaware`、`selfguard`、`selfworth`、`social`、`spine`、`sticker`、`style`、`typo`)拷进去就能用,不需要额外配 API —— **55 个里有 34 个属于这一类**。
+
+Plugins with no external dependencies (`acl`, `agency`, `aiflavour`, `armor`, `claimguard`, `ctxclean`, `drift`, `emotion`, `fatigue`, `factguard`, `glossary`, `homophone`, `human`, `humanizer`, `interest`, `leakguard`, `merge`, `mention`, `mind`, `noise`, `pay`, `poke`, `proactive`, `quote`, `quoteref`, `scene`, `selfaware`, `selfguard`, `selfworth`, `social`, `spine`, `sticker`, `style`, `typo`) work as soon as they are copied in — no extra API setup. That's **34 of the 55**.
 
 ## 建议的启用顺序 / Suggested rollout order
 
@@ -135,6 +138,8 @@ python3 dsh-guard/test_mood_check.py        # 47 项:跑真实 check()（假事�
 python3 dsh-interest/test_interest.py       # 热度计算 + 口味轮换 + 注入预算
 python3 dsh-leakguard/test_leakguard.py     # 强/弱标题档 + 指令句影子层
 python3 dsh-memory/test_memory.py           # 抽取/去重/容量/过期 + 注入预算
+python3 dsh-mind/test_mind.py               # 81 项:衰减口径对齐 + 岛判定 + 7 条冲突规则(均带反向用例) + 只读约束
+python3 dsh-mind/test_mind_hook.py          # 18 项:跑真实 observe 钩子(须在容器里);含 priority=-1 与「req 一个字节没动」
 python3 dsh-poke/test_poke.py               # 三道闸门 + 回话文案
 python3 dsh-proactive/test_proactive.py     # 正则兴趣评分 + 限流 + 每日额度
 python3 dsh-quote/test_quote.py             # 25 项:@剥离 + 只认 QQ 号的身份判定 + 块形状
