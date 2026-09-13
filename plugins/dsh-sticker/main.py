@@ -62,6 +62,7 @@ from astrbot.api.provider import LLMResponse
 from astrbot.core import logger
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
+from astrbot.core.star import Context
 
 STICKER_DIR = os.environ.get("DSH_STICKER_DIR", "/AstrBot/data/stickers")
 IMG_EXT = (".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -371,6 +372,28 @@ if _ORIG_SEND_STREAMING is not None and not getattr(
 ):
     _guarded_send_streaming._dsh_sticker_guard = True
     AstrMessageEvent.send_streaming = _guarded_send_streaming
+
+# [patch:third-exit-v1.2.0] Context.send_message 是 dsh-merge 和内置
+# send_message_to_user 工具的出站路径，跟 AstrMessageEvent.send 并列。
+# 2026-09-13 12:43:31 dsh-merge 通过 `star_ctx.send_message()` 发出
+# 「我没发涩图啊，头像那个别赖我[贴纸:装可怜]」，被汪 9 秒后引用暴露。
+# 日志里全天「使用工具」0 次（send_message_to_user 未暴露），但一旦启用，
+# 这条路也会是漏网之鱼。patch 逻辑跟 AstrMessageEvent.send 完全一致。
+_ORIG_CTX_SEND = Context.send_message
+
+
+async def _guarded_ctx_send(self, session, message_chain, *args, **kwargs):
+    try:
+        guard_outgoing(message_chain)
+    except BaseException:  # noqa: BLE001 —— fail-open
+        pass
+    return await _ORIG_CTX_SEND(self, session, message_chain, *args, **kwargs)
+
+
+if not getattr(Context.send_message, "_dsh_sticker_guard", False):
+    _guarded_ctx_send._dsh_sticker_guard = True
+    Context.send_message = _guarded_ctx_send
+    logger.info("[贴纸] 出口兜底闸已装：Context.send_message 直发的链也会剥标记")
 
 
 async def _send_markers(

@@ -158,6 +158,70 @@ try:
 finally:
     S._ORIG_SEND_STREAMING = _real_st
 
+print("\n=== 9. 第三条出口：Context.send_message（dsh-merge 走的）===")
+
+MERGE_LEAK = "我没发涩图啊，头像那个别赖我[贴纸:装可怜]"
+MERGE_CLEAN = "我没发涩图啊，头像那个别赖我"
+
+from astrbot.core.star import Context                            # noqa: E402
+
+ck(
+    getattr(Context.send_message, "_dsh_sticker_guard", False),
+    "Context.send_message 没被包",
+)
+print("   Context.send_message 带 _dsh_sticker_guard 标记 ✓")
+
+ctx_sent = []
+
+
+async def _rec_ctx(self, session, chain, *a, **k):
+    ctx_sent.append((session, chain))
+    return True
+
+
+_real_ctx = S._ORIG_CTX_SEND
+S._ORIG_CTX_SEND = _rec_ctx
+try:
+    c = MessageChain(chain=[Plain(MERGE_LEAK)])
+    r = asyncio.new_event_loop().run_until_complete(
+        Context.send_message(object.__new__(Context), "aiocqhttp:GroupMessage:476573490", c)
+    )
+    ck(r is True, "返回值没透传：%r" % r)
+    ck(len(ctx_sent) == 1, "原 Context.send_message 没被调到")
+    got = [x.text for x in ctx_sent[0][1].chain if isinstance(x, Plain)]
+    print("   平台真正收到的文字：%r" % got)
+    ck(got == [MERGE_CLEAN], "dsh-merge 这条路还是带标记的：%r" % got)
+    ck(ctx_sent[0][0].endswith("476573490"), "session 被改动了")
+finally:
+    S._ORIG_CTX_SEND = _real_ctx
+
+print("\n=== 9b. Context 闸坏了也不能吞消息 ===")
+S.guard_outgoing = _boom
+S._ORIG_CTX_SEND = _rec_ctx
+try:
+    ctx_sent.clear()
+    c = MessageChain(chain=[Plain(MERGE_LEAK)])
+    r = asyncio.new_event_loop().run_until_complete(
+        Context.send_message(object.__new__(Context), "aiocqhttp:GroupMessage:476573490", c)
+    )
+    ck(r is True, "闸炸了之后 merge 的消息被吞了：%r" % r)
+    ck(len(ctx_sent) == 1, "闸炸了之后原函数没被调到")
+    print("   闸抛异常 → 消息照发（只是这次没剥）✓")
+finally:
+    S.guard_outgoing = _real_guard
+    S._ORIG_CTX_SEND = _real_ctx
+
+print("\n=== 9c. 干净文本 / 非链对象不误伤 ===")
+c = MessageChain(chain=[Plain("今天群里挺热闹")])
+ck(S.guard_outgoing(c) == 0, "干净文本被剥了")
+ck(c.chain[0].text == "今天群里挺热闹", "干净文本被改了")
+for bad in [None, "字符串", 42, MessageChain(chain=None)]:
+    try:
+        ck(S.guard_outgoing(bad) == 0, "非链对象返回了非 0")
+    except BaseException as e:
+        fail.append("非链对象抛了异常：%r" % e)
+print("   干净文本零改动 / None·str·int·空链 都不抛 ✓")
+
 print("\n=== 8. 重复装载不会套娃 ===")
 cur = AstrMessageEvent.send
 mod = sys.modules["main"]
