@@ -61,6 +61,7 @@ from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.core import logger
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 STICKER_DIR = os.environ.get("DSH_STICKER_DIR", "/AstrBot/data/stickers")
 IMG_EXT = (".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -278,6 +279,98 @@ def strip_markers(text: str) -> tuple[str, list[str]]:
     """
     raw = text or ""
     return MARKER_RE.sub("", raw).strip(), MARKER_RE.findall(raw)
+
+
+# ---------------------------------------------------------------- 出口兜底闸（v4）
+#
+# 为什么前两道钩子不够
+# --------------------
+# on_llm_response 和 on_decorating_result 都只覆盖**走管道**的那条链。
+# 2026-09-13 00:53 群里真的漏出来一条，群友引用回来的原文是：
+#
+#     零基础上太空？先学会在群里别被禁言吧[贴纸:装酷]
+#
+# 而这条在 astrbot.log 的 `respond.stage:206 Prepare to send` 里
+# **一次都没出现过**（全量日志里 `[贴纸:` 从没进过出站正文）——
+# 说明它根本没走 respond.stage。`event.send()` 是**平台直发**：
+# 不过装饰钩子、不过出口闸，标记原样进群。
+# 现在至少有 5 个插件在用它（dsh-welcome / dsh-imagegen / dsh-video /
+# dsh-guard / dsh-poke），以后还会加 —— 每加一个就是一条新的漏法。
+#
+# 所以把 `AstrMessageEvent.send` 包一层：**这是所有出站路径唯一的公共点**。
+# 三条设计约束：
+#   1) 只剥、不改别的 —— 复用同一个 strip_markers 纯函数，行为跟另两道完全一致；
+#   2) fail-open —— 这一步抛任何异常都照原样发出去。宁可漏一个标记，
+#      也绝不能因为兜底闸自己出问题而把消息吞掉；
+#   3) 每次真剥到东西就 WARNING 一次。**这条日志是证据**：
+#      下次再有人报「发出标记了」，直接搜它就知道是哪条路径漏的。
+def guard_outgoing(message) -> int:
+    """剥掉出站 MessageChain 里所有 Plain 的贴纸标记。返回剥掉的标记个数。"""
+    chain = getattr(message, "chain", None)
+    if not isinstance(chain, list):
+        return 0
+    hit = 0
+    for comp in chain:
+        if not isinstance(comp, Plain):
+            continue
+        raw = comp.text or ""
+        cleaned, markers = strip_markers(raw)
+        if not markers:
+            continue
+        comp.text = cleaned
+        hit += len(markers)
+        logger.warning(
+            "[贴纸] 出口兜底剥标记（这条没过装饰钩子，说明走了 event.send 直发）："
+            "%r → %r",
+            raw[:60],
+            cleaned[:60],
+        )
+    return hit
+
+
+_ORIG_SEND = AstrMessageEvent.send
+_ORIG_SEND_STREAMING = getattr(AstrMessageEvent, "send_streaming", None)
+
+
+async def _guarded_send(self, message, *args, **kwargs):
+    try:
+        guard_outgoing(message)
+    except BaseException:  # noqa: BLE001 —— fail-open，见上面第 2 条
+        pass
+    return await _ORIG_SEND(self, message, *args, **kwargs)
+
+
+async def _guarded_send_streaming(self, generator, *args, **kwargs):
+    """流式那条路收的是**异步生成器**，不是 MessageChain。
+
+    `send_streaming(self, generator: AsyncGenerator[MessageChain, None], ...)`
+    （astr_message_event.py:280）—— 对着生成器调 guard_outgoing 只会拿到
+    getattr(gen, "chain", None) == None 然后返回 0，**等于没装**。
+    所以要包住生成器本身，逐条链剥。（本部署流式是关的，纯粹为了别留地雷：
+    哪天有人打开 streaming_response，这里必须是对的。）
+    """
+
+    async def _guarded_gen():
+        async for chain in generator:
+            try:
+                guard_outgoing(chain)
+            except BaseException:  # noqa: BLE001
+                pass
+            yield chain
+
+    return await _ORIG_SEND_STREAMING(self, _guarded_gen(), *args, **kwargs)
+
+
+# 只装一次：插件热重载会再执行一遍本模块，重复包装会让日志出现多层。
+if not getattr(AstrMessageEvent.send, "_dsh_sticker_guard", False):
+    _guarded_send._dsh_sticker_guard = True
+    AstrMessageEvent.send = _guarded_send
+    logger.info("[贴纸] 出口兜底闸已装：event.send 直发的链也会剥标记")
+if _ORIG_SEND_STREAMING is not None and not getattr(
+    _ORIG_SEND_STREAMING, "_dsh_sticker_guard", False
+):
+    _guarded_send_streaming._dsh_sticker_guard = True
+    AstrMessageEvent.send_streaming = _guarded_send_streaming
 
 
 async def _send_markers(
