@@ -166,6 +166,122 @@ _QUOTE_RE = re.compile(r"\[引用消息\(([^:）)]{1,32})[:：]")
 # 别人 @ 的第三方
 _AT_ANY_RE = re.compile(r"\[At:(\d{5,12})\]")
 
+# ---------------------------------------------------------------- @ 标记对照
+#
+# 为什么单独做这一件事（实测的一对真语料）：
+#
+#     群友C: [At:3752949717] 😘😘😘
+#     大肥鱼:      这仨表情是给谁的
+#
+# 框架给模型的 prompt 就是 req.prompt = event.message_str
+# （astr_main_agent.py:1455），里面 @ 只渲染成一个纯数字 `[At:3752949717]`。
+# 框架确实会另加一行 `User ID: x, Nickname: y` 说明**谁在说话**
+# （_append_system_reminders，identifier=True），所以「谁发的」它知道 ——
+# 但**没有任何地方告诉它 3752949717 就是它自己**。
+# 人格提示词里查过：`3752949717` 出现 0 次。
+#
+# 于是群友 @ 它时，它把这条读成「某人 @ 了某个陌生人」，只能靠框架把它唤醒
+# 这件事反推「大概是在叫我」。上面那条就退化成了「这仨表情是给谁的」。
+#
+# 所以这里只做一件事：把**本条请求里真正出现过**的 @ 号码翻成一张对照表。
+# 只列出现过的，不列全群（本群 157 人，列全了就是把提示词灌满噪音）。
+_AT_LEGEND_HEAD = "【@ 标记怎么读】`[At:数字]` 就是「@某人」，数字是对方的 QQ 号。"
+_AT_LEGEND_MAX = 6
+
+
+def _ctx_text(c) -> str:
+    """req.contexts 里一条的 content 可能是 str、也可能是 list[dict]，都取成文本。"""
+    # 先解 dict，**再**判 str —— 顺序反了的话 {"content": "abc"} 解包成 "abc"
+    # 之后会直接掉到最后的 return ""，历史里的 @ 号码就全漏了（单测抓到过）。
+    if isinstance(c, dict):
+        c = c.get("content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        out = []
+        for piece in c:
+            if isinstance(piece, str):
+                out.append(piece)
+            elif isinstance(piece, dict):
+                out.append(str(piece.get("text") or ""))
+        return " ".join(out)
+    return ""
+
+
+def at_targets(event) -> tuple:
+    """返回 (是否被单独 @ 了它, 是否只是 @全体成员)。
+
+    为什么不能靠正则扫正文：框架**把第一个 @它 从 message_str 里删掉了**
+    （aiocqhttp_platform_adapter.py:382-391），正文里根本没有这个痕迹。
+    只能回到组件层看 At.qq。
+    """
+    me = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+    direct = allm = False
+    try:
+        for comp in (event.message_obj.message or []):
+            q = str(getattr(comp, "qq", "") or "")
+            if not q:
+                continue
+            if q in ("all", "everyone"):
+                allm = True
+            elif me and q == me:
+                direct = True
+    except BaseException:  # noqa: BLE001
+        pass
+    return direct, allm
+
+
+def mention_note(direct: bool, allm: bool, sender: str) -> str:
+    """点名提示。既没被单独 @ 也不是 @全体 时返回空串。"""
+    if direct:
+        who = (sender or "").strip()
+        # 说话人是谁框架已经在 system 里写了（User ID/Nickname），这里出现的
+        # 目的是把一个**碎片**和「有人在点你」这件事绑起来 —— 光有说话人不够，
+        # 模型还是不知道那三个表情是冲它来的。
+        return (
+            "【这条是在点你】%s@ 了你才说的这句话，而正文里那个「@你」被框架"
+            "抹掉了（只留下 @别人 的痕迹）。所以你看到的正文可能很短、甚至只是"
+            "一个表情或半句话 —— 那不是在自言自语，是**点名直接对你说话**。"
+            "照平时聊天回就行：别问「这是给谁的」，也别当成没头没尾的怪话。"
+            % (("「%s」" % who) if who else "有人")
+        )
+    if allm:
+        return (
+            "【这条是 @全体成员】不是专门点你（正文里的 @全体成员 被框架抹掉了）。"
+            "接不接随意，不用当成单独叫你。"
+        )
+    return ""
+
+
+def at_legend(texts, me: str, names_by_uid: dict) -> str:
+    """把请求里出现过的 @ 号码翻成对照表。一个都没有就返回空串（不注入）。"""
+    seen: list = []
+    for t in texts:
+        for n in _AT_ANY_RE.findall(t or ""):
+            if n not in seen:
+                seen.append(n)
+    if not seen or not me:
+        return ""
+    # 自己的号码永远排第一 —— 它才是最需要被看懂的那一条。
+    seen.sort(key=lambda n: n != me)
+    parts = []
+    for n in seen[:_AT_LEGEND_MAX]:
+        if n == me:
+            parts.append(
+                "`[At:%s]`＝**@你**（%s 就是你自己，群名片「大肥鱼」）" % (n, n)
+            )
+        else:
+            nm = names_by_uid.get(n)
+            parts.append("`[At:%s]`＝@%s" % (n, nm or ("QQ" + n)))
+    extra = ""
+    if len(seen) > _AT_LEGEND_MAX:
+        extra = "（另 %d 个同上规则，没列）" % (len(seen) - _AT_LEGEND_MAX)
+    tail = ""
+    if me in seen:
+        tail = ("看到 `[At:%s]` 就是有人**直接冲你说话**，别读成「别人被 @ 了」，"
+                "也别问「这是给谁的」。" % me)
+    return " ".join([_AT_LEGEND_HEAD] + parts) + extra + tail
+
 
 # 角色词：「群主」「管理员」这类**不点名但明确指向别人**的说法。
 # 为什么必须收：真群里最典型的带偏就是这个形式 —— 群友B 那条 19 轮链
@@ -331,7 +447,8 @@ class Main(star.Star):
         self._names = _Names()
         # gid -> _Streak（只留当前那一条：换人就重算）
         self._streak: dict = {}
-        self._stat = {"seen": 0, "directed": 0, "fired": 0, "max_n": 0}
+        self._stat = {"seen": 0, "directed": 0, "fired": 0, "max_n": 0,
+                      "at": 0}
         logger.info(
             "[spine] 已加载：%s 影子=%s 提醒>=%d轮 直白>=%d轮 窗口%.0f分钟 豁免%d人",
             "开" if ENABLED else "关",
@@ -343,6 +460,35 @@ class Main(star.Star):
         )
 
     # ---- 主路径
+    def _inject_at(self, event, req, gid: str, me: str, raw: str) -> None:
+        """注入「这条是不是点你的」+ @ 号码对照。跟牵引计数无关，任何群消息都该拿到。"""
+        direct, allm = at_targets(event)
+        sender = ""
+        try:
+            sender = (event.get_sender_name() or "").strip()
+        except BaseException:  # noqa: BLE001
+            pass
+        bits = [x for x in (mention_note(direct, allm, sender),) if x]
+        texts = [raw, getattr(req, "prompt", "") or ""]
+        for c in list(getattr(req, "contexts", None) or [])[-12:]:
+            texts.append(_ctx_text(c))
+        names_by_uid: dict = {}
+        for nm, u in (self._names.get(gid) or {}).items():
+            names_by_uid.setdefault(str(u), nm)
+        legend = at_legend(texts, me, names_by_uid)
+        if legend:
+            bits.append(legend)
+        block = " ".join(bits)
+        if not block:
+            return
+        if TextPart is None:
+            req.extra_user_content_parts.append(block)
+        else:
+            req.extra_user_content_parts.append(TextPart(text=block))
+        self._stat["at"] += 1
+        logger.info("[spine] @提示注入 %d 字（点名=%s @全体=%s）：%s",
+                    len(block), direct, allm, block[:150])
+
     @filter.on_llm_request()
     async def spine(self, event: AstrMessageEvent, req) -> None:
         if not ENABLED:
@@ -363,6 +509,12 @@ class Main(star.Star):
 
             me = str(getattr(event.message_obj, "self_id", "") or "")
             raw = self._raw_text(event)
+            # @ 对照表排在这儿：它在「不是冲我说的」和影子模式的 return 之前，
+            # 因为「看懂 @ 是谁」跟「有没有被牵着走」是两回事。
+            try:
+                self._inject_at(event, req, gid, me, raw)
+            except BaseException as e:  # noqa: BLE001
+                logger.debug("[spine] @ 对照表失败（放过，照常说话）：%s", e)
             directed = self._is_directed(event, raw, me)
             now = time.time()
 
@@ -510,12 +662,14 @@ class Main(star.Star):
             "累积牵引感知：%s｜影子：%s\n"
             "阈值：连 %d 轮起提醒，连 %d 轮起说直白，窗口 %.0f 分钟\n"
             "本次启动以来：看到 %d 条，冲我说的 %d 条，注入 %d 次，最长连 %d 轮\n"
+            "@ 提示注入 %d 次（被点名 / @全体 / 正文出现 @ 号码时带上）\n"
             "本群当前：%s"
             % (
                 "开" if ENABLED else "关",
                 "开" if SHADOW else "关",
                 SOFT_N, HARD_N, WINDOW / 60,
                 s["seen"], s["directed"], s["fired"], s["max_n"],
+                s["at"],
                 now,
             )
         )
