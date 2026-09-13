@@ -68,15 +68,49 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core import logger
 from astrbot.core.provider.provider import Provider
 
-# 链条顺序：逗号分隔的 provider id，前面的优先。
-# 默认值就是用户要的顺序：两个 opus-5 在前，glm 兜底。
-CHAIN = [
-    s.strip()
-    for s in os.environ.get(
+# 链条顺序：逗号分隔，前面的优先。
+#
+# [patch:order-v1 顺序一等公民] 每一项支持两种写法：
+#   provider_id              用该 provider 自己的配置模型
+#   provider_id:model_name   同一个 provider 上换一个模型（同源不同模型档）
+#
+# 为什么要把 model 写法提到 CHAIN 里：2026-09-13 实测（当天 157 次识图）
+# 四档的真实战绩是
+#   zhipu-vision:glm-4.1v-thinking-flash  76% 成功 / 中位 5.6s   ← 最好
+#   vision-scnet                          72% 成功 / 中位 6.1s
+#   zhipu-vision:glm-4v-flash             66% 成功 / 中位 3.9s
+#   zhipu-vision(glm-4.6v-flash)          16% 成功 / 中位 8.8s   ← 最差
+# 而旧结构里 CHAIN 只认纯 provider id、MODEL_FALLBACKS 一律追加在最后，
+# 于是**成功率最低的那档被钉死在第 2 位**，卡在 76% 那档前面：
+# 每次第一档超时，都要先掏 10 秒撞这个 16% 的档，才轮到真正能用的档。
+# 用当天真实成功/失败序列重排模拟：P90 从 18.0s 降到 12.2s。
+CHAIN_SPEC: list[tuple[str, str | None]] = []
+
+
+def _parse_chain(raw: str) -> list[tuple[str, str | None]]:
+    """把 "pid" / "pid:model" 混写的配置解析成 [(pid, model|None)]。"""
+    out: list[tuple[str, str | None]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            pid, model = item.split(":", 1)
+            pid, model = pid.strip(), model.strip()
+            if pid and model:
+                out.append((pid, model))
+                continue
+        out.append((item, None))
+    return out
+
+
+CHAIN_SPEC = _parse_chain(
+    os.environ.get(
         "DSH_VIS_CHAIN", "vision-opus5,vision-opus5-thinking,zhipu-vision"
-    ).split(",")
-    if s.strip()
-]
+    )
+)
+# 兼容旧读法：只要 provider id 的列表（日志、报错文案用）。
+CHAIN = [pid for pid, _m in CHAIN_SPEC]
 # 要被顶替的 provider id。必须与 default_image_caption_provider_id 一致，
 # 且必须是**真实存在**的 provider —— 见上面「为什么是顶替」。
 ALIAS = os.environ.get("DSH_VIS_ALIAS", "vision-opus5").strip()
@@ -118,16 +152,22 @@ SLOW_TTL = float(os.environ.get("DSH_VIS_SLOW_TTL", "180"))
 # 只用现有 provider id 不够：同一个智谱 key 其实还有几个可用视觉模型，
 # 而免费主模型 429 时原链没有第二条独立模型可走。这里允许给任意 OpenAI 兼容
 # provider 补“同源不同模型”档，格式 provider_id:model；不创建新密钥、不改源配置。
-MODEL_FALLBACKS = []
-for _item in os.environ.get(
-    "DSH_VIS_MODEL_FALLBACKS",
-    "zhipu-vision:glm-4.1v-thinking-flash,zhipu-vision:glm-4v-flash",
-).split(","):
-    _item = _item.strip()
-    if ":" in _item:
-        _pid, _model = _item.split(":", 1)
-        if _pid.strip() and _model.strip():
-            MODEL_FALLBACKS.append((_pid.strip(), _model.strip()))
+MODEL_FALLBACKS = _parse_chain(
+    os.environ.get(
+        "DSH_VIS_MODEL_FALLBACKS",
+        "zhipu-vision:glm-4.1v-thinking-flash,zhipu-vision:glm-4v-flash",
+    )
+)
+# 最终档位顺序 = 显式链 + 同源模型兜底。有了 order-v1 之后两者等价，
+# 保留 MODEL_FALLBACKS 只是为了不破坏既有配置和习惯。
+#
+# 去重（保序）是必须的：MODEL_FALLBACKS 有个非空的默认值，所以一旦把某个
+# 模型档也写进 DSH_VIS_CHAIN，同一个模型就会出现两次 —— 撞档者会拿同一个
+# 模型连撞两次，白花一个 ATTEMPT_TIMEOUT。配置里重复写也只保留第一次出现。
+SPEC: list[tuple[str, str | None]] = []
+for _spec in CHAIN_SPEC + MODEL_FALLBACKS:
+    if _spec not in SPEC:
+        SPEC.append(_spec)
 
 # 瞬时错误特征。403/1010 是 Cloudflare 指纹弹回，429 是限流，
 # 都允许链条层再试；但真实 provider 自身已默认做 5 次指数退避，调用时会把
@@ -287,6 +327,17 @@ class ModelOverrideProvider:
         call_kwargs = dict(kwargs)
         call_kwargs["model"] = self.model
         return await self.base.text_chat(*args, **call_kwargs)
+
+
+def _spec_of(lk) -> tuple[str, str | None]:
+    """这一档对应的 (provider_id, model|None)，用来和配置里的 SPEC 比对。
+
+    ModelOverrideProvider 的 provider_config["id"] 是 "pid:model" 这种展示名，
+    不能直接拿来比 —— 要比的是**底座**的 pid 加上它被指定的模型。
+    """
+    if isinstance(lk, ModelOverrideProvider):
+        return (lk.base.provider_config.get("id", "?"), lk.model)
+    return (lk.provider_config.get("id", "?"), None)
 
 
 class ChainProvider(Provider):
@@ -520,35 +571,42 @@ class Main(star.Star):
             inst = inst.links[0] if inst.links else None
         return inst
 
+    def _link_alive(self, pm, lk) -> bool:
+        """这一档手里攥的实例，还是 inst_map 里那个活的吗。
+
+        WebUI 里改任何一个 provider 都会走 provider_manager.reload()：terminate +
+        重新 load，把 inst_map[id] 换成全新的裸实例。不核对的话，链条手里就是
+        已 terminate 的旧实例 —— 识图看着还能用，但重装/兜底会静默失效。
+        """
+        base = lk.base if isinstance(lk, ModelOverrideProvider) else lk
+        return base is self._live(pm, base.provider_config.get("id", "?"))
+
     def _ensure(self, pm, quiet=False) -> bool:
         """确保 inst_map[ALIAS] 是当前配置对应的链条。已经对了就什么都不做。
 
         返回 True 表示这次动过手（首装或重装）。
         """
         cur = pm.inst_map.get(ALIAS)
-        # 逐档核对身份：只要有一档不是 inst_map 里那个活实例，就得重建。
-        # 只比 ALIAS 一个不够 —— 单独改 zhipu-vision 时 ALIAS 没被碰，
-        # 但链条第三档已经是 terminate 掉的死实例了。
+        # [patch:order-v1] 判据从「只比 CHAIN 里的显式 provider」改成
+        # 「逐档比 (provider, model) 签名 + 核对活实例」。原因：model 档现在
+        # 也能写进 CHAIN，旧判据会永远判不等 → 每 30 秒白重建一次链条。
         if isinstance(cur, ChainProvider) and cur is self.chain:
-            # 只核对显式 provider；ModelOverrideProvider 是我们按配置即时造的包装档，
-            # 不会出现在 inst_map。真实底座变更时，前面的身份比较仍会触发重建。
-            explicit = [lk for lk in cur.links if not isinstance(lk, ModelOverrideProvider)]
-            want = [lk for lk in (self._live(pm, pid) for pid in CHAIN) if lk is not None]
-            if want == explicit:
+            if [_spec_of(lk) for lk in cur.links] == SPEC and all(
+                self._link_alive(pm, lk) for lk in cur.links
+            ):
                 return False
 
         links, missing = [], []
-        for pid in CHAIN:
-            inst = self._live(pm, pid)
-            (links.append(inst) if inst is not None else missing.append(pid))
-        # 同源模型档排在显式 provider 链之后，作为最后兜底。默认补智谱的两个
-        # 低延迟视觉模型；主 glm-4.6v-flash 限流时可直接换模型，而不是全挂。
-        for pid, model in MODEL_FALLBACKS:
+        for pid, model in SPEC:
             inst = self._live(pm, pid)
             if inst is None:
-                missing.append("%s:%s" % (pid, model))
+                missing.append(pid if model is None else "%s:%s" % (pid, model))
                 continue
-            links.append(ModelOverrideProvider(inst, model, "%s:%s" % (pid, model)))
+            links.append(
+                inst
+                if model is None
+                else ModelOverrideProvider(inst, model, "%s:%s" % (pid, model))
+            )
         if not links:
             self.note = "链条里一个 provider 都没找到：%s" % ",".join(CHAIN)
             logger.error("[vischain] %s，识图保持原样", self.note)
@@ -569,13 +627,16 @@ class Main(star.Star):
         names = " → ".join(
             "%s(%s)" % (lk.provider_config.get("id"), lk.get_model()) for lk in links
         )
+        # [patch:order-v1] 缺失档也要写进 self.note，不能只打日志：
+        # WebUI 里删掉一个 provider 时链条会静默少一档，而 /识图状态 正是
+        # 群主用来确认「识图到底走了哪些档」的地方 —— 报喜不报忧会让人误判。
+        if missing:
+            names += "，缺失: " + ",".join(missing)
         self.note = names
         if not quiet:
             logger.info(
-                "[vischain] 已接管识图 %s：%s%s（每档重试%d次，单次超时%.0fs）",
-                ALIAS, names,
-                "，缺失: " + ",".join(missing) if missing else "",
-                RETRY, ATTEMPT_TIMEOUT,
+                "[vischain] 已接管识图 %s：%s（每档重试%d次，单次超时%.0fs）",
+                ALIAS, names, RETRY, ATTEMPT_TIMEOUT,
             )
         return True
 
