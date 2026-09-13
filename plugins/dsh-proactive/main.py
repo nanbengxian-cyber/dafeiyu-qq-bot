@@ -71,7 +71,8 @@ from astrbot.core.star.filter.custom_filter import CustomFilter
 _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
-from dsh_link import blocks  # type: ignore  # noqa: E402
+from dsh_link import TurnClaim, blocks, claim_turn  # type: ignore  # noqa: E402
+from dsh_action import ActionStore, related
 
 
 def _flag(name: str, default: str = "1") -> bool:
@@ -85,8 +86,9 @@ GROUPS = {
     g.strip() for g in os.environ.get("DSH_PROACTIVE_GROUPS", "100000001").split(",") if g.strip()
 }
 # 每群两次主动探头之间的最小间隔（毫秒，对齐 Codex minIntervalMs 语义）。
-MIN_INTERVAL_MS = max(60_000, int(os.environ.get("DSH_PROACTIVE_MIN_INTERVAL_MS", "600000")))
-DAY_MAX = max(1, int(os.environ.get("DSH_PROACTIVE_DAY_MAX", "5")))
+MIN_INTERVAL_MS = max(60_000, int(os.environ.get("DSH_PROACTIVE_MIN_INTERVAL_MS", "180000")))
+DAY_MAX = max(1, int(os.environ.get("DSH_PROACTIVE_DAY_MAX", "12")))
+PERSONA_MIN_SCORE = max(0.0, min(1.0, float(os.environ.get("DSH_PROACTIVE_PERSONA_MIN_SCORE", "0.48"))))
 THRESHOLD = max(1, int(os.environ.get("DSH_PROACTIVE_THRESHOLD", "8")))
 OWNER = os.environ.get("DSH_PROACTIVE_OWNER", "2774000001").strip()
 TIMEZONE = os.environ.get("DSH_PROACTIVE_TZ", "Asia/Shanghai")
@@ -329,12 +331,12 @@ def social_allows_proactive(gid: str, uid: str, now: float | None = None,
         con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=0.5)
         try:
             row = con.execute(
-                "SELECT avoid_until FROM relations WHERE group_id=? AND user_id=?",
+                "SELECT avoid_until,opted_out FROM relations WHERE group_id=? AND user_id=?",
                 (gid, uid),
             ).fetchone()
         finally:
             con.close()
-        if row and float(row[0] or 0) > (time.time() if now is None else float(now)):
+        if row and (bool(row[1]) or float(row[0] or 0) > (time.time() if now is None else float(now))):
             return False, "对方要求少打扰"
     except (OSError, sqlite3.Error, TypeError, ValueError):
         pass
@@ -359,6 +361,7 @@ class Main(star.Star):
         self._last_event: dict[str, float] = {}  # 消息 id -> ts，跨适配器重复投递去重
         self._quiet: dict[str, str] = {}  # 日志去重，避免每条消息刷一行
         self._self_id: str = SELF_ID_ENV
+        self.actions = ActionStore(os.environ.get("DSH_ACTION_DB", "/AstrBot/data/dsh_action.db"))
         logger.info(
             "[proactive] 已加载：%s 影子=%s 阈值%d 间隔%.0f分钟 每日%d次 群=%s",
             "开" if ENABLED else "关", "开" if SHADOW else "关",
@@ -415,6 +418,7 @@ class Main(star.Star):
                 return self._quiet_skip(gid, "当前不在主动探头时段", "inactive_hour")
             social_ok, social_reason = social_allows_proactive(gid, uid)
             if not social_ok:
+                self.actions.revoke(gid, uid)
                 return self._quiet_skip(gid, "不探头：%s" % social_reason, "social_boundary:%s" % uid)
 
             now_ms = int(time.time() * 1000)
@@ -434,8 +438,31 @@ class Main(star.Star):
                 weights=weights if isinstance(weights, dict) else None,
             )
             ok, why, score, hits = decision
-            if not ok:
-                return self._quiet_skip(gid, "不探头：%s" % why, why[:16])
+            persona = event.get_extra("dsh.persona.action.v1") or {}
+            persona_score = float(persona.get("score", 0.0) or 0.0) if isinstance(persona, dict) else 0.0
+            persona_wake = bool(persona.get("should_wake")) if isinstance(persona, dict) else False
+            # 人格动机只放宽热场兴趣门槛，不绕过冷却、额度、社交边界和低价值过滤。
+            if not ok and why.startswith("兴趣分不够") and hits and persona_wake:
+                ok, why = persona_score >= PERSONA_MIN_SCORE, "人格动机接住：%s" % (persona.get("motive") or "兴趣")
+            # ActionStore owns successful-send quotas/cooldowns and bounded continuations.
+            # Re-evaluate eligibility without the legacy attempt counters.
+            eligible, _, score, hits = should_proactively_reply(
+                text, {"senderId": uid, "groupId": gid}, now_ms=now_ms,
+                weights=weights if isinstance(weights, dict) else None)
+            if not eligible and hits and persona_wake and persona_score >= PERSONA_MIN_SCORE:
+                eligible = True
+            if SHADOW:
+                return
+            mid = str(getattr(event.message_obj, "message_id", "") or uuid.uuid4())
+            candidate, reason = self.actions.consider(
+                gid, uid, mid, text, time.time(), eligible=eligible,
+                day_max=DAY_MAX, cooldown=MIN_INTERVAL_MS / 1000)
+            if not candidate:
+                return self._quiet_skip(gid, "行动层：%s" % reason, reason)
+            if not claim_turn(event, TurnClaim("dsh-proactive", "interest", 25,
+                                                block_repeat=True, block_proactive=True)):
+                self.actions.release(gid, candidate["token"])
+                return
             # 同一条消息可能被多个渠道/适配器重复送进来，优先按平台 message_id 去重。
             raw_message = getattr(event, "raw_message", None)
             if isinstance(raw_message, dict):
@@ -458,7 +485,13 @@ class Main(star.Star):
                 self._quiet.pop(gid, None)
                 logger.info("[proactive] 影子模式，只记不发 gid=%s", gid)
                 return
-            await self._fire(gid, now_ms, score, hits, text, state)
+            try:
+                submitted = await self._fire(gid, now_ms, score, hits, text, state, candidate)
+            except Exception:
+                self.actions.release(gid, candidate["token"])
+                raise
+            if not submitted:
+                self.actions.release(gid, candidate["token"])
         except BaseException as exc:
             logger.warning("[proactive] 评分失败，跳过: %r", exc)
 
@@ -482,7 +515,7 @@ class Main(star.Star):
 
     # ------------------------------------------------------------ 探头
     async def _fire(self, gid: str, now_ms: int, score: int, hits: list,
-                    trigger_text: str, state: dict) -> bool:
+                    trigger_text: str, state: dict, candidate=None) -> bool:
         platform = self.context.get_platform_inst(PLATFORM_ID)
         if platform is None or not hasattr(platform, "create_event"):
             logger.error("[proactive] 找不到平台实例 %s", PLATFORM_ID)
@@ -520,6 +553,8 @@ class Main(star.Star):
         msg.raw_message = raw
         event = platform.create_event(msg)
         event.set_extra("dsh_proactive", True)
+        if candidate:
+            event.set_extra("dsh_action_candidate", candidate)
         event.set_extra("dsh_proactive_score", score)
         event.set_extra("dsh_proactive_hits", hits)
         event.set_extra("dsh_proactive_text", trigger_text)
@@ -578,6 +613,27 @@ class Main(star.Star):
         ) % ("/".join(hits) if hits else "感兴趣的话题", score,
              ctx[-500:] or "（没有上下文）", trigger[:100])))
         yield req
+
+    @filter.on_llm_request(priority=1950)
+    async def validate_action(self, event, req):
+        candidate = event.get_extra("dsh_action_candidate")
+        if not candidate:
+            return
+        gid = str(event.get_group_id() or "")
+        ok, _ = social_allows_proactive(gid, candidate["uid"])
+        recent = read_context(gid, 3)
+        changed = bool(recent and str(recent[-1][0]) not in {SENTINEL_UID, self._self_id}
+                       and not related(str(recent[-1][3]), candidate["topic"]))
+        if not ok or changed or not self.actions.valid(gid, candidate["token"], time.time()):
+            self.actions.release(gid, candidate["token"])
+            event.stop_event()
+
+    @filter.after_message_sent()
+    async def action_sent(self, event):
+        candidate = event.get_extra("dsh_action_candidate")
+        result = event.get_result()
+        if candidate and result and getattr(result, "chain", None):
+            self.actions.sent(str(event.get_group_id()), candidate["token"], time.time())
 
     # ------------------------------------------------------------ 身份
     async def _resolve_self_id(self, platform) -> str:

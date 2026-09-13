@@ -57,3 +57,22 @@ def claim_turn(event: Any, claim: TurnClaim) -> bool:
 def blocks(event: Any, capability: str) -> bool:
     current = get_claim(event) or {}
     return bool(current.get("block_%s" % capability, False))
+
+
+def action_wake_score(*, interest: float, motive: float, relation: float, energy: float,
+                      active_window: bool, recent_messages: int, bot_messages: int,
+                      ignored_streak: int) -> float:
+    """Shared low-cost wake score; never replaces explicit task/safety gates."""
+    def clamp(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+    score = (0.34 * clamp(interest) + 0.28 * clamp(motive) +
+             0.16 * clamp(relation) + 0.12 * clamp(energy))
+    if active_window:
+        score += 0.08
+    if recent_messages >= 3:
+        score += 0.06
+    if bot_messages >= 4:
+        score -= 0.14
+    if ignored_streak >= 2:
+        score -= min(0.18, 0.06 * ignored_streak)
+    return clamp(score)

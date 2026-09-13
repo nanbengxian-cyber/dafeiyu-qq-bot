@@ -1,0 +1,5 @@
+name: dsh-persona-core
+desc: 大肥鱼人格驱动核心。内测 live 模式下统一计算可衰减的自我状态、用户关系、动机和唯一行为候选，并向主模型注入行为指导；明确任务、安全和权限路径保持硬优先级。
+version: 0.2.0
+author: 大肥鱼
+repo: local

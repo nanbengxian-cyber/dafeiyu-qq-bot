@@ -27,7 +27,8 @@ if "astrbot" not in sys.modules:
         sys.modules["astrbot.api"].star = types.SimpleNamespace(Star=object, Context=object)
         sys.modules["astrbot.api.event"].AstrMessageEvent = object
         sys.modules["astrbot.api.event"].filter = types.SimpleNamespace(
-            on_llm_request=lambda: (lambda f: f),
+            on_llm_request=lambda *a, **k: (lambda f: f),
+            after_message_sent=lambda *a, **k: (lambda f: f),
             command=lambda *a, **k: (lambda f: f),
             platform_adapter_type=lambda *a, **k: (lambda f: f),
             custom_filter=lambda *a, **k: (lambda f: f))
@@ -127,7 +128,7 @@ check("冷却中不触发", not ok, why)
 
 ok, why, _, _ = m.should_proactively_reply(
     "白米饭", {"senderId": "1", "groupId": "100000001"},
-    last_reply_ms=0, now_ms=1_000_000_000_000, count=5)
+    last_reply_ms=0, now_ms=1_000_000_000_000, count=m.DAY_MAX)
 check("额度用完不触发", not ok, why)
 
 ok, why, _, _ = m.should_proactively_reply(
