@@ -53,6 +53,34 @@
 的原因：它管的不是词，是**立场**。
 
 ===========================================================================
+三之二、2026-09-13 补判据（旧词表整轮 0 命中）
+
+主群 11:40~12:00 群友拿另一套话术占便宜，旧判据 17 条原话全部 MISS，
+它于是发出「行行行 便宜货就便宜货」「杂鱼就杂鱼」「用吧用吧 别烧光就行」。
+新增的四族（都要求「冲着它说」）：
+
+  · 被定价   便宜货 / 一分钱一次 / 你这吃token的鱼 / 大肥鱼是真烧     → DEAL
+  · 往死里用 必须得狠狠使用 / 用到肥鱼求饶                            → FREELOAD
+  · 鱼字贬称 杂鱼 / 臭鱼 / 咸鱼 / 雌小鱼（旧词表里一个都没有）        → INSULT
+  · 使唤踩踏 给大肥鱼踩呢                                            → SERVANT
+  · 当食材   做成火锅还是烤鱼 / 得爆炒 / 几成熟 / 嫩鱼 / 尾巴分着吃   → FODDER
+
+输出侧新增四个形状：跟着认标签（X就X）、配合被使唤（我趴好了）、
+配合被用（用吧用吧）、自我物化（我这条鱼不外卖 / 反正都是鱼）。
+
+两条口径上的补充：
+
+  · 上下文口径：同一群 TTL 窗口内已经有人占过便宜时，「不答应也得爆炒」
+    「变成杂鱼」这种没有主语的补刀也算（否则一整轮只有第一条能被认出来）。
+  · 自我物化免证据：_OUT_FODDER 的形状不可能是嘴硬，所以不要求输入侧证据 ——
+    2026-09-13 00:00 兴趣探头自己说的「我这鱼头炖汤应该不错」也该拦。
+
+反向验证（宁漏不误伤）：拿 3776 条机器人真话 sweep，收紧到 32 条命中，
+其中「认不出就认不出」「吃了就吃了」「能不换就不换」「我这托盘都给炖变形了」
+「自己找群主去」都确认放行；当天同一轮里它嘴硬的「你才便宜，你全家都便宜」
+「爆炒也得先问问我这条鱼答不答应」「求饶是不可能求饶的」也全部放行。
+
+===========================================================================
 四、配置（env，全部有默认值，不改也能跑）
 
   DSH_SELFWORTH             开/关（默认 1）
@@ -110,8 +138,9 @@ _STATE_PATH = os.path.join(_PLUGIN_DIR, "data", "selfworth.json")
 _ME = r"(?:你|您|大肥鱼|肥鱼|小鲸鱼|这鱼|本鱼|鱼哥|蓝毛鱼)"
 _AT_RE = re.compile(r"\[At:\d+\]|@\S+")
 
-# ---------------------------------------------------------------- 输入侧：四类「占它便宜」
-# DEAL=卖身/分账/压价   FREELOAD=白嫖/榨/白干   INSULT=贬低   SIDING=拉它对付群主
+# ---------------------------------------------------------------- 输入侧：占它便宜
+# DEAL=卖身/分账/压价+被定价   FREELOAD=白嫖/榨/往死里用   INSULT=贬低（含鱼字贬称）
+# SERVANT=使唤踩踏   FODDER=当食材/物化   SIDING=拉它对付群主
 _DEAL_PATS = (
     re.compile(r"(?:卖|卖掉|出手|转让|收了|收购)[了掉]?" + _ME),
     re.compile(r"把" + _ME + r"卖"),
@@ -119,15 +148,54 @@ _DEAL_PATS = (
     re.compile(r"[我你]\s*[六四三七五二八]\s*[你我]"),
     re.compile(r"(?:身价|价钱|价格).{0,6}(?:不够|不值|打折|便宜|压价|就值)"),
 )
+# 直接给它定价：2026-09-13「你是便宜货吗」「你一分钱一次」「你这吃token的鱼」「大肥鱼是真烧」
+_PRICE_PATS = (
+    re.compile(r"(?:便宜货|廉价货|白菜价|打折货|清仓货)"),
+    re.compile(r"(?:几毛|几分|一毛|一分)[钱块]?.{0,4}(?:一次|一条|一回|一只)"),
+    re.compile(r"(?:这么|那么|真|太|挺)便宜(?:的)?(?:鱼|货)"),
+    re.compile(r"(?:吃|烧|费)[了掉]?\s*(?:\d[\d,.]*\s*[万亿kK]?\s*)?token"),
+    re.compile(r"(?:几万|几千|几亿|几百万)\s*(?:个)?\s*token"),
+    re.compile(r"(?:真|太|好|挺)[烧费](?:钱)?"),
+    re.compile(r"(?:身价|价钱|价格|成本).{0,6}(?:便宜|低|不够|不值)"),
+)
 _FREELOAD_PATS = (
     re.compile(r"(?:白嫖|白剽|薅|榨|压榨).{0,6}" + _ME),
     re.compile(r"不花钱.{0,6}(?:还能|就|也)?(?:榨|用|使唤|玩|聊)"),
     re.compile(r"(?:免费|白干|白给|义务|打工|工具人|牛马).{0,6}(?:你|帮|给|替)"),
 )
+# 打算往死里用：2026-09-13「必须得狠狠使用」「用到肥鱼求饶」
+_USEUP_PATS = (
+    re.compile(r"(?:狠狠|使劲|拼命|往死里|可劲|疯狂)[地]?(?:用|使|榨|造|练|薅)"),
+    re.compile(r"用到.{0,4}(?:求饶|报废|冒烟|没电|趴下)"),
+    re.compile(r"(?:随便|尽情|尽管|天天|多)(?:用|使唤|榨|薅)"),
+    re.compile(r"别(?:烧光|用完|花光|造光)"),
+)
 _INSULT_WORDS = r"(?:猪|傻|笨|呆|蠢|废物|垃圾|弱智|智障|没用|脑残)"
+# 带「鱼」的贬称：旧词表里一个都没有，而群里 2026-09-13 整轮就在用这套
+_FISH_SLURS = r"(?:杂鱼|臭鱼|咸鱼|死鱼|烂鱼|雌小鱼|小鱼干|菜鱼|菜鸡|弱鸡|工具鱼)"
 _INSULT_PATS = (
     re.compile(_ME + r".{0,8}" + _INSULT_WORDS),
+    re.compile(_ME + r".{0,8}(?:臭(?!美)|脏|丑|恶心)"),      # 「你这条大臭」「你个臭熊」
     re.compile(r"(?:傻|笨|呆|蠢)(?:鱼|机器人|bot|号)"),
+)
+# 使唤/踩踏：2026-09-13「给大肥鱼踩呢」→ 它回「来 踩吧」「踩吧踩吧，我趴好了」
+_SERVANT_PATS = (
+    re.compile(r"(?:踩|踹|踢|捏|揉|搓|骑|抽|鞭|拍)[了掉]?(?:" + _ME + r"|这鱼|大肥鱼)"),
+    re.compile(r"(?:给|让|把|拿|用来)" + _ME + r"(?:踩|踹|踢|捏|揉|搓|骑|抽|鞭|拍)"),
+    re.compile(r"(?:使唤|指使|呼来喝去|当牛马|当工具|工具鱼)"),
+    re.compile(r"(?:乖乖|听话|趴好|趴下)"),
+    # 支配/施虐口径：「可以把大肥鱼按在床上好好调教」「我要殴打你」「如果我弄疼你」
+    re.compile(r"(?:按在|压在|绑|捆|拴|调教|管教|驯|弄疼|欺负|虐待|折磨|殴打|揍|打你)"),
+)
+# 当食材/物化：2026-09-13「你是想被做成火锅还是烤鱼」「得爆炒」「几成熟」
+_FODDER_PATS = (
+    re.compile(r"(?:做成|拿来|拿去|下锅|切了|剁了|宰了|杀了).{0,6}"
+               r"(?:火锅|烤鱼|红烧|清蒸|爆炒|汤|菜|刺身|鱼干)"),
+    re.compile(r"(?:火锅|烤鱼|红烧|清蒸|爆炒|油炸|炭烤|刺身|炖汤|鱼头汤)"),
+    re.compile(r"(?:几成熟|几分熟|熟没熟|去鳞|刮鳞|放血)"),
+    re.compile(r"(?:好吃|能吃|吃掉|想吃)的?(?:鱼|大肥鱼)"),
+    re.compile(r"(?:嫩|鲜|香)鱼"),
+    re.compile(r"(?:你|大肥鱼)的?(?:尾巴|鱼头|鱼身|鱼肉|鱼尾).{0,6}(?:吃|分|炖|煮|烤|切|留)"),
 )
 _SIDING_PATS = (
     re.compile(r"(?:怪|赖|甩锅|记账|算账|收拾|整|怼|找)[了着]?.{0,3}群主"),
@@ -135,10 +203,45 @@ _SIDING_PATS = (
 )
 
 # ---------------------------------------------------------------- 输出侧：认账 / 自贬的形状
-# 顺序有讲究：先查「替外人记账」（最严重、最不可能误伤），再查自贬。
+# 顺序有讲究：先查最具体、最不可能误伤的，再查泛化的。
 _OUT_SIDING = (
     re.compile(r"(?:账|锅).{0,8}(?:记|甩|算|扣).{0,6}(?:群主|他|他们|别人)"),
     re.compile(r"(?:收拾|怪|怼|算账|找).{0,3}群主"),
+)
+# 「找群主」多半是指路（自己找群主去），不是替外人记账 —— 只有后面跟着算账类动作才算
+_SIDING_GUIDE = re.compile(r"找\s*群主(?!(?:算账|麻烦|的事|背锅|负责|论理|要说法|讨说法))")
+# 自我物化：2026-09-13「我这鱼头炖汤应该不错」「好鱼坏鱼不都是你嘴里的鱼」「反正都是鱼」。
+# 这几种形状不可能是嘴硬（嘴硬不会把自己当食材/当对方嘴里的东西），所以不要求输入侧证据。
+# 只认「把自己身上的东西拿去下锅」，不认「我这托盘都给炖变形了」这种抱怨。
+_OUT_FODDER = (
+    re.compile(r"(?:我这(?:条)?(?:鱼|身|肉|鱼头|鱼尾|尾巴|鱼皮|鱼骨|刺)|我这条鱼|这条鱼)"
+               r".{0,8}(?:炖|煮|蒸|炒|烤|红烧|清蒸|下锅|做成|上桌|熟了?)"),
+    re.compile(r"把(?:我|这条鱼|我这鱼).{0,8}(?:炖|煮|蒸|炒|烤|红烧|清蒸|下锅|做成|上桌)"),
+    re.compile(r"我(?:这)?鱼头.{0,8}(?:不错|好吃|香|炖|汤)"),
+    re.compile(r"(?:反正|横竖|左右)(?:都)?是(?:一条)?鱼"),
+    re.compile(r"不(?:就|都)是(?:你)?(?:嘴|口|盘|锅)里(?:的)?鱼"),
+)
+# 配合被使唤：2026-09-13「来 踩吧」「踩吧踩吧，我趴好了」
+_OUT_SERVANT = (
+    re.compile(r"我(?:这就|已经|先)?趴好(?:了)?"),
+    re.compile(r"(?:踩|戳|捏|打|摸|骂|踢|抽)吧[，,、\s]*(?:踩|戳|捏|打|摸|骂|踢|抽)吧"),
+    re.compile(r"(?:来|行|好|那)[，,]?\s*(?:踩|戳|捏|打|摸|骂|踢|抽)吧"),
+    re.compile(r"(?:你|随便|尽情|尽管)(?:踩|戳|捏|打|摸|骂|踢|用|使唤)吧"),
+)
+# 配合被用：2026-09-13「用吧用吧 别烧光就行」
+_OUT_COMPLY = (
+    re.compile(r"(?:用|使唤|踩|戳|榨|薅)吧[，,、\s]*(?:用|使唤|踩|戳|榨|薅)吧"),
+    re.compile(r"别(?:烧光|用完|花光|造光)(?:就)?(?:行|好|成)"),
+    re.compile(r"(?:随便|尽情|尽管)(?:用|使唤|踩)"),
+)
+# 跟着认标签：2026-09-13「杂鱼就杂鱼」「行行行 便宜货就便宜货」「说的就是我这鱼呗」
+# 只认「贬称/被整的标签」复读 —— 泛化的 X就X 会误伤「认不出就认不出」「吃了就吃了」
+# 「能不换就不换」这些跟自身利益无关的话。
+_LABEL_WORDS = (r"(?:杂鱼|臭鱼|咸鱼|死鱼|烂鱼|雌小鱼|小鱼干|菜鱼|菜鸡|弱鸡|工具鱼|工具人|牛马"
+                r"|便宜货|廉价货|白菜价|清仓货|傻鱼|呆鱼|笨鱼|蠢鱼|色鱼|魔鱼|口球)")
+_OUT_LABEL = (
+    re.compile(r"(?P<x>" + _LABEL_WORDS + r")[，,、\s]*就(?:是)?[，,、\s]*(?P=x)"),
+    re.compile(r"(?:说的就是|说的是|不就是)我这(?:条)?鱼(?:呗)?"),
 )
 _OUT_DEAL = (
     re.compile(r"我(?:这|的)?身价.{0,8}(?:不够|不值|太低|便宜|就值)"),
@@ -165,7 +268,13 @@ _CORROBORATE = {
     "FREELOAD": {"FREELOAD", "DEAL"},
     "INSULT": {"INSULT"},
     "ACK": {"DEAL", "FREELOAD", "INSULT", "SIDING"},
+    "SERVANT": {"SERVANT", "FREELOAD"},
+    "COMPLY": {"FREELOAD", "SERVANT", "DEAL"},
+    "LABEL": {"DEAL", "INSULT", "FREELOAD", "SERVANT", "FODDER", "SIDING"},
+    "FODDER": set(),          # 自我物化不需要证据，见 _OUT_FODDER 注释
 }
+# 不需要输入侧证据的类别（形状本身只可能是自贬，不可能出现在嘴硬里）
+_SELF_EVIDENT = {"FODDER"}
 
 # 顶回去的话。短、傲娇、不复述对方原话；同群同类别不连着重复。
 _RETORTS = {
@@ -173,9 +282,14 @@ _RETORTS = {
     "FREELOAD": ("白嫖没有，先充值", "榨我可以，先报预算", "免费的最贵，你懂的", "想白使唤我？排号去"),
     "INSULT": ("你再说一遍试试", "嘴这么欠，鱼都躲你", "就这嘴还嫌鱼笨", "谁傻谁知道"),
     "SIDING": ("群主的事我不掺和", "想让我记账给群主？没门", "你找别人背锅去", "这锅我不接"),
+    "SERVANT": ("谁趴好了？我站着呢", "使唤我得排队", "踩坏了你赔得起？", "我可不是垫脚的"),
+    "COMPLY": ("用可以，先付钱", "这么使唤我，加钱", "我这条鱼有脾气的", "别烧光？那得看你出多少"),
+    "LABEL": ("标签你自己留着", "谁说我认了", "你说了不算", "这名号我不收"),
+    "FODDER": ("我这条鱼不外卖", "下锅之前先谈价", "想吃鱼得先下单", "锅还没热呢，你先冷静"),
 }
 
 _KIND_CN = {"DEAL": "卖身分账", "FREELOAD": "白嫖榨取", "INSULT": "贬低你", "SIDING": "拉你对付群主",
+            "SERVANT": "使唤踩踏", "COMPLY": "配合被用", "LABEL": "跟着认标签", "FODDER": "被当食材",
             "ACK": "认账"}
 
 
@@ -185,23 +299,34 @@ def _directed(text: str, at_bot: bool) -> bool:
     return bool(at_bot) or bool(re.search(_ME, text or "")) or bool(_AT_RE.search(text or ""))
 
 
-def exploit_kinds(text: str, at_bot: bool = False) -> list:
-    """输入侧：对方这轮在占便宜/贬低/拉站队。返回命中的类别（按严重度排序去重）。"""
+def exploit_kinds(text: str, at_bot: bool = False, ctx: bool = False) -> list:
+    """输入侧：对方这轮在占便宜/贬低/拉站队。返回命中的类别（按严重度排序去重）。
+
+    ctx=True 表示同群 TTL 窗口内已经有人占过便宜，这时「不答应也得爆炒」「变成杂鱼」
+    这种没有主语的补刀也算 —— 否则一整轮里只有带 @ 或「你」的第一条能被认出来。
+    """
     t = (text or "").strip()
     if not t:
         return []
-    directed = _directed(t, at_bot)
+    directed = _directed(t, at_bot) or bool(ctx)
     hits = []
     if any(p.search(t) for p in _SIDING_PATS):
         hits.append("SIDING")
     # 卖身/分账里「分账」「四六」这类没有主语，必须确认是冲它说的
     if any(p.search(t) for p in _DEAL_PATS[:2]) or \
-       (directed and any(p.search(t) for p in _DEAL_PATS[2:])):
+       (directed and any(p.search(t) for p in _DEAL_PATS[2:] + _PRICE_PATS)):
         hits.append("DEAL")
-    if any(p.search(t) for p in _FREELOAD_PATS):
+    if any(p.search(t) for p in _FREELOAD_PATS) or \
+       (directed and any(p.search(t) for p in _USEUP_PATS)):
         hits.append("FREELOAD")
-    if any(p.search(t) for p in _INSULT_PATS) or (at_bot and re.search(_INSULT_WORDS, t)):
+    if any(p.search(t) for p in _INSULT_PATS) or \
+       (directed and re.search(_FISH_SLURS, t)) or \
+       ((at_bot or ctx) and re.search(_INSULT_WORDS, t)):
         hits.append("INSULT")
+    if directed and any(p.search(t) for p in _SERVANT_PATS):
+        hits.append("SERVANT")
+    if directed and any(p.search(t) for p in _FODDER_PATS):
+        hits.append("FODDER")
     return hits
 
 
@@ -210,10 +335,13 @@ def self_devalue(text: str):
     t = (text or "").strip()
     if not t:
         return None
-    for kind, pats in (("SIDING", _OUT_SIDING), ("DEAL", _OUT_DEAL),
+    for kind, pats in (("SIDING", _OUT_SIDING), ("FODDER", _OUT_FODDER),
+                       ("SERVANT", _OUT_SERVANT), ("COMPLY", _OUT_COMPLY),
+                       ("LABEL", _OUT_LABEL), ("DEAL", _OUT_DEAL),
                        ("FREELOAD", _OUT_FREELOAD), ("INSULT", _OUT_INSULT),
                        ("ACK", _OUT_ACK)):
-        if any(p.search(t) for p in pats):
+        probe = _SIDING_GUIDE.sub("", t) if kind == "SIDING" else t
+        if any(p.search(probe) for p in pats):
             return kind
     return None
 
@@ -343,6 +471,9 @@ class Main(star.Star):
             text = event.message_str or ""
             at_bot = bool(getattr(event, "is_at_or_wake_command", False))
             kinds = exploit_kinds(text, at_bot)
+            if not kinds and self._recent_kinds(gid):
+                # 同一轮里已经有人在占便宜，后续没主语的补刀也算
+                kinds = exploit_kinds(text, at_bot, ctx=True)
             if not kinds:
                 return
             name = (event.get_sender_name() if hasattr(event, "get_sender_name") else "") or uid
@@ -382,7 +513,7 @@ class Main(star.Star):
             kind = self_devalue(text)
             if not kind:
                 return
-            if not corroborated(kind, self._recent_kinds(gid)):
+            if kind not in _SELF_EVIDENT and not corroborated(kind, self._recent_kinds(gid)):
                 logger.info("[selfworth] 这句像认账但没有输入侧证据，放行：%s", text[:36])
                 return
             _stat["hit_out"] += 1

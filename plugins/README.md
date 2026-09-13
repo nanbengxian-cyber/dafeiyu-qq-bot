@@ -25,7 +25,7 @@ All configuration is via environment variables in docker-compose's `env_file`. A
 | `dsh-decide` | 895 | `/插话判断` | — | 小模型 |
 | `dsh-mention` | 319 | `/艾特模式` | — | — |
 | `dsh-claimguard` | 525 | `/防骗状态` | — | — |
-| `dsh-selfworth` | 454 | `/利益状态` `/利益模式` `/利益账本` | — | — |
+| `dsh-selfworth` | 585 | `/利益状态` `/利益模式` `/利益账本` | — | — |
 | `dsh-agency` | 约 400 | `/自主状态` | — | — |
 | `dsh-initiate` | 620 | `/主动开口状态` `/主动开口测试` | — | 小模型 |
 | `dsh-emotion` | 582 | `/情绪状态` | — | — |
@@ -141,7 +141,8 @@ python3 dsh-quote/test_quote.py             # 25 项:@剥离 + 只认 QQ 号的�
 python3 dsh-quoteref/test_quoteref.py       # 计数器 + 冷却 + At 摘除
 python3 dsh-scene/test_scene.py             # 背景加载 + 作息判定
 python3 dsh-selfaware/test_selfaware.py     # 行为日志解析 + 独立账本 + 入群记录 + 注入预算
-python3 dsh-selfworth/test_selfworth.py     # 四类占便宜 + 认账形状 + 嘴硬必须放行
+python3 dsh-selfworth/test_selfworth.py     # 八类占便宜 + 认账形状 + 嘴硬必须放行（含 0913 群语料）
+python3 dsh-selfworth/sweep_corpus.py 真话.txt   # 拿真语料 sweep 输出侧，人工看有没有误伤
 python3 dsh-social/test_social.py           # 按群隔离 + 信号边界 + 衰减/日上限 + 退出
 python3 dsh-selfguard/test_selfguard.py     # 重复判定 + 冲突拱火 + 豁免
 python3 dsh-slang/test_slang.py             # 16 项:触发/幻觉拦截/注入预算/自动审核门/重启持久化

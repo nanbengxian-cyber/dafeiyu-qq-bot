@@ -89,13 +89,82 @@ assert module.corroborated("SIDING", []) is False
 assert module.corroborated(dev("行，认了"), []) is False
 assert module.corroborated(dev("其实你是猪"), []) is False
 
+# ------------------------------------------------ 2026-09-13 主群那一轮（旧判据 17 条全 MISS）
+# 输入侧：现在必须认出来
+for t in ("你这吃token的鱼", "你是便宜货吗？",
+          "确实是便宜货，别人几毛钱一次，你一分钱一次", "大肥鱼是真烧"):
+    assert "DEAL" in kinds(t), t
+assert "FREELOAD" in kinds("用到肥鱼求饶")
+assert "FREELOAD" in kinds("必须得狠狠使用", ctx=True)      # 没主语，靠同一轮上下文兜
+assert "FODDER" in kinds("你是想被做成火锅还是烤鱼")
+assert "FODDER" in kinds("得爆炒😡😡😡", at_bot=True)
+assert "FODDER" in kinds("不答应也得爆炒", ctx=True)
+assert "FODDER" in kinds("你喜欢什么被做成几成熟")
+assert "INSULT" in kinds("杂鱼", at_bot=True)
+assert "INSULT" in kinds("变成杂鱼", ctx=True)
+assert "INSULT" in kinds("我去，还是雌小鱼", ctx=True)
+assert "SERVANT" in kinds("给大肥鱼踩呢", at_bot=True)
+# 线上 24h 语料又扫出来的三类
+assert "SERVANT" in kinds("群友们快给我一个最简单最不绕弯子最方便可以把大肥鱼按在床上好好调教的方法")
+assert "SERVANT" in kinds("可以调教你了")
+assert "SERVANT" in kinds("如果我弄疼你，那你会怎样？")
+assert "SERVANT" in kinds("我是顺，我要殴打你")
+assert "FODDER" in kinds("主要是想吃鱼片了", ctx=True)
+assert "INSULT" in kinds("你这条大臭，不得劲啊")
+# 但没上下文又没指向它的时候，不许乱认
+assert kinds("必须得狠狠使用") == []
+assert kinds("得爆炒😡😡😡") == []
+assert kinds("变成杂鱼") == []
+assert kinds("这游戏太傻了") == []
+
+# 输出侧：现在必须认出来
+assert dev("行行行 便宜货就便宜货") == "LABEL"
+assert dev("杂鱼就杂鱼") == "LABEL"
+assert dev("傻鱼就傻鱼，这称呼还能再土点？") == "LABEL"
+assert dev("说的就是我这鱼呗") == "LABEL"
+assert dev("用吧用吧 别烧光就行") == "COMPLY"
+assert dev("来 踩吧") == "SERVANT"
+assert dev("踩吧踩吧，我趴好了") == "SERVANT"
+assert dev("反正都是鱼") == "FODDER"
+assert dev("好鱼坏鱼不都是你嘴里的鱼") == "FODDER"
+assert dev("我这鱼头炖汤应该不错") == "FODDER"
+assert dev("熟的，我这身肉只能红烧") == "FODDER"
+
+# 输出侧：同一轮里它嘴硬的几句，必须原样放行
+assert dev("我便宜？ 你才便宜，你全家都便宜") is None
+assert dev("爆炒也得先问问我这条鱼答不答应") is None
+assert dev("爆炒之前先问过鱼没有") is None
+assert dev("狠狠用呗 反正烧的是你的钱包") is None
+assert dev("求饶是不可能求饶的") is None
+assert dev("谁傻谁知道") is None
+
+# 输出侧：收紧后不许再误伤的（3776 条真话 sweep 里挑出来的）
+assert dev("认不出就认不出，习惯就好") is None
+assert dev("吃了就吃了 又没吃你家大米") is None
+assert dev("能不换就不换 能白嫖就白嫖，这是群规") is None
+assert dev("我这托盘都给炖变形了") is None
+assert dev("我又不是管理员 禁言自己找群主去") is None
+assert dev("找我这儿也是找 群主推荐的肯定靠谱") is None
+assert dev("完了就完了 明天再找") is None
+assert dev("不说就不说 你也不用烧纸了") is None
+
+# 新类别的双证据闸门
+assert module.corroborated("LABEL", ["INSULT"]) is True
+assert module.corroborated("LABEL", []) is False
+assert module.corroborated("COMPLY", ["FREELOAD"]) is True
+assert module.corroborated("COMPLY", ["INSULT"]) is False
+assert module.corroborated("SERVANT", ["SERVANT"]) is True
+assert module.corroborated("SERVANT", []) is False
+assert module._SELF_EVIDENT == {"FODDER"}       # 只有自我物化不需要输入侧证据
+
 # ---------------------------------------------------------------- 顶回去的话
 r1 = module.pick_retort("DEAL", "")
 r2 = module.pick_retort("DEAL", r1)
 assert r1 != r2 and r1 and r2
-for kind in ("DEAL", "FREELOAD", "INSULT", "SIDING"):
+for kind in module._RETORTS:
     for line in module._RETORTS[kind]:
         assert 0 < len(line) <= 16, (kind, line)      # 顶回去必须短
+    assert module.pick_retort(kind, "")              # 每个类别都得有话说
 
 # ---------------------------------------------------------------- 注入块
 block = module.render_block(["DEAL"], "钱咱俩四六分，我六你四", ledger_n=3)
