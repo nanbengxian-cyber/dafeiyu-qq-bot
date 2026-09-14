@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dafeiyu.console"
-    android:versionCode="2"
-    android:versionName="1.1">
+    android:versionCode="3"
+    android:versionName="1.2">
 
     <!-- minSdk 21 = Android 5.0。这个 App 只用了 Activity/Toast/SeekBar 这些
          从 API 1 就有的东西，压低下限纯粹是为了别在旧手机上装不上。

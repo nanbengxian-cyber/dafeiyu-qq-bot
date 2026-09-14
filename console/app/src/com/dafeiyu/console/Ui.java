@@ -301,6 +301,12 @@ public final class Ui {
             Api.ApiException ae = (Api.ApiException) exc;
             String msg = ae.getMessage() == null ? "" : ae.getMessage();
             if (ae.code == 401) {
+                // 只在服务端真的没说原因时才贴「登录过期」这句通用话术。
+                // 之前无条件覆盖，把「密码不对」也说成过期，误导过人。
+                String m = msg.isEmpty() ? "" : msg;
+                if (m.contains("过期") || m.contains("重新")) {
+                    return m;
+                }
                 return "登录过期了，重新输一次密码";
             }
             if (ae.code == 403) {

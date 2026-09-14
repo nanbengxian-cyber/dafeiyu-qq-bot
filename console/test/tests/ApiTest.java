@@ -100,6 +100,11 @@ public final class ApiTest {
         } catch (Api.ApiException e) {
             T.contains("说密码不对", e.getMessage(), "密码");
             T.eq("空 cookie", "", wrong.cookie());
+            // 回归：密码错的 code 曾经是 401，被 Ui.explain 一律翻成
+            // 「登录过期了，重新输一次密码」，用户以为掉登录、反复试密码。
+            T.eq("密码错不能是 401（会被误说成过期）", 0, Integer.valueOf(e.code));
+            T.contains("登录页显示真话", Ui.explain(e), "密码不对");
+            T.isFalse("不再谎报过期", Ui.explain(e).contains("过期"));
         }
 
         f = new Fake();

@@ -140,10 +140,13 @@ public class Api {
         if (r.code == 429 || (r.body != null && r.body.contains("试太多次"))) {
             throw new ApiException("密码错太多次被锁了，等一会再试（每次翻倍，最多 1 小时）", r.code);
         }
+        // 密码错的 code 必须是 0，不能是 401：Ui.explain 见到 401 会一律
+        // 翻译成「登录过期了，重新输一次密码」，把「密码不对」这句真话吞掉，
+        // 让人以为自己的账号掉线了、密码没问题，越试越糊涂。
         if (r.code == 200 && r.body != null && r.body.contains("密码不对")) {
-            throw new ApiException("密码不对", 401);
+            throw new ApiException("密码不对（就是控制台那个登录密码）", 0);
         }
-        throw new ApiException("登录失败（HTTP " + r.code + "），密码可能不对", r.code);
+        throw new ApiException("登录失败（HTTP " + r.code + "），密码可能不对", 0);
     }
 
     /** 从 Set-Cookie 里抠出 {@code dsh_qr=值}。 */
