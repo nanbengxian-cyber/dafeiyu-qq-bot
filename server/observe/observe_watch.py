@@ -6,6 +6,7 @@
   R2 主模型中转 429 限流
   R3 主动回复失败（Traceback）
   R4 识图失败拖慢（vischain 档全挂）
+  R5 napcat 掉线（Login Error / 二维码循环；只告警，不自动重启——扫码须人工）
 
 有错就改：
   R1 复发（24h 内 >=3 次）-> 自动给人格追加强化约束（幂等）+ 重启 + 邮件
@@ -32,6 +33,19 @@ WINDOW_MIN = 10          # 看最近 10 分钟
 PAIR_WINDOW_S = 25       # 工具收尾双回复时间窗（拆句/分段秒级，正常回复>25s）
 TOOLCALL = re.compile(r"使用工具：|Agent 使用工具|Tool `[a-z_]+` Result|工具调用生图|工具调用语音|工具调用视频")
 ALERT_COOLDOWN_S = 1800  # 同类问题告警冷却 30 分钟
+
+# [R5 2026-09-14] napcat 掉线探针。2026-09-14 07:33 掉线 3.5h 无告警的补丁。
+# 现场校准（踩坑记录）：
+#   ① Login Error 是间歇性的：掉线后并不是每分钟都报，12 分钟窗可能 0 次。
+#      窗口必须放宽到 30 分钟。
+#   ② docker logs 需要 root：observe timer 以 root 跑没问题，但手工验证
+#      时必须 sudo，否则拿到空输出会误判「探针坏了」。
+#   ③ 判据用双证据：Login Error >=1 **且** 二维码出现（只有掉线等扫码才会
+#      打二维码）。单看任何一个都会抖——Error 可能只是重连抖动，二维码
+#      刷一次也可能是扫码瞬间的正常打印。
+R5_LOGIN_ERR_RE = re.compile(r"Login Error|登录超时|token 失效")
+R5_QRCODE_RE = re.compile(r"二维码|qrcode|扫码")
+R5_WINDOW_MIN = 30
 R1_AUTOFIX_THRESHOLD = 3  # 24h 内 R1 次数达到即自动修
 
 # [fix:r1-restart-loop-v1 2026-09-13] 「补丁在但仍复发」时允许的重启次数上限。
@@ -162,6 +176,44 @@ def r1_autofix(st, changed, fp, now=None):
                    % (st.get("patch_retry_used", 0), R1_RETRY_MAX))
 
 
+def r5_napcat_probe(st):
+    """R5：napcat 掉线检测（Login Error 循环 / 二维码等待）。
+
+    只读 napcat 容器日志。返回 (report_line or None, evidence_dict)。
+    决策是纯函数式的：证据 -> 结论，方便单测（把日志行直接喂正则即可）。
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "napcat", "--since", f"{R5_WINDOW_MIN}m"],
+            capture_output=True, text=True, timeout=30,
+        ).stderr or ""
+        # napcat 日志主要走 stderr；stdout 可能带二维码 banner，一并合并
+        out += subprocess.run(
+            ["docker", "logs", "napcat", "--since", f"{R5_WINDOW_MIN}m"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception as e:
+        return None, {"probe_error": str(e)}
+    lines = out.splitlines()[-400:]
+    now = time.time()
+    err_ts = []
+    qr = False
+    for ln in lines:
+        if R5_LOGIN_ERR_RE.search(ln):
+            err_ts.append(ln)
+        if R5_QRCODE_RE.search(ln):
+            qr = True
+    n_err = len(err_ts)
+    st.setdefault("r5", {})
+    if n_err >= 1 and qr:
+        first = err_ts[0][:80] if err_ts else ""
+        return (
+            f"R5 napcat 掉线：近30分钟 Login Error x{n_err}，二维码={qr} —— 机器人不在线，需人工扫码",
+            {"login_err": n_err, "qrcode": qr, "first": first},
+        )
+    return None, {"login_err": n_err, "qrcode": qr}
+
+
 def main():
     lines = tail_log()
     now = datetime.now()
@@ -274,6 +326,11 @@ def main():
         report.append(f"R3 主动回复失败 x{nfailed}(多为decide预期静默)")
     if nvisfail:
         report.append(f"R4 识图失败 x{nvisfail}")
+    # ---- R5: napcat 掉线（最高优先级：人不在线一切白搭）----
+    r5_line, r5_ev = r5_napcat_probe(st)
+    if r5_line:
+        report.append(r5_line)
+        st["r5"]["last_hit"] = now_iso()
 
     # ---- 自动修复：R1 复发 -> 插件补丁（幂等）+ 重启 ----
     # 模型层约束（人格）实测拦不住"回甲时顺手接乙的茬"（C1 情景两轮 FAIL），
