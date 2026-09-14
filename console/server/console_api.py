@@ -53,6 +53,16 @@ from console_spec import (
     PLUGIN_LABELS,
 )
 
+# 实时观察层（/live /mind /log /rawconfig 的数据源）。和 patch_qrweb 的哲学一致：
+# 它是**附加**功能，导入失败只让这四个端点回 503，配置/状态/模式一切照旧。
+try:
+    import feed_sources
+except Exception as _feed_exc:  # noqa: BLE001
+    feed_sources = None
+    FEED_ERR = "%s: %s" % (type(_feed_exc).__name__, _feed_exc)
+else:
+    FEED_ERR = ""
+
 CFG_PATH = os.environ.get("CONSOLE_CFG", "/opt/qqbot/astrbot/data/cmd_config.json")
 DASH = os.environ.get("CONSOLE_DASH", "http://127.0.0.1:6185")
 PUBLIC_DIR = os.environ.get("QRWEB_DIR", "/opt/qqbot/public")
@@ -531,6 +541,66 @@ def _plugins():
     return out
 
 
+def _astrbot_started():
+    """astrbot 容器本次启动的绝对 epoch（活性判断的基准线）。"""
+    rc, out, _ = _sh(["docker", "inspect", "-f", "{{.State.StartedAt}}", "astrbot"], timeout=8)
+    if rc != 0 or not out:
+        return None
+    return _epoch_from(out.strip())
+
+
+def live_plugins():
+    """插件实时画像 = dashboard 的启停事实 × 日志的活动证据。
+
+    dashboard 说「启用了」只代表插件加载了，不代表它在干活；日志说「有活动」
+    只能证明进程活着。两个证据放在一起才回答得了「这个插件在运行吗」：
+      running    dashboard 启用 + 本次容器启动后有日志
+      idle       dashboard 启用 + 启动后无日志（安静插件是正常的，不算病）
+      load_err   dashboard 启用但日志里只有加载行且晚于启动（可它应该有加载行；
+                 罕见，按可疑展示）
+      disabled   dashboard 明确关了
+      crashed    日志有错误行（最高优先级信号，压过其他判断）
+      unknown    dashboard 问不到（后端故障时回这个，不硬猜）
+    日志标签里的历史脏名（aw/dsh-mind-check 这类一次性测试脚本）天然被
+    dashboard 清单过滤掉 —— 只有真实存在的插件才会出现在结果里。
+    """
+    base = _plugins()
+    if base is None:
+        return None
+    started = _astrbot_started()
+    scan = feed_sources.scan_log() if feed_sources else None
+    by_log = {p["name"]: p for p in (scan.runtime_plugins(started) if scan else [])}
+    out = []
+    for item in base:
+        name = item["name"]
+        log = by_log.get(name)
+        errors = log["errors"] if log else 0
+        if errors > 0 and log.get("last_age_s") is not None:
+            status = "crashed"
+        elif not item["enabled"]:
+            status = "disabled"
+        elif log is None or log.get("last_age_s") is None:
+            status = "idle"  # 日志里没见过它：加载着但安静（无加载行的插件存在）
+        elif log["status"] in ("stale", "unknown"):
+            # 插件启用了，但它的最后日志早于本次容器启动 —— 说明这个容器周期
+            # 里它一行都没打过。启用了却完全无声，按 idle 而不是报错。
+            status = "idle"
+        else:
+            status = "running"
+        row = dict(item)
+        row["live_status"] = status
+        if log:
+            row["last_age_s"] = log.get("last_age_s")
+            row["events"] = log.get("events")
+            row["errors"] = errors
+        else:
+            row["last_age_s"] = None
+            row["events"] = 0
+            row["errors"] = 0
+        out.append(row)
+    return out
+
+
 def _group_order():
     """插件分组的显示顺序 = PLUGIN_GROUPS 里第一次出现的顺序。"""
     seen = []
@@ -667,6 +737,9 @@ def build_status(force=False):
         "tools": _recent_tool_calls(),
         "plugins": _plugins(),
         "plugin_groups": _group_order(),
+        # v2：插件实时画像（启停事实 × 日志活动证据）。老 APK 不认识会直接忽略，
+        # 新 APK 用它渲染「插件是否在运行」。失败回 None 而不是炸整个 status。
+        "live_plugins": (live_plugins() if feed_sources else None),
         "mode": current_mode(cfg),
         # env 改了但容器还没重启 —— 手机上要显眼提示，否则人会以为改完就生效了
         "env_pending": pending_restart(),
@@ -1031,6 +1104,41 @@ def handle(method, path, query, body):
             # 单独一个端点是为了让「查更新」这件事便宜 —— status 要 docker inspect
             # 和 plugin/get，几百毫秒；这个只 stat 一个文件。
             return 200, {"apk": apk_info(), "schema_version": 2}
+        if path == "/api/console/live":
+            # 群聊合并流（群友消息 + 机器人发言）。feed_sources 导入失败回 503，
+            # 让手机明说「观察层没起来」，而不是给一份空数据装正常。
+            if feed_sources is None:
+                raise ApiError("观察层没装载：" + FEED_ERR, 503)
+            return 200, feed_sources.dialog(
+                group_id=query.get("group"),
+                limit=_to_int(query.get("limit"), 60),
+                before=_to_float(query.get("before")),
+            )
+        if path == "/api/console/mind":
+            # 内在状态：dsh-mind 注入块 + dsh-effect 判词 + selfaware 迁移 + 记分卡
+            if feed_sources is None:
+                raise ApiError("观察层没装载：" + FEED_ERR, 503)
+            out = feed_sources.mind_feed()
+            out["live_plugins"] = live_plugins()
+            return 200, out
+        if path == "/api/console/log":
+            if feed_sources is None:
+                raise ApiError("观察层没装载：" + FEED_ERR, 503)
+            level = (query.get("level") or "all").strip()
+            if level not in feed_sources.LOG_LEVELS:
+                raise ApiError("level 只能是 %s 之一" % (feed_sources.LOG_LEVELS,), 400)
+            return 200, feed_sources.log_tail(
+                minutes=_to_int(query.get("minutes"), 180),
+                level=level,
+                name=query.get("name"),
+                limit=_to_int(query.get("limit"), 200),
+            )
+        if path == "/api/console/rawconfig":
+            # 全量配置（脱敏）。给「确保能看到所有配置」的诉求 —— 旋钮清单是
+            # 挑过的子集，这里给全量，密钥只报「已设置」。
+            if feed_sources is None:
+                raise ApiError("观察层没装载：" + FEED_ERR, 503)
+            return 200, feed_sources.raw_config()
         return 404, {"error": "no such endpoint"}
 
     if method != "POST":
@@ -1061,3 +1169,18 @@ def handle(method, path, query, body):
 
 
 CONSOLE_PREFIX = "/api/console/"
+
+
+def _to_int(raw, dflt):
+    """query 参数 → int，带上限钳制。坏值回默认 —— 观察端点的参数不值得 400。"""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return dflt
+
+
+def _to_float(raw):
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None

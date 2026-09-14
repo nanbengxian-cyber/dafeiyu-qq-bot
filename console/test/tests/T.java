@@ -74,6 +74,14 @@ public final class T {
         }
     }
 
+    public static void isNull(String what, Object v) {
+        if (v == null) {
+            ok(what);
+        } else {
+            bad(what, "期望 null，得到 [" + v + "]");
+        }
+    }
+
     public static void contains(String what, String haystack, String needle) {
         if (haystack != null && haystack.contains(needle)) {
             ok(what);

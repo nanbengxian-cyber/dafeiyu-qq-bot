@@ -53,6 +53,32 @@ public class MainActivity extends Activity {
     /** 用户在配置页改动但还没提交的值。 */
     private final Map<String, Object> edited = new LinkedHashMap<String, Object>();
 
+    /** 观察页数据（v2）：群聊流 / 心智 / 日志。null 表示还没拉到。 */
+    private Map<String, Object> liveData;
+    private Map<String, Object> mindData;
+    private Map<String, Object> logData;
+    private String liveGroup = "";        // 当前选中的群
+    private long liveOldestTs;            // 已加载的最旧一条（翻页锚点）
+    private String logLevel = "all";
+    private String logName = "";
+    private boolean liveAutoRefresh = true;
+
+    /** 观察页自动刷新的节拍器。15 秒一拍，只在观察页且自动开时真正发请求。 */
+    private static final long FEED_POLL_MS = 15000L;
+    private final Runnable feedTicker = new Runnable() {
+        @Override
+        public void run() {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            // 节拍器不停；只有处在观察页、自动开、且没有别的请求在跑时才拉
+            if (tab == TAB_LIVE && liveAutoRefresh && !busy) {
+                loadFeed(false);
+            }
+            ui.postDelayed(this, FEED_POLL_MS);
+        }
+    };
+
     private int tab;
     private boolean busy;
 
@@ -70,9 +96,21 @@ public class MainActivity extends Activity {
             return;
         }
         tab = store.tab();
+        // 旧 APK 存的 tab 只有 0..2，v2 有 6 个页签 —— 越界的值回状态页，
+        // 比渲染出一个空白页好。
+        if (tab < 0 || tab >= TABS.length) {
+            tab = 0;
+        }
         setContentView(buildShell());
         loadAll(false);
         checkServerVersion();
+        ui.postDelayed(feedTicker, FEED_POLL_MS);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        ui.removeCallbacks(feedTicker);
     }
 
     // ---------------------------------------------------------------- 外壳
@@ -144,7 +182,10 @@ public class MainActivity extends Activity {
         return root;
     }
 
-    private static final String[] TABS = {"状态", "配置", "模式"};
+    private static final String[] TABS = {"状态", "实时", "心智", "日志", "配置", "模式"};
+    private static final int TAB_LIVE = 1;
+    private static final int TAB_MIND = 2;
+    private static final int TAB_LOG = 3;
 
     private void buildTabs() {
         tabBar.removeAllViews();
@@ -212,6 +253,9 @@ public class MainActivity extends Activity {
                 Map<String, Object> st = null;
                 KnobModel.Schema sc = null;
                 Map<String, Object> vals = null;
+                Map<String, Object> feed = null;
+                Map<String, Object> md = null;
+                Map<String, Object> lg = null;
                 String err = null;
                 boolean expired = false;
                 try {
@@ -220,6 +264,11 @@ public class MainActivity extends Activity {
                         sc = KnobModel.parse(api.schema());
                     }
                     vals = Ui.stable(mapOf(api.config(), "values"));
+                    // 观察页的数据独立拉：切页时才拉，但首次打开时一起拿到，
+                    // 用户打开 App 第一眼看到的就是「机器人在干啥」。
+                    feed = api.live(liveGroup, 60, 0);
+                    md = api.mind();
+                    lg = api.log(logLevel, logName, 180, 200);
                 } catch (Api.ApiException exc) {
                     err = Ui.explain(exc);
                     expired = exc.code == 401;
@@ -229,6 +278,9 @@ public class MainActivity extends Activity {
                 final Map<String, Object> fSt = st;
                 final KnobModel.Schema fSc = sc;
                 final Map<String, Object> fVals = vals;
+                final Map<String, Object> fFeed = feed;
+                final Map<String, Object> fMd = md;
+                final Map<String, Object> fLg = lg;
                 final String fErr = err;
                 final boolean fExpired = expired;
                 ui.post(new Runnable() {
@@ -241,7 +293,7 @@ public class MainActivity extends Activity {
                             kickToLogin();
                             return;
                         }
-                        if (fErr != null) {
+                        if (fErr != null && fSt == null) {
                             banner.setTextColor(Theme.BAD);
                             banner.setText(fErr);
                             return;
@@ -252,6 +304,20 @@ public class MainActivity extends Activity {
                         }
                         values = fVals;
                         edited.clear();
+                        if (fFeed != null) {
+                            liveData = fFeed;
+                            liveGroup = Feed.currentGroup(fFeed, liveGroup);
+                            List<Feed.Msg> msgs = Feed.messages(fFeed);
+                            if (!msgs.isEmpty()) {
+                                liveOldestTs = msgs.get(msgs.size() - 1).ts;
+                            }
+                        }
+                        if (fMd != null) {
+                            mindData = fMd;
+                        }
+                        if (fLg != null) {
+                            logData = fLg;
+                        }
                         render();
                     }
                 });
@@ -323,10 +389,19 @@ public class MainActivity extends Activity {
         banner.setTextColor(Theme.tone(head.tone));
 
         switch (tab) {
-            case 1:
+            case TAB_LIVE:
+                renderLive();
+                break;
+            case TAB_MIND:
+                renderMind();
+                break;
+            case TAB_LOG:
+                renderLog();
+                break;
+            case 4:
                 renderConfig();
                 break;
-            case 2:
+            case 5:
                 renderModes();
                 break;
             default:
@@ -394,6 +469,294 @@ public class MainActivity extends Activity {
         value.setTextSize(16);
         box.addView(value);
         return box;
+    }
+
+    // ---- 实时页（群聊动向）----
+
+    /**
+     * 拉 /live。force=true 是下拉/切页时：重置翻页锚点；
+     * 轮询（force=false）保留 liveOldestTs，拿到的新消息插在数组前面。
+     */
+    private void loadFeed(final boolean force) {
+        if (busy && !force) {
+            return;
+        }
+        setBusy(true);
+        final String group = liveGroup;
+        final long before = force ? 0 : liveOldestTs;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Api api = store.api();
+                Map<String, Object> st = null;
+                Map<String, Object> md = null;
+                Map<String, Object> lg = null;
+                String err = null;
+                boolean expired = false;
+                try {
+                    // 切页/下拉时顺带把心智页和日志页也刷了 —— 三页共享一套
+                    // 网络开销，一次轮询把该刷的都刷到，省得每页单独等。
+                    st = api.live(group, 60, before);
+                    if (force && group != null && !group.isEmpty()) {
+                        md = api.mind();
+                        lg = api.log(logLevel, logName, 180, 200);
+                    }
+                } catch (Api.ApiException exc) {
+                    err = Ui.explain(exc);
+                    expired = exc.code == 401;
+                } catch (Exception exc) {  // noqa
+                    err = Ui.explain(exc);
+                }
+                final Map<String, Object> fSt = st;
+                final Map<String, Object> fMd = md;
+                final Map<String, Object> fLg = lg;
+                final String fErr = err;
+                final boolean fExpired = expired;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        if (fExpired) {
+                            store.clearCookie();
+                            toast("登录过期了，重新登录一次");
+                            kickToLogin();
+                            return;
+                        }
+                        if (fErr != null && fSt == null) {
+                            banner.setTextColor(Theme.BAD);
+                            banner.setText(fErr);
+                            // 轮询失败不该清掉已有内容 —— 旧数据仍比空页有用
+                            return;
+                        }
+                        if (fSt != null) {
+                            liveData = fSt;
+                            liveGroup = Feed.currentGroup(fSt, liveGroup);
+                            List<Feed.Msg> msgs = Feed.messages(fSt);
+                            if (!msgs.isEmpty()) {
+                                liveOldestTs = msgs.get(msgs.size() - 1).ts;
+                            } else if (force) {
+                                liveOldestTs = 0;
+                            }
+                        }
+                        if (fMd != null) {
+                            mindData = fMd;
+                        }
+                        if (fLg != null) {
+                            logData = fLg;
+                        }
+                        if (tab == TAB_LIVE) {
+                            render();   // 实时页在轮询时保持新鲜
+                        }
+                    }
+                });
+            }
+        }, "live").start();
+    }
+
+    private void renderLive() {
+        if (liveData == null) {
+            content.addView(note("还没拿到群聊数据，下拉刷新"));
+            content.addView(bigButton("立即刷新", false, new Runnable() {
+                @Override
+                public void run() {
+                    loadFeed(true);
+                }
+            }));
+            return;
+        }
+        // 群选择器
+        List<Feed.Group> groups = Feed.groups(liveData);
+        content.addView(sectionTitle("群"));
+        if (groups.isEmpty()) {
+            content.addView(note("还没有任何群的消息记录"));
+        } else {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setPadding(Theme.dp(this, 6), Theme.dp(this, 4),
+                    Theme.dp(this, 6), Theme.dp(this, 4));
+            for (final Feed.Group g : groups) {
+                boolean cur = g.id.equals(liveGroup) || g.id.equals(Json.str(liveData, "group", ""));
+                Button b = new Button(this);
+                b.setText(g.label.replace("群 ", "") + (g.botMsgs > 0 ? "·机" : ""));
+                b.setAllCaps(false);
+                b.setTextSize(13);
+                b.setTextColor(cur ? Theme.BG : Theme.TEXT);
+                b.setBackgroundColor(cur ? Theme.ACCENT : Theme.CARD);
+                b.setPadding(Theme.dp(this, 8), 0, Theme.dp(this, 8), 0);
+                b.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        liveGroup = g.id;
+                        loadFeed(true);
+                    }
+                });
+                row.addView(b);
+            }
+            content.addView(row);
+        }
+
+        content.addView(sectionTitle("对话"));
+        List<Feed.Msg> msgs = Feed.messages(liveData);
+        if (msgs.isEmpty()) {
+            content.addView(note("该群还没抓到消息"));
+        } else {
+            for (int i = msgs.size() - 1; i >= 0; i--) {   // 新的在底部
+                content.addView(msgView(msgs.get(i)));
+            }
+        }
+        content.addView(note("自动刷新已" + (liveAutoRefresh ? "开"
+                : "关") + " · 只显示缓冲，不翻库"));
+        content.addView(bigButton(liveAutoRefresh ? "暂停自动刷新" : "开启自动刷新",
+                false, new Runnable() {
+                    @Override
+                    public void run() {
+                        liveAutoRefresh = !liveAutoRefresh;
+                        render();
+                    }
+                }));
+    }
+
+    private View msgView(Feed.Msg m) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.HORIZONTAL);
+        box.setGravity(Gravity.TOP);
+        int pad = Theme.dp(this, 12);
+        box.setPadding(pad, Theme.dp(this, 6), pad, Theme.dp(this, 6));
+
+        TextView who = new TextView(this);
+        who.setText(m.bot ? "🐟" : "👤");
+        who.setTextSize(15);
+        box.addView(who);
+
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(Theme.dp(this, 8), 0, 0, 0);
+
+        TextView meta = new TextView(this);
+        String tag = m.bot ? "机器人" : (m.who == null || m.who.isEmpty() ? "群友" : m.who);
+        meta.setText(tag + " · " + StatusFmt.dur(m.ts <= 0 ? -1
+                : Math.max(0, (System.currentTimeMillis() / 1000) - m.ts)) + "前");
+        meta.setTextColor(m.bot ? Theme.GOOD : Theme.DIM);
+        meta.setTextSize(12);
+        body.addView(meta);
+
+        TextView txt = new TextView(this);
+        txt.setText(m.bot ? ("⤷ " + Ui.stripMd(m.text)) : m.text);
+        txt.setTextColor(m.bot ? Theme.TEXT : Theme.DIM);
+        txt.setTextSize(15);
+        body.addView(txt);
+
+        if (m.reactions != null) {
+            TextView r = new TextView(this);
+            r.setText("└ 群友反应 " + m.reactions + " 条");
+            r.setTextColor(Theme.DIM);
+            r.setTextSize(12);
+            body.addView(r);
+        }
+        box.addView(body, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        return box;
+    }
+
+    // ---- 心智页（内在状态 + 行为判词 + 能力变化）----
+
+    private void renderMind() {
+        if (mindData == null) {
+            content.addView(note("还没拿到心智数据，切到实时页下拉一次"));
+            return;
+        }
+        Feed.MindPage page = Feed.mindPage(mindData);
+        content.addView(note(page.pluginSummary));
+        content.addView(note(page.dynamics));
+        if (!page.honesty.isEmpty()) {
+            content.addView(note(page.honesty));
+        }
+        if (page.revisions != null && !page.revisions.isEmpty()) {
+            content.addView(sectionTitle("能力变化"));
+            for (Feed.MindRow r : page.revisions) {
+                content.addView(note(r.text));
+            }
+        }
+        if (page.rows != null && !page.rows.isEmpty()) {
+            content.addView(sectionTitle("内在状态"));
+            for (Feed.MindRow r : page.rows) {
+                content.addView(note(r.text));
+            }
+        }
+        if (page.effects != null && !page.effects.isEmpty()) {
+            content.addView(sectionTitle("发出的话 & 反应"));
+            for (Feed.MindRow r : page.effects) {
+                content.addView(note(r.text));
+            }
+        }
+        if (!page.hasData) {
+            content.addView(note("还没有观测数据（dsh-mind / dsh-effect 可能刚部署）"));
+        }
+    }
+
+    // ---- 日志页 ----
+
+    private void renderLog() {
+        if (logData == null) {
+            content.addView(note("还没拿到日志，切到实时页下拉一次"));
+            return;
+        }
+        content.addView(sectionTitle("近期运行日志"));
+        List<Feed.LogLine> lines = Feed.logLines(logData);
+        if (lines.isEmpty()) {
+            content.addView(note("这个时间段没有日志"));
+        } else {
+            for (Feed.LogLine l : lines) {
+                LinearLayout box = new LinearLayout(this);
+                box.setOrientation(LinearLayout.HORIZONTAL);
+                box.setPadding(Theme.dp(this, 12), Theme.dp(this, 5),
+                        Theme.dp(this, 12), Theme.dp(this, 5));
+                TextView ts = new TextView(this);
+                ts.setText(l.ts);
+                ts.setTextColor(Theme.DIM);
+                ts.setTextSize(11);
+                box.addView(ts);
+                LinearLayout body = new LinearLayout(this);
+                body.setOrientation(LinearLayout.VERTICAL);
+                body.setPadding(Theme.dp(this, 8), 0, 0, 0);
+                TextView tag = new TextView(this);
+                tag.setText(l.tag == null || l.tag.isEmpty() ? "core" : l.tag);
+                tag.setTextColor(Theme.tone(l.tone));
+                tag.setTextSize(12);
+                body.addView(tag);
+                TextView text = new TextView(this);
+                text.setText(l.text);
+                text.setTextColor(Theme.tone(l.tone));
+                text.setTextSize(13);
+                body.addView(text);
+                box.addView(body, new LinearLayout.LayoutParams(0,
+                        ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                content.addView(box);
+            }
+        }
+        content.addView(note("显示最近 3 小时 · " + Json.str(logData, "name", "全部插件")
+                + " · " + logLevel));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        String[] picks = {"all", "info", "warn", "err"};
+        for (final String p : picks) {
+            boolean cur = p.equals(logLevel);
+            Button b = new Button(this);
+            b.setText(p);
+            b.setAllCaps(false);
+            b.setTextSize(13);
+            b.setTextColor(cur ? Theme.BG : Theme.TEXT);
+            b.setBackgroundColor(cur ? Theme.ACCENT : Theme.CARD);
+            b.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    logLevel = p;
+                    loadFeed(true);
+                }
+            });
+            row.addView(b);
+        }
+        content.addView(row);
     }
 
     // ---- 配置页 ----

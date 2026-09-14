@@ -216,9 +216,65 @@ public class Api {
         return post("/api/console/action", body, 200000);
     }
 
+    // ---------------------------------------------------------------- 观察页（v2）
+
+    /**
+     * /live：群聊合并流（群友消息 + 机器人发言），新的在前。
+     *
+     * limit 是本次要几条；before 是翻页锚点（上一页最旧那条的 ts）。
+     * 服务端按 (group, ts<before) 查，手机传什么就用什么，不自己缓存。
+     */
+    public Map<String, Object> live(String group, int limit, long before) throws ApiException {
+        String url = base + "/api/console/live";
+        if (group != null && !group.isEmpty()) {
+            url += "?group=" + urlEncode(group);
+        }
+        if (limit > 0) {
+            url += (url.contains("?") ? "&" : "?") + "limit=" + limit;
+        }
+        if (before > 0) {
+            url += "&before=" + before;
+        }
+        return get(url, 15000);
+    }
+
+    /** /mind：内在状态块 + 效应判词 + 能力变化 + 记分卡。 */
+    public Map<String, Object> mind() throws ApiException {
+        return get("/api/console/mind", 20000);
+    }
+
+    /**
+     * /log：日志尾巴。level = all/err/warn/info，name = 插件名（含 dsh-）。
+     */
+    public Map<String, Object> log(String level, String name, int minutes, int limit)
+            throws ApiException {
+        String url = base + "/api/console/log";
+        if (level != null && !level.isEmpty()) {
+            url += "?level=" + urlEncode(level);
+        }
+        if (name != null && !name.isEmpty()) {
+            url += (url.contains("?") ? "&" : "?") + "name=" + urlEncode(name);
+        }
+        if (minutes > 0) {
+            url += "&minutes=" + minutes;
+        }
+        if (limit > 0) {
+            url += "&limit=" + limit;
+        }
+        return get(url, 15000);
+    }
+
+    /** /rawconfig：全量配置（密钥掩码）。 */
+    public Map<String, Object> rawconfig() throws ApiException {
+        return get("/api/console/rawconfig", 15000);
+    }
+
     // ---------------------------------------------------------------- 底层
 
     private Map<String, Object> get(String path, int timeout) throws ApiException {
+        if (!path.startsWith("/")) {
+            path = "/" + path;  // live()/log() 拼 query 时可能丢头上的斜杠
+        }
         return call("GET", path, null, timeout);
     }
 

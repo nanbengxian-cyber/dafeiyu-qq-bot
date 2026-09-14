@@ -26,7 +26,11 @@ BT=$TOOLS/android-14
 ANDROID_JAR=$TOOLS/android-34/android.jar
 KEYSTORE=${KEYSTORE:-$PWD/release.jks}
 KS_PASS=${KS_PASS:?请设置 KS_PASS 环境变量（签名密钥口令）}
-KS_ALIAS=release
+# 密钥别名可配：仓库示例 keystore 叫 release，这台机器的 dsh-cloud-2026.jks
+# 叫 dshcloud。写死会在最后签名一步报 no such entry，前面的功夫全白费。
+# 版本号在 app/AndroidManifest.xml 里改（versionCode 每次发新包必须 +1，
+# 手机端自更新比对的就是它）。
+KS_ALIAS=${KS_ALIAS:-release}
 
 APP=app
 BUILD=build
@@ -89,16 +93,25 @@ R_JAVA=$(find "$BUILD/gen" -name 'R.java')
 say "编译 Java"
 # -source/-target 8：d8 认得 Java 8 字节码；再高会因为 android.jar 缺少
 # 新版本需要的运行时类型而失败。--release 不能用（它会屏蔽 -bootclasspath）。
-javac -encoding UTF-8 -nowarn \
+# 编译错误必须让整个构建失败：javac 失败时旧 build/ 里的 class 会被拿去
+# 继续打包，产出一个「签名有效但装上闪退」的残废包，比构建失败恶劣得多。
+if ! javac -encoding UTF-8 -nowarn \
   -source 8 -target 8 \
   -bootclasspath "$ANDROID_JAR" \
   -cp "$ANDROID_JAR" \
   -d "$BUILD/classes" \
-  "$R_JAVA" $APP/src/com/dafeiyu/console/*.java 2>&1 \
-  | grep -v 'bootstrap class path\|source value 8\|target value 8\|deprecat' || true
+  "$R_JAVA" $APP/src/com/dafeiyu/console/*.java 2>"$BUILD/javac.err"; then
+  grep -v 'bootstrap class path\|source value 8\|target value 8\|deprecat' "$BUILD/javac.err" >&2
+  die "javac 失败（上面是错误详情）"
+fi
+grep -v 'bootstrap class path\|source value 8\|target value 8\|deprecat' "$BUILD/javac.err" >&2 || true
 
 CLASS_N=$(find "$BUILD/classes" -name '*.class' | wc -l)
 [ "$CLASS_N" -gt 0 ] || die "javac 没产出 class"
+# 防残废包：Feed/MainActivity 这些核心类必须真的在产物里。
+for must in MainActivity Feed Api; do
+  [ -f "$BUILD/classes/com/dafeiyu/console/$must.class" ] || die "$must.class 缺失（编译被跳过？）"
+done
 say "  $CLASS_N 个 class"
 
 # ---------------------------------------------------------------- 4 dex

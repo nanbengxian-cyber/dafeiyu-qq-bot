@@ -11,6 +11,7 @@ public final class Main {
         KnobModelTest.run();
         ApiTest.run();
         UiTest.run();
+        FeedTest.run();
         System.exit(T.report());
     }
 }
