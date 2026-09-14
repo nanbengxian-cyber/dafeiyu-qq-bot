@@ -97,6 +97,18 @@ _SELF_QUERY_RE = re.compile(
     r"|(?:能不能|会不会|可不可以).{0,10}(?:画|看|听|说|搜|读|记|发|做)"
     r"|(?:自我感受|自我认知|能力状态)"
 )
+
+# [fix:relevance-gate-v1 2026-09-14] join/actions 相关性闸门。
+# 生产观测（dsh-mind observe_block，近24h 345轮）：join_review_history 472字
+# 345/345 全勤、recent_self_actions 285字全勤 —— 入群审核记录跟日常闲聊
+# 毫无关系却每轮注入，是每轮 4100~4800 字注入总量的两大来源。
+# 只在消息谈到相关话题时才注入；日常闲聊不塞。
+_JOIN_RE = re.compile(
+    r"入群|进群|加群|审核|新成员|新人|申请加|批准|拉人|谁进|进来的|踢|踢出|拒"
+)
+_ACTION_RE = re.compile(
+    r"你刚才|你之前|你上次|你最近|刚做|做过什么|干了什么|忙什么|上次|昨天|前天|经历"
+)
 try:
     ACTION_AGE = max(300.0, float(os.environ.get("DSH_SELFAWARE_ACTION_AGE", "86400")))
 except (TypeError, ValueError):
@@ -530,9 +542,13 @@ class Main(star.Star):
                     long_block = render_long_self(self.sense)
                     if long_block:
                         sense_blocks.append(long_block)
+            # [fix:relevance-gate-v1] join/actions 只在话题相关时注入（见 _JOIN_RE 注释）
+            text = str(getattr(event, "message_str", "") or "")
+            want_joins = attributable and bool(_JOIN_RE.search(text))
+            want_actions = attributable and bool(_ACTION_RE.search(text))
             blocks = build_blocks(
-                read_join_history() if attributable else [],
-                recent_actions() if attributable else [],
+                read_join_history() if want_joins else [],
+                recent_actions() if want_actions else [],
                 sense_blocks=sense_blocks,
             )
             for block in blocks:
