@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>大肥鱼行为节点 · 离线编辑器</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <strong>大肥鱼行为节点</strong>
+  <span class="badge">临时编辑 · 刷新或切换示例会丢失修改 · 不连接 QQ</span>
+  <label class="graph-picker">示例图 <select id="graph" aria-label="选择示例图"></select></label>
+  <button id="validate" type="button">检查图</button>
+  <button id="run" type="button">▶ 运行</button>
+  <button id="replay" type="button" disabled>↻ 录制重放</button>
+  <span id="status" role="status" aria-live="polite">准备就绪</span>
+</header>
+<main>
+  <aside class="left-panel">
+    <h2>节点库</h2>
+    <div id="palette"></div>
+    <p class="hint">点击添加节点；点击输出端口后，再点击类型兼容的输入端口即可连线。</p>
+  </aside>
+  <section id="viewport" aria-label="节点画布">
+    <svg id="edges" aria-hidden="true"></svg>
+    <div id="nodes"></div>
+  </section>
+  <aside class="right-panel">
+    <div class="panel-heading"><h2>检查器</h2><button id="delete-node" class="danger" type="button" disabled>删除节点</button></div>
+    <div id="inspector" class="hint">点击节点查看并编辑配置。</div>
+  </aside>
+</main>
+<section id="bottom">
+  <div><h2>运行结果</h2><pre id="result">尚未运行</pre></div>
+  <div><h2>执行轨迹</h2><ol id="trace"></ol></div>
+  <div><h2>节点详情</h2><pre id="detail">点击轨迹查看输入输出</pre></div>
+</section>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

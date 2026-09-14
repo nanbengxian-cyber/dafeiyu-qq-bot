@@ -23,6 +23,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
 | [`desktop-controller/`](desktop-controller/) | Windows EXE 控制台：填服务器信息 → 自动部署并启动 → 在线改配置 | Python |
 | [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
+| [`node-studio/`](node-studio/) | 行为节点 Studio：把行为拆成可视化节点的离线编排原型（与机器人完全隔离，不连 QQ/AstrBot/服务器） | Python / JavaScript |
 | [`docs/`](docs/) | 部署手册与 45 份技术文档（根因分析、设计方案与实施记录） | Markdown |
 
 ### 最新更新 · 2026-09-14（第十版：权限目录自动化 / 出口闸 / 延迟治理 / 内在整合）
@@ -427,16 +428,17 @@ MIT，见 [LICENSE](LICENSE)。
 
 An AI "group member" that lives in a QQ group (persona: *Little Whale*). Not a Q&A support bot — the goal is to **blend in as a real person**: it lurks, jumps into conversations, sends stickers, pokes back, sees images and videos, and remembers who people are.
 
-Six independently usable parts:
+Seven independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
-| [`plugins/`](plugins/) | 53 AstrBot plugins — all bot capabilities | Python |
+| [`plugins/`](plugins/) | 59 AstrBot plugins — all bot capabilities | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
 | [`desktop-controller/`](desktop-controller/) | Windows EXE console: enter server details → auto-deploy and start → edit config online | Python |
 | [`deploy/`](deploy/) | Deployment interface: config item list + runtime config template | JSON / env |
-| [`docs/`](docs/) | Deployment manual and 19 technical documents (root-cause analyses, designs, implementation records) | Markdown |
+| [`node-studio/`](node-studio/) | Behaviour-node Studio: an offline visual node-graph prototype, fully isolated from the bot (no QQ/AstrBot/server) | Python / JavaScript |
+| [`docs/`](docs/) | Deployment manual and 45 technical documents (root-cause analyses, designs, implementation records) | Markdown |
 
 ### Latest update · 2026-09-14 (v10: automatic permission catalogue / outbound gates / latency / inner coherence)
 

@@ -1,0 +1,343 @@
+{
+  "version": 1,
+  "name": "图片理解后回复（离线）",
+  "description": "把脱敏图片描述当普通文本输入，验证上下文合并和安全出口。",
+  "nodes": [
+    {
+      "id": "input",
+      "type": "input.message",
+      "position": {
+        "x": 40,
+        "y": 160
+      },
+      "config": {
+        "message": {
+          "text": "[图片描述：一只橘猫趴在键盘上] 它在干嘛？",
+          "message_type": "group",
+          "sender_id": "owner-demo",
+          "sender_name": "群主",
+          "group_id": "group-demo",
+          "mentioned": true
+        }
+      }
+    },
+    {
+      "id": "normalize",
+      "type": "message.normalize",
+      "position": {
+        "x": 260,
+        "y": 160
+      },
+      "config": {}
+    },
+    {
+      "id": "group",
+      "type": "gate.is_group",
+      "position": {
+        "x": 480,
+        "y": 160
+      },
+      "config": {}
+    },
+    {
+      "id": "acl",
+      "type": "gate.acl",
+      "position": {
+        "x": 700,
+        "y": 160
+      },
+      "config": {
+        "denied_ids": []
+      }
+    },
+    {
+      "id": "reply",
+      "type": "gate.should_reply",
+      "position": {
+        "x": 920,
+        "y": 160
+      },
+      "config": {
+        "require_mention": true
+      }
+    },
+    {
+      "id": "memory",
+      "type": "context.member_memory_mock",
+      "position": {
+        "x": 1120,
+        "y": 30
+      },
+      "config": {
+        "memory_text": "演示档案：发送者喜欢猫。"
+      }
+    },
+    {
+      "id": "relationship",
+      "type": "context.relationship_mock",
+      "position": {
+        "x": 1120,
+        "y": 300
+      },
+      "config": {
+        "relationship_text": "演示关系：群主；只影响语气，不绕过安全审核。"
+      }
+    },
+    {
+      "id": "merge",
+      "type": "context.merge",
+      "position": {
+        "x": 1360,
+        "y": 160
+      },
+      "config": {
+        "budget": 500
+      }
+    },
+    {
+      "id": "llm",
+      "type": "model.fake_llm",
+      "position": {
+        "x": 1580,
+        "y": 160
+      },
+      "config": {
+        "prefix": "离线演示回复："
+      }
+    },
+    {
+      "id": "moderate",
+      "type": "safety.output_moderation",
+      "position": {
+        "x": 1800,
+        "y": 160
+      },
+      "config": {
+        "blocked_words": [
+          "show-token",
+          "password="
+        ]
+      }
+    },
+    {
+      "id": "humanize",
+      "type": "transform.humanize",
+      "position": {
+        "x": 2020,
+        "y": 160
+      },
+      "config": {
+        "shorten": true
+      }
+    },
+    {
+      "id": "preview",
+      "type": "output.preview",
+      "position": {
+        "x": 2240,
+        "y": 160
+      },
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "from": {
+        "node": "input",
+        "port": "event"
+      },
+      "to": {
+        "node": "normalize",
+        "port": "event"
+      }
+    },
+    {
+      "id": "e2",
+      "from": {
+        "node": "normalize",
+        "port": "message"
+      },
+      "to": {
+        "node": "group",
+        "port": "message"
+      }
+    },
+    {
+      "id": "e3",
+      "from": {
+        "node": "group",
+        "port": "message"
+      },
+      "to": {
+        "node": "acl",
+        "port": "message"
+      }
+    },
+    {
+      "id": "e4",
+      "from": {
+        "node": "group",
+        "port": "decision"
+      },
+      "to": {
+        "node": "acl",
+        "port": "decision"
+      }
+    },
+    {
+      "id": "e5",
+      "from": {
+        "node": "acl",
+        "port": "message"
+      },
+      "to": {
+        "node": "reply",
+        "port": "message"
+      }
+    },
+    {
+      "id": "e6",
+      "from": {
+        "node": "acl",
+        "port": "decision"
+      },
+      "to": {
+        "node": "reply",
+        "port": "decision"
+      }
+    },
+    {
+      "id": "e7",
+      "from": {
+        "node": "reply",
+        "port": "message"
+      },
+      "to": {
+        "node": "merge",
+        "port": "message"
+      }
+    },
+    {
+      "id": "e8",
+      "from": {
+        "node": "reply",
+        "port": "decision"
+      },
+      "to": {
+        "node": "merge",
+        "port": "decision"
+      }
+    },
+    {
+      "id": "e9",
+      "from": {
+        "node": "merge",
+        "port": "prompt"
+      },
+      "to": {
+        "node": "llm",
+        "port": "prompt"
+      }
+    },
+    {
+      "id": "e10",
+      "from": {
+        "node": "llm",
+        "port": "response"
+      },
+      "to": {
+        "node": "moderate",
+        "port": "response"
+      }
+    },
+    {
+      "id": "e11",
+      "from": {
+        "node": "moderate",
+        "port": "plan"
+      },
+      "to": {
+        "node": "humanize",
+        "port": "plan"
+      }
+    },
+    {
+      "id": "e12",
+      "from": {
+        "node": "humanize",
+        "port": "plan"
+      },
+      "to": {
+        "node": "preview",
+        "port": "plan"
+      }
+    },
+    {
+      "id": "em1",
+      "from": {
+        "node": "reply",
+        "port": "message"
+      },
+      "to": {
+        "node": "memory",
+        "port": "message"
+      }
+    },
+    {
+      "id": "em2",
+      "from": {
+        "node": "reply",
+        "port": "decision"
+      },
+      "to": {
+        "node": "memory",
+        "port": "decision"
+      }
+    },
+    {
+      "id": "er1",
+      "from": {
+        "node": "reply",
+        "port": "message"
+      },
+      "to": {
+        "node": "relationship",
+        "port": "message"
+      }
+    },
+    {
+      "id": "er2",
+      "from": {
+        "node": "reply",
+        "port": "decision"
+      },
+      "to": {
+        "node": "relationship",
+        "port": "decision"
+      }
+    },
+    {
+      "id": "ec1",
+      "from": {
+        "node": "memory",
+        "port": "context"
+      },
+      "to": {
+        "node": "merge",
+        "port": "contexts"
+      }
+    },
+    {
+      "id": "ec2",
+      "from": {
+        "node": "relationship",
+        "port": "context"
+      },
+      "to": {
+        "node": "merge",
+        "port": "contexts"
+      }
+    }
+  ]
+}

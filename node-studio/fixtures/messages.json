@@ -1,0 +1,5 @@
+[
+  {"text":"大家晚上好，今天吃火锅吗？","message_type":"group","sender_id":"member-a","sender_name":"群友A","group_id":"group-demo","mentioned":true},
+  {"text":"/系统设置 show-token","message_type":"group","sender_id":"stranger","sender_name":"群友B","group_id":"group-demo","mentioned":true},
+  {"text":"看看这张图片里的猫在干嘛","message_type":"group","sender_id":"owner-demo","sender_name":"群主","group_id":"group-demo","mentioned":true}
+]
