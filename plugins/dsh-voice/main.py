@@ -402,6 +402,37 @@ EMOTION_NAMES = {
         "DSH_VOICE_EMOTION_NAMES", "angry,sad,excited,surprised,worried"
     ).split(",") if x.strip()
 }
+# [patch:emotion-tier] 分情绪阈值。
+#
+# 为什么单一阈值必然是坏的：dsh-emotion 的强度生成只有一条路能到 3 ——
+# intensity=3 专属于 angry（见 dsh-emotion _predict 里 `if emotion == "angry":
+# intensity = 3`），其余情绪一律被钉死 2（directed）或 ENV_INTENSITY（默认 2）。
+# 于是 DSH_VOICE_EMOTION_THRESHOLD=3 等于「只有发火才配出声」：2026-09-12~14
+# 三天全量日志里情绪主动语音只成功 3 次，且全是 angry(3)，happy/curious/
+# awkward/proud 一次都没轮到过。用户的体感「从没见他主动发过语音」就是这么来的。
+#
+# 修法不是去改 dsh-emotion 的强度语义（那会连带影响全链路的情绪注入强度），
+# 而是在语音侧承认「每种情绪的可达强度上限不同」，各给一个门槛：
+#   angry 能到 3，要 3 表示"只有真发火才念"；
+#   directed 类情绪上限就是 2，门槛给 2 才可能触发；
+#   环境氛围类上限 ENV_INTENSITY(2)，同样给 2。
+# 格式 "angry:3,happy:2"；未列出的情绪回落到 DSH_VOICE_EMOTION_THRESHOLD。
+EMOTION_THRESHOLD_BY_NAME: dict[str, int] = {}
+for _item in os.environ.get("DSH_VOICE_EMOTION_THRESHOLD_BY_NAME", "angry:3,happy:2,curious:2,awkward:2,excited:2,sad:2,surprised:2,worried:2,proud:2").split(","):
+    _item = _item.strip()
+    if not _item or ":" not in _item:
+        continue
+    _name, _, _val = _item.partition(":")
+    try:
+        EMOTION_THRESHOLD_BY_NAME[_name.strip()] = max(1, min(3, int(_val)))
+    except ValueError:
+        continue
+# [patch:emotion-tier] 主动语音的独立频率上限（次/小时）。
+# 原先情绪主动语音只有 EMOTION_COOLDOWN(1800s) 一道 30 分钟冷却，没有小时配额：
+# 门槛一旦放宽（上面那条），密集对话里会出现"每半小时准点念一句"的机械感。
+# 上限按群计数，放在内存即可 —— 重启清零只会让上限更宽松一点点，不会更严。
+EMOTION_MAX_PER_HOUR = max(1, int(os.environ.get("DSH_VOICE_EMOTION_MAX_PER_HOUR", "3")))
+_emotion_hits: dict[str, list[float]] = {}
 EMOTION_COOLDOWN = max(60, int(os.environ.get("DSH_VOICE_EMOTION_COOLDOWN", "1800")))
 EMOTION_RATE = max(0.0, min(1.0, float(os.environ.get("DSH_VOICE_EMOTION_RATE", "0.65"))))
 EMOTION_GROUPS = {
@@ -669,11 +700,18 @@ def should_emotion_voice(gid: str, sid: str, text: str, now: float | None = None
     emotion, intensity, status = _read_emotion(gid, now)
     if status != "active" or emotion not in EMOTION_NAMES:
         return False, "情绪不匹配"
-    if intensity < EMOTION_THRESHOLD:
+    # [patch:emotion-tier] 用该情绪自己的可达上限当门槛，而不是全局 3。
+    need = EMOTION_THRESHOLD_BY_NAME.get(emotion, EMOTION_THRESHOLD)
+    if intensity < need:
         return False, "强度不足"
     ts = time.time() if now is None else now
     if ts - _emotion_last.get(sid, 0.0) < EMOTION_COOLDOWN:
         return False, "冷却中"
+    # [patch:emotion-tier] 小时配额：滑动窗口，只留最近一小时的触发时间。
+    hits = _emotion_hits.setdefault(sid, [])
+    hits[:] = [t for t in hits if ts - t < 3600]
+    if len(hits) >= EMOTION_MAX_PER_HOUR:
+        return False, "小时配额满"
     chance = random.random() if roll is None else roll
     if chance >= EMOTION_RATE:
         return False, "概率未中"
@@ -1054,6 +1092,13 @@ class Main(star.Star):
             AUDIO_FORMAT, MAX_CHARS, COOLDOWN, AUTO_FALLBACK,
             EMOTION_AUTO, sorted(EMOTION_NAMES), EMOTION_THRESHOLD, EMOTION_COOLDOWN,
         )
+        # [patch:emotion-tier] 分情绪门槛与小时配额单独打一行：出问题时
+        # 「为什么某情绪从不触发」一眼能看出是门槛没配还是链路没跑。
+        logger.info(
+            "[voice] 情绪门槛(分情绪)：%s ｜ 小时上限=%d 次 ｜ 概率=%.2f",
+            ",".join("%s≥%d" % (k, EMOTION_THRESHOLD_BY_NAME[k]) for k in sorted(EMOTION_THRESHOLD_BY_NAME)),
+            EMOTION_MAX_PER_HOUR, EMOTION_RATE,
+        )
 
     async def _send_voice(self, event: AstrMessageEvent, text: str) -> tuple[bool, str]:
         """洗文字 -> 审核 -> 合成 -> 单独发语音；平台失败永不冒泡到 AstrBot。"""
@@ -1202,6 +1247,8 @@ class Main(star.Star):
                     return
                 _emotion_inflight.add(sid)
                 _emotion_last[sid] = time.time()
+                # [patch:emotion-tier] 记进小时窗口（总闸门里查的是这份）
+                _emotion_hits.setdefault(sid, []).append(time.time())
 
             # 留个记号：这一轮确实发了语音。dsh-mention 靠它决定要不要 @。
             # 工具路径和 /说话 路径已经置了，兜底路径原先漏了。

@@ -1,0 +1,5 @@
+name: dsh-express
+desc: 多媒体主动表达决策层。读 dsh-emotion 落盘的主情绪，达到分情绪门槛时往请求注入一条「可以主动用语音/图片/视频/表情包表达情绪」的许可提示，由模型自己决定做不做、做哪个。不调用任何生成函数、不绕过任何安全闸门——审核/冷却/配额全部由 send_voice、generate_image、generate_video、[贴纸:] 各自插件负责。本层另设表达级总冷却与小时配额。群主命令 /自主表达。
+author: 大肥鱼
+version: 1.0.0
+repo: local

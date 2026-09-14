@@ -1,5 +1,5 @@
 name: dsh-voice
-desc: 语音（TTS）插件。Fish Audio/悟声主链、Edge ReadAloud 独立兜底，提供 LLM 工具、/说话、显式请求兜底，并可在 dsh-emotion 主情绪达到阈值时主动用语音表达；支持审核、音色、降级、冷却与限长。QQ NT 发送回执超时时按已送达收口：不重发、不往群里播报机制（1.2.3 修「这次语音没确认发出去」假报错）。
+desc: 语音（TTS）插件。Fish Audio/悟声主链、Edge ReadAloud 独立兜底，提供 LLM 工具、/说话、显式请求兜底，并可在 dsh-emotion 主情绪达到阈值时主动用语音表达；支持审核、音色、降级、冷却与限长。QQ NT 发送回执超时时按已送达收口：不重发、不往群里播报机制（1.2.3 修「这次语音没确认发出去」假报错）。1.2.5 情绪主动语音改为分情绪门槛（angry≥3，其余情绪≥2）＋小时配额：原先全局阈值 3 而 dsh-emotion 只有 angry 能到 3，等于只有发火才出声，三天只触发 3 次。
 author: 大肥鱼
-version: 1.2.4
+version: 1.2.5
 repo: local
