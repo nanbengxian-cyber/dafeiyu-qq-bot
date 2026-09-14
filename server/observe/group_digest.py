@@ -20,8 +20,8 @@ import sys
 from datetime import datetime, timedelta
 
 LOG_PATH = "/opt/qqbot/astrbot/data/logs/astrbot.log"
-GROUP_ID = "476573490"
-BOT_QQ = "3752949717"
+GROUP_ID = "100000001"
+BOT_QQ = "3752949000"
 
 TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{3})\]")
 IN_RE = re.compile(r"\[default\] \[default\(aiocqhttp\)\] (.+?)/(\d+): (.*)$")
@@ -115,7 +115,7 @@ def render(events, show_plug=True):
     for ev in events:
         stamp = ev["t"].strftime("%H:%M:%S")
         if ev["kind"] == "user":
-            tag = "★群主" if ev["qq"] == "2774067216" else ""
+            tag = "★群主" if ev["qq"] == "2774000001" else ""
             if ev["qq"] == BOT_QQ:
                 tag = "☆机器人自己"
             out.append("%s  %s(%s) %s: %s" % (stamp, ev["who"], ev["qq"], tag, fmt_text(ev["text"])))

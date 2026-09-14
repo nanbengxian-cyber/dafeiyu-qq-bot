@@ -98,8 +98,8 @@ print("   口癖层改动 0 条 ✓（%d 条里连一条都没碰）" % len(CLEA
 # ---------------------------------------------------------------- 3. 口癖只剥不刹
 print("\n=== 3. 口癖不触发会话刹车（AI 腔才刹）===")
 mt, _ = build([], tics=["大半夜的", "大半夜"])
-r1 = mt.inspect("大半夜的，谁是你宝宝", "476573490", 1000.0)
-r2 = mt.inspect("亲什么亲 大半夜的", "476573490", 1010.0)   # 10 秒后，在 180s 窗口内
+r1 = mt.inspect("大半夜的，谁是你宝宝", "100000001", 1000.0)
+r2 = mt.inspect("亲什么亲 大半夜的", "100000001", 1010.0)   # 10 秒后，在 180s 窗口内
 ck(r1["tic_hits"], "口癖没被记到 tic_hits：%r" % r1)
 ck(not r1["dyn_hits"], "口癖串进了 dyn_hits：%r" % r1["dyn_hits"])
 ck(not r2["brake"], "口癖触发了整条拦（应该只剥不刹）：%r" % r2)
@@ -109,8 +109,8 @@ print("   口癖连击 2 次 brake=%s ✓（该剥的照样剥：%s）"
 mr, _ = build([], tics=[])
 mr.dyn.data["解释"] = {"count": 99, "last_ts": 1000.0, "active": True}
 mr.roots = set(mr.roots) | {"解释"}
-q1 = mr.inspect("我来解释一下这个", "476573490", 2000.0)
-q2 = mr.inspect("简单解释就是 A", "476573490", 2010.0)
+q1 = mr.inspect("我来解释一下这个", "100000001", 2000.0)
+q2 = mr.inspect("简单解释就是 A", "100000001", 2010.0)
 ck(q1["dyn_hits"], "AI 腔词根没被记到 dyn_hits：%r" % q1)
 ck(q2["brake"], "AI 腔词根没触发刹车（原有行为被改坏了）：%r" % q2)
 print("   AI 腔词根连击 2 次 brake=%s ✓（原有刹车行为保持不变）" % q2["brake"])
@@ -149,7 +149,7 @@ class FakeEvent:
         return self._gid
 
     def get_self_id(self):
-        return "3752949717"
+        return "3752949000"
 
     @property
     def unified_msg_origin(self):

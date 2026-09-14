@@ -42,10 +42,14 @@
 
 import asyncio
 import hashlib
+import ipaddress
 import io
 import os
 import re
+import socket
 import time
+import weakref
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from PIL import Image as PILImage
@@ -118,9 +122,70 @@ CACHE_MAX = int(os.environ.get("DSH_IMGCTX_CACHE", "300"))
 _caption_cache: dict[str, str] = {}
 # 插入顺序，用于超出 CACHE_MAX 时淘汰最旧的
 _cache_order: list[str] = []
-# 正在后台预转述的图：file key -> Task。避免同一张图被并行转述两次
-# （连发同一张表情包时很容易撞上），也兼作并发上限。
+# 正在转述的图：key -> Task。所有前台/后台路径共用，避免重复调用视觉模型。
 _inflight: dict[str, "asyncio.Task"] = {}
+_INFLIGHT_OWNERS: "weakref.WeakKeyDictionary[asyncio.Task, Main]" = weakref.WeakKeyDictionary()
+
+# 下载安全策略：手动跟随重定向，每一跳重新校验 DNS/IP。
+MAX_REDIRECTS = int(os.environ.get("DSH_IMGCTX_MAX_REDIRECTS", "4"))
+
+
+def _is_public_ip(host: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0].split("%", 1)[0]).is_global:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+async def _check_public_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    return await asyncio.to_thread(_is_public_ip, parsed.hostname)
+
+
+class _PublicResolver(aiohttp.abc.AbstractResolver):
+    async def resolve(self, host, port=0, family=socket.AF_UNSPEC):
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, port, family, socket.SOCK_STREAM
+        )
+        out, seen = [], set()
+        for fam, _stype, proto, _canon, sockaddr in infos:
+            addr = sockaddr[0].split("%", 1)[0]
+            try:
+                if not ipaddress.ip_address(addr).is_global:
+                    raise OSError("DNS 解析到非公网地址，已拒绝")
+            except ValueError as exc:
+                raise OSError("解析出的地址不合法") from exc
+            key = (fam, addr, port)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"hostname": host, "host": addr, "port": port,
+                        "family": fam, "proto": proto,
+                        "flags": socket.AI_NUMERICHOST})
+        if not out:
+            raise OSError("域名解析不到地址")
+        return out
+
+    async def close(self):
+        return None
+
+
+def _public_connector() -> aiohttp.TCPConnector:
+    return aiohttp.TCPConnector(resolver=_PublicResolver(), use_dns_cache=False)
 
 # 框架已经成功转述过图片的标记。命中任一即说明这一轮不用我们插手。
 _FRAMEWORK_OK_MARKERS = (
@@ -384,13 +449,21 @@ class Main(star.Star):
 
     # ------------------------------------------------ 下载 + 转述
 
-    async def _fetch(self, session: aiohttp.ClientSession, url: str) -> bytes | None:
+    async def _fetch(self, session: aiohttp.ClientSession, url: str, hops: int = 0) -> bytes | None:
         """下载图片，只返回字节。
 
         不落原始文件：真正需要落盘的是给视觉模型的那张 JPEG，
         原始 GIF 可能有 2MB（实测群里有 49 帧 2083KB 的），没必要写小硬盘。
         """
-        async with session.get(url) as resp:
+        if hops > MAX_REDIRECTS or not await _check_public_url(url):
+            logger.warning("[imgctx] 拒绝非公网图片 URL 或重定向过多")
+            return None
+        async with session.get(url, allow_redirects=False) as resp:
+            if resp.status in {301, 302, 303, 307, 308}:
+                location = resp.headers.get("Location")
+                if location:
+                    return await self._fetch(session, urljoin(url, location), hops + 1)
+                return None
             if resp.status != 200:
                 # 常见原因是 URL 里的 rkey 过期（实测约 18 分钟就变 400）
                 logger.warning("[imgctx] 下载图片失败 HTTP %s", resp.status)

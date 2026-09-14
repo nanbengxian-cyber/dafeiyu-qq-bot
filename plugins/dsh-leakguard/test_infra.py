@@ -31,7 +31,7 @@ RX_OUT = re.compile(
     r"respond\.stage:\d+\]: Prepare to send - \S+?/\d+: (.*)$"
 )
 LOGS = "/AstrBot/data/logs"
-BOT = "3752949717"
+BOT = "3752949000"
 
 
 def read_lines():

@@ -55,6 +55,6 @@ assert not decision("/联网状态", roll=0.0)[0]
 
 # 查询清理：不要把 QQ 展示型 @ 和聊天填充词带给搜索引擎。
 assert m.build_association_query("话说，哈基米这个梗哪来的？") == "哈基米这个梗哪来的"
-assert m.build_association_query("@难谓言(2774067216) DeepSeek最近有什么更新？") == "DeepSeek最近有什么更新"
+assert m.build_association_query("@难谓言(2774000001) DeepSeek最近有什么更新？") == "DeepSeek最近有什么更新"
 
 print("ASSOCIATION_LOGIC_TEST_OK")

@@ -2,9 +2,9 @@
 
 [中文](#中文) · [English](#english)
 
-一套让 QQ 群机器人「像真人群友一样说话」的完整工程：53 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App、一个 Windows 桌面控制台，以及记录每个问题根因与实测数据的技术文档。
+一套让 QQ 群机器人「像真人群友一样说话」的完整工程：59 个 AstrBot 插件、一个 QQ↔AI 桥接程序、一个安卓控制台 App、一个 Windows 桌面控制台，以及记录每个问题根因与实测数据的技术文档。
 
-A complete engineering effort to make a QQ group bot *talk like an actual group member*: 53 AstrBot plugins, a QQ↔AI bridge, an Android console app, a Windows desktop controller, and technical documents recording the root cause and measured data behind every fix.
+A complete engineering effort to make a QQ group bot *talk like an actual group member*: 59 AstrBot plugins, a QQ↔AI bridge, an Android console app, a Windows desktop controller, and technical documents recording the root cause and measured data behind every fix.
 
 ---
 
@@ -18,14 +18,70 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
-| [`plugins/`](plugins/) | 53 个 AstrBot 插件 —— 机器人的全部能力 | Python |
+| [`plugins/`](plugins/) | 59 个 AstrBot 插件 —— 机器人的全部能力 | Python |
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
 | [`desktop-controller/`](desktop-controller/) | Windows EXE 控制台：填服务器信息 → 自动部署并启动 → 在线改配置 | Python |
 | [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
-| [`docs/`](docs/) | 部署手册与 19 份技术文档（根因分析、设计方案与实施记录） | Markdown |
+| [`docs/`](docs/) | 部署手册与 45 份技术文档（根因分析、设计方案与实施记录） | Markdown |
 
-### 最新更新 · 2026-09-09（第八版：社交关系 / 自身利益 / 联网出口审核）
+### 最新更新 · 2026-09-14（第十版：权限目录自动化 / 出口闸 / 延迟治理 / 内在整合）
+
+第十版是一次**大范围加固**：把「像真人」从说话方式推进到**边界、速度与自我一致性**，
+并修掉一批会让机器人「当着全群的面出洋相」的漏点。第九版并入本版，未单独发布。
+
+- **权限目录自动化（[`dsh-acl`](plugins/dsh-acl/) 2.0.0）。** 老版目录靠人工登记，
+  装新插件后经常忘了补 → 群主 `/权限` 看不到自己有什么。新版改为**启动时 AST 扫描实际安装的
+  `@filter.command`**，手工表只负责分档：目录不再是「记得登记什么」，而是「机器上真有什么」。
+  当前实测 **109 条（owner 60／admin 24／所有人 25）**，三条 AstrBot WebUI 专属指令
+  （`name`/`provider`/`dashboard_update`）显式剔除 —— 它们受 WebUI 账号体系限制，QQ 身份永远过不了，
+  留在目录里等于骗群主。扫描失败退回静态表，绝不让 `/权限` 变空。完整分档见
+  [群权限手册](docs/群权限手册.md)。
+- **贴纸标记泄漏的第三条出口（[`dsh-sticker`](plugins/dsh-sticker/) 1.2.0）。**
+  群主报「还是会发 `[贴纸:装酷]` 这种图纸文字」，而扫了 15350 条出站正文却是 0 次。真因：
+  真语料在**群友的引用块**里 —— 第一轮只包了 `AstrMessageEvent.send`，而 `dsh-merge` 走的是
+  另一条并列的平台出口 **`star.Context.send_message`**（先 `llm_generate` 生成再按 session 直发，
+  既不过装饰钩子也不过 `event.send`）。修法：给 `Context.send_message` 加同名兜底闸，复用同一个
+  `guard_outgoing`，并同时覆盖内置 `send_message_to_user` 工具。细节见
+  [78-贴纸标记泄漏的第三条出口](docs/78-贴纸标记泄漏的第三条出口-Context-send_message-20260913.md)。
+- **回话变快：识图档位顺序（[`dsh-vischain`](plugins/dsh-vischain/)）。** 群主说「主要限制就是速率太慢了」。
+  量了近 70000 行日志，按档拆开后：**369 次成功识图背后 293 次失败重试白花 2190 秒，
+  等于每成功转述一张图平均多等 5.9 秒**，其中 58% 的失败是撞满 10 秒硬超时。根因是**档位顺序**
+  而非超时 —— 已死的档排在最前，每次都要先撞满 10 秒才轮到真能用的档。改成「白花过时间的档排到最后」
+  并按 180s→360s→720s 递增退避（不拉黑、仍兜底）。两处反向验证也记下来了：① **把超时从 10s 降到
+  8s 会误杀 15.5% 的成功调用**，所以超时值本身是对的，不该动；② 第一版因**全角括号**匹配错误，
+  把成绩算成「114 次成功、平均白花 16.4 秒」，**数字整整错了三倍** —— 这份文档保留了那次误算。
+  见 [68-识图链条白花时间治理](docs/68-识图链条白花时间治理-20260912.md) /
+  [82-识图档位顺序与看护重启循环](docs/82-识图档位顺序与看护重启循环-20260913.md)。
+- **掉线却显示在线（[`server/observe`](server/observe/)）。** 探针只看**下行**（还收得到群消息）
+  就判在线，而真实故障是**上行**发不出去 —— 账号在、消息全丢，表现成「静默变笨」。
+  加一条上行发送链路检测，`online` 与 `good` 分开报。
+- **内在状态总线（[`dsh-mind`](plugins/dsh-mind/)）。** 群主问「有没有一种方案可以整合目前的主动行为，
+  而不再是独立分支的独岛」。量化后发现真相比感觉更糟：**11 个状态存储、33 个插件各塞各的块、
+  约 50 种标签**，而**没有任何一处代码知道**这一轮有几个岛在说话、矛不矛盾、占多少字。
+  所以 P0 只建**只读观测层、不改任何行为**（docs/71 的反事实回放是同族教训）：每轮一行 `岛=N/11`
+  日志 + 一条只记「标签+字数」的记录，绝不注入、绝不写别人的状态、绝不阻止回复。见
+  [83-内在状态总线与仲裁层](docs/83-内在状态总线与仲裁层-20260913.md)。
+- **不再像机器（[`dsh-aiflavour`](plugins/dsh-aiflavour/) / [`dsh-voice`](plugins/dsh-voice/) / [`dsh-typo`](plugins/dsh-typo/)）。**
+  三处「一眼看出是 AI」的量测与修法：① 口癖 `大半夜(的)` **21 次 / 71 倍于群友**，做了口癖层剥除
+  （**只剥不刹** —— 整条拦会让它该说话时哑掉）；② `慢点，还有 N 秒冷却` 114 次，换成 6 句轮换人话
+  （**「冷却」是纯机器词**，且换话术必须同时给变体，否则新话术自己会变成新口头禅）；
+  ③ 打错字的自我纠正率 35%→8%，对齐到与群友同量级（0.83‰ vs 0.87‰）。见
+  [70](docs/70-口头禅与自我纠正频率对齐-20260913.md) / [73](docs/73-系统提示不该说机器话-20260913.md) / [75](docs/75-机器人口癖-大半夜的-20260913.md)。
+- **基础设施报错不进群（[`dsh-leakguard`](plugins/dsh-leakguard/)）。** 机器人 **11 次把 API 原始报错
+  当回复发进群**（带 traceId、余额不足、retryAfterSeconds，2026-09-10 四分钟连发 9 条）。不动框架，
+  在出口拦成**沉默**（成串报错下换固定话术反而更像机器）。指纹防误杀用 11 条真实报错 + 8662 条真实
+  聊天回测，**0 误伤**。见 [72-基础设施报错不进群](docs/72-基础设施报错不进群-20260913.md)。
+- **控制台实时观察层（[`console/`](console/) v1.1）。** App 从「只看状态 + 改配置」扩成
+  「实时看机器人在干啥」：新增 4 个只读端点 + 三个页签（实时／心智／日志），复用现有鉴权，不新增写入口。
+  见 [84-控制台实时观察层](docs/84-控制台实时观察层-v1.1-20260914.md)。
+- **意志执行层（[`dsh-will`](plugins/dsh-will/)，新插件）。** 起因是「机器人要学会真正的反抗」。
+  拿真实消息回放旧判据：`傻`/`滚`/`闭嘴` 全部落 `ordinary`，407 次注入里**真拒绝 0 次** ——
+  因为五个行为全是「往 prompt 里塞一段话」，「你可以拒绝」是**请求**不是**执行**。
+  本插件不注入任何东西，只在出口真的做一件事（不回／短回／顶回去），脾气有两个来源（被踩线、被当空气），
+  且事实、安全、权限与工具任务永远照办，群主与管理员永不被沉默，一切异常一律放行。141 + 30 项测试全过。
+
+### 上一次更新 · 2026-09-09（第八版：社交关系 / 自身利益 / 联网出口审核）
 
 第八版把「像真人」从**说话方式**推进到**立场与边界**，并补上一道防炸群的出口闸。三块新能力加两处修正，
 插件总数到 **47 个**：
@@ -183,7 +239,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | `dafeiyu-console.apk` | 安卓 5.0+ | 安卓控制台 App（约 121 KB）。装完在登录页填自己的服务器地址即可，包内不含任何服务器信息。 |
 | `dafeiyu-controller.exe` | Windows 10/11 | 桌面控制台（单文件、免安装）：填服务器 SSH 与仓库信息 → 自动部署并启动 → 之后在同一个界面里改配置。同页的 `.sha256` 是校验值。 |
 
-### 47 个插件在解决什么
+### 59 个插件在解决什么
 
 每个插件对应一个**实际发生过的问题**，不是功能清单式的堆砌。
 
@@ -289,6 +345,14 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [62-社交关系](docs/62-社交关系-按群隔离的社交距离.md) | 按群隔离的社交距离：数据模型、只认哪些信号（以及哪些明确不算）、五档口吻、影子模式与隐私边界 |
 | [63-自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md) | 四类损己发言的真语料证据、为什么人格治不了、为什么判据是「输入侧证据 + 输出侧形状」两侧同时成立 |
 | [64-联网出口审核](docs/64-联网出口审核-先审后发防炸群.md) | 五条出口的审核路径、为什么必须 fail-closed、回复出口闸的降级策略与残留风险 |
+| [67-插件全量代码审计报告](docs/67-插件全量代码审计报告.md) | 一次全量审计的逐条发现与修复（含 `dsh-ctxclean` 丢失持久前缀、`dsh-pay` 到账确认过宽等） |
+| [72-基础设施报错不进群](docs/72-基础设施报错不进群-20260913.md) | 11 次原始报错泄漏的完整证据链、双档指纹与 8662 条负例回测 |
+| [78-贴纸标记泄漏的第三条出口](docs/78-贴纸标记泄漏的第三条出口-Context-send_message-20260913.md) | 为什么第一轮修完还在漏：`Context.send_message` 是并列的第二条平台出口 |
+| [81-掉线了却显示在线](docs/81-掉线了却显示在线-上行发送检测-20260913.md) | 探针只看下行造成的监控盲区，与上行检测的修法 |
+| [82-识图档位顺序与看护重启循环](docs/82-识图档位顺序与看护重启循环-20260913.md) | 延迟真因是档位顺序而非超时；含「降超时反而误杀 15.5%」的反证与看护重启额度封顶 |
+| [83-内在状态总线与仲裁层](docs/83-内在状态总线与仲裁层-20260913.md) | 11 个状态存储的量化、只读观测层的设计取舍，与「读不到 ≠ 平静」 |
+| [84-控制台实时观察层](docs/84-控制台实时观察层-v1.1-20260914.md) | 实时观察层的 4 个端点与 3 个页签、为什么复用现有鉴权而不新增写入口 |
+| [群权限手册](docs/群权限手册.md) | 109 条指令的完整分档（owner 60／admin 24／所有人 25）、AST 动态目录扫描原理与分档原则 |
 | [群指令手册](docs/群指令手册.md) | 群里所有指令的用途、权限与示例(50 条插件指令 + 9 条内置指令) |
 
 ### 快速开始
@@ -374,7 +438,78 @@ Six independently usable parts:
 | [`deploy/`](deploy/) | Deployment interface: config item list + runtime config template | JSON / env |
 | [`docs/`](docs/) | Deployment manual and 19 technical documents (root-cause analyses, designs, implementation records) | Markdown |
 
-### Latest update · 2026-09-09 (v8: social distance / self-interest / outbound moderation)
+### Latest update · 2026-09-14 (v10: automatic permission catalogue / outbound gates / latency / inner coherence)
+
+v10 is a **broad hardening pass**: it moves "sounding human" from *how it talks* to **boundaries, speed, and
+self-consistency**, and closes a set of leaks that made the bot embarrass itself in front of the whole group.
+Version 9 was folded into this release and never shipped on its own. Plugin count is now **59**.
+
+- **Automatic permission catalogue ([`dsh-acl`](plugins/dsh-acl/) 2.0.0).** The old catalogue was a hand-maintained
+  table, so newly installed plugins were routinely forgotten and the owner could not see what they were allowed to
+  run. It now **scans the actually installed `@filter.command` decorators via AST at startup**; the hand table only
+  assigns tiers. The catalogue answers "what is really on this machine", not "what someone remembered to register".
+  Current measured total: **109 commands (owner 60 / admin 24 / everyone 25)**. Three AstrBot WebUI-only commands
+  (`name`/`provider`/`dashboard_update`) are explicitly excluded — they are gated by the WebUI account system, so a
+  QQ identity can never pass, and listing them would be lying to the owner. If the scan fails it falls back to the
+  static table, so `/权限` can never come back empty. Full breakdown:
+  [群权限手册](docs/群权限手册.md).
+- **The third leak path for sticker markers ([`dsh-sticker`](plugins/dsh-sticker/) 1.2.0).** The owner reported
+  `[贴纸:装酷]` still reaching the group, yet a scan of 15350 outbound bodies found zero. The real corpus was inside
+  **other members' quote blocks** — the first fix only wrapped `AstrMessageEvent.send`, while `dsh-merge` leaves
+  through a parallel platform exit, **`star.Context.send_message`** (it calls `llm_generate` and sends straight to
+  the session, bypassing both the decoration hooks and `event.send`). Fix: the same `guard_outgoing` is now hooked
+  onto `Context.send_message`, which also covers the built-in `send_message_to_user` tool. See
+  [78](docs/78-贴纸标记泄漏的第三条出口-Context-send_message-20260913.md).
+- **Faster replies: image-chain tier order ([`dsh-vischain`](plugins/dsh-vischain/)).** The owner said "the main
+  limitation right now is speed". Across ~70000 log lines: **369 successful image transcriptions hid 293 failed
+  retries that burned 2190 seconds — 5.9 s of pure extra waiting per successful image**, with 58% of failures
+  being hard 10-second timeouts. The cause was **tier ordering, not timeouts**: a dead tier sat first, so every
+  request spent 10 seconds on it before reaching one that worked. Tiers that waste wall-clock time are now demoted
+  to last with 180s→360s→720s escalating backoff (not blacklisted, still a fallback). Two counter-findings are
+  recorded too: ① **lowering the timeout from 10s to 8s would kill 15.5% of successful calls**, so the timeout
+  value itself was right and must not be touched; ② the first measurement used half-width brackets against
+  full-width `一次过（6.0s）` lines and reported "114 successes, 16.4 s of waste" — **off by a factor of three**.
+  See [68](docs/68-识图链条白花时间治理-20260912.md) / [82](docs/82-识图档位顺序与看护重启循环-20260913.md).
+- **Offline but shown online ([`server/observe`](server/observe/)).** The probe only checked the **downlink**
+  (still receiving group messages) and declared the bot online, while the real failure was on the **uplink** —
+  the account was alive and every outgoing message was lost, which looks like "it quietly got dumber". An uplink
+  send-path check was added, and `online` is now reported separately from `good`.
+- **Inner-state bus ([`dsh-mind`](plugins/dsh-mind/)).** The owner asked whether the proactive behaviours —
+  emotion, desire, and the rest — could be integrated instead of living as separate islands. Measurement showed
+  reality was worse than the impression: **11 state stores, 33 plugins each injecting their own blocks, ~50
+  labels**, and **no code anywhere knew** how many islands spoke in a round, whether they contradicted each other,
+  or how many characters they consumed. So P0 builds a **read-only observation layer that changes no behaviour**
+  (the counterfactual replay in docs/71 is the same lesson): one `岛=N/11` log line per round plus a record of
+  labels and character counts only — never injected, never writing another component's state, never blocking a
+  reply. See [83](docs/83-内在状态总线与仲裁层-20260913.md).
+- **Less obviously a machine ([`dsh-aiflavour`](plugins/dsh-aiflavour/) / [`dsh-voice`](plugins/dsh-voice/) /
+  [`dsh-typo`](plugins/dsh-typo/)).** Three "you can tell it's AI at a glance" findings, each measured and fixed:
+  ① the verbal tic `大半夜(的)` appeared **21 times, 71× the rate of real members**, so a tic-stripping layer was
+  added (**strip only, never block** — blocking whole messages would mute it when it should speak); ②
+  `慢点，还有 N 秒冷却` appeared 114 times and became 6 rotating human phrasings (**"cooldown" is a pure machine
+  word**, and a replacement must ship with variants, or the new phrasing itself becomes the next tic); ③ typo
+  self-correction dropped from 35% to 8%, matching real members (0.83‰ vs 0.87‰). See
+  [70](docs/70-口头禅与自我纠正频率对齐-20260913.md) / [73](docs/73-系统提示不该说机器话-20260913.md) /
+  [75](docs/75-机器人口癖-大半夜的-20260913.md).
+- **Infrastructure errors no longer reach the group ([`dsh-leakguard`](plugins/dsh-leakguard/)).** The bot posted
+  **raw API errors into the group 11 times** (with traceId, insufficient balance, retryAfterSeconds; 9 in four
+  minutes on 2026-09-10). The framework was left untouched and the leak is stopped at the exit as **silence**
+  (a fixed phrase would look even more robotic under a burst of errors). The fingerprint filter was backtested
+  against 11 real errors and 8662 real chat messages with **zero false positives**.
+  See [72](docs/72-基础设施报错不进群-20260913.md).
+- **Real-time console layer ([`console/`](console/) v1.1).** The app grew from "view status + edit config" to
+  "watch what the bot is doing right now": 4 new read-only endpoints and three tabs (live / mind / log), reusing
+  the existing auth and adding no write path. See
+  [84](docs/84-控制台实时观察层-v1.1-20260914.md).
+- **Will-execution layer ([`dsh-will`](plugins/dsh-will/), new).** It started from "the bot needs to learn to
+  actually push back". Replaying the old criteria against real messages: `傻`/`滚`/`闭嘴` all landed in
+  `ordinary`, and of 407 injections **it refused exactly zero times** — because all five behaviours merely
+  stuffed a paragraph into the prompt. "You may refuse" is a **request**, not **execution**. This plugin injects
+  nothing and instead does one real thing at the exit (no reply / short reply / retort), with temper from two
+  sources (being stepped on, being ignored). Facts, safety, permissions, and tool tasks are always served; the
+  owner and admins are never silenced; every exception falls open. 141 + 30 tests pass.
+
+### Previous update · 2026-09-09 (v8: social distance / self-interest / outbound moderation)
 
 v8 moves "sounding human" from **how it talks** to **where it stands and where its limits are**, and adds a gate
 that keeps the bot from getting the group banned. Three new capabilities plus two fixes; the plugin count is now
@@ -552,7 +687,7 @@ Before rollout: **61 new unit tests** (36 emotion + 25 quote) and a **1618-messa
 
 The Android console app is on the [Releases](../../releases) page (~110 KB, Android 5.0+). Enter your own server address on the login screen; the package embeds no server details.
 
-### What the 47 plugins fix
+### What the 59 plugins fix
 
 Each plugin addresses a **problem that actually happened**, not a feature checklist.
 
@@ -652,6 +787,14 @@ Each was re-validated across multiple plugins:
 | [62 社交关系](docs/62-社交关系-按群隔离的社交距离.md) | Per-group social-distance ledger, accepted signals, five style tiers, shadow mode and fairness boundary |
 | [63 自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md) | Four self-harming reply classes and the two-sided input-evidence + output-shape verdict |
 | [64 联网出口审核](docs/64-联网出口审核-先审后发防炸群.md) | Review-before-send across five outbound paths, fail-closed behavior and residual risks |
+| [67 插件全量代码审计报告](docs/67-插件全量代码审计报告.md) | A full audit's findings and fixes (including `dsh-ctxclean` dropping persistent prefixes) |
+| [72 基础设施报错不进群](docs/72-基础设施报错不进群-20260913.md) | The full evidence chain for 11 leaked raw errors, two-tier fingerprints, 8662-message backtest |
+| [78 贴纸标记泄漏的第三条出口](docs/78-贴纸标记泄漏的第三条出口-Context-send_message-20260913.md) | Why the first fix still leaked: `Context.send_message` is a parallel platform exit |
+| [81 掉线了却显示在线](docs/81-掉线了却显示在线-上行发送检测-20260913.md) | The monitoring blind spot from downlink-only probes, and the uplink check |
+| [82 识图档位顺序与看护重启循环](docs/82-识图档位顺序与看护重启循环-20260913.md) | Latency came from tier order, not timeouts; includes the "lowering the timeout kills 15.5%" counter-proof |
+| [83 内在状态总线与仲裁层](docs/83-内在状态总线与仲裁层-20260913.md) | Quantifying 11 state stores, the read-only observation layer, and "unreadable ≠ calm" |
+| [84 控制台实时观察层](docs/84-控制台实时观察层-v1.1-20260914.md) | The live layer's 4 endpoints and 3 tabs, and why it reuses existing auth with no new write path |
+| [群权限手册](docs/群权限手册.md) | Full tiering of 109 commands (owner 60 / admin 24 / everyone 25) and the AST-scanned catalogue |
 | [命令手册](docs/群指令手册.md) | All in-group commands with usage, permissions and examples (50 plugin commands + 9 built-in) |
 
 ### Quick start

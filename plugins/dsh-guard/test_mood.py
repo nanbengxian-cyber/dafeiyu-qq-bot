@@ -195,7 +195,7 @@ check("G2h 没有类型 = 硬类（不动）", M.classify({}), ("", True))
 print("H. 状态读取（真建 SQLite + JSON）")
 tmp = Path(tempfile.mkdtemp())
 now = time.time()
-gid, uid = "476573490", "2001"
+gid, uid = "100000001", "2001"
 E_UP = {"scene": "群级情绪，读不到就当中性"}
 
 

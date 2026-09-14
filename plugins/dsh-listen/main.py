@@ -226,6 +226,13 @@ async def _get_cached(path: str) -> str:
     _record_stats(cap, err)
     if cap:
         _cache[path] = cap
+        # [fix:listen-cache-unbounded 2026-09-14] 这条路径原来不裁剪。
+        # _cache 有两个写入点：后台 _job()（写完就 _trim_cache()）和这里
+        # （LLM 请求路上现转现用）。只有前者裁剪，所以「群友发语音时机器人
+        # 恰好没被 @ 过」这类只走本路径的场景会让缓存无上限长大 ——
+        # key 是文件路径、value 是转写全文，长期跑就是纯泄漏。
+        # CACHE_MAX 的语义是「_cache 的上限」，不是「后台任务的上限」。
+        _trim_cache()
     return cap
 
 

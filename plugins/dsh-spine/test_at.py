@@ -3,7 +3,7 @@
 
 核心断言用的是**生产日志里那对真实失败语料**：
 
-    群友C: [At:3752949717] 😘😘😘
+    群友C: [At:3752949000] 😘😘😘
     大肥鱼:      这仨表情是给谁的
 
 跑法（必须在 astrbot 容器里，要 import astrbot + 读 dsh_memory.db）：
@@ -29,8 +29,8 @@ finally:
     _LGR.add = _ADD
     _lg.remove()
 
-ME = "3752949717"        # 机器人大肥鱼
-OWNER = "2774067216"     # 群主难谓言
+ME = "3752949000"        # 机器人大肥鱼
+OWNER = "2774000001"     # 群主难谓言
 CAT = "3172949971"       # 群友C
 
 fail = []
@@ -42,10 +42,10 @@ def ck(c, m):
 
 
 print("=== 1. 那对真实失败语料 ===")
-b = S.at_legend(["[At:3752949717] 😘😘😘"], ME, {})
+b = S.at_legend(["[At:3752949000] 😘😘😘"], ME, {})
 print("   注入块: %s" % b)
 ck(b, "有 @ 自己却没生成对照表")
-ck("＝**@你**" in b, "没有点明 [At:3752949717] 就是它自己：%r" % b)
+ck("＝**@你**" in b, "没有点明 [At:3752949000] 就是它自己：%r" % b)
 ck(ME in b, "对照表里没有自己的号码")
 ck("别读成" in b and "别问" in b, "缺「别问这是给谁的」那句行为约束")
 ck("群友C" not in b, "把当前说话人写进对照表了（那是框架的活，会重复）")
@@ -89,7 +89,7 @@ print("\n=== 7. 插件装载 + 真跑一次 _inject_at（读成员表）===")
 
 class FakeEv:
     def get_group_id(self):
-        return "476573490"
+        return "100000001"
 
     def get_sender_id(self):
         return CAT
@@ -109,14 +109,14 @@ class FakeCtx:
 try:
     plug = S.Main(FakeCtx())
     req = FakeReq()
-    plug._inject_at(FakeEv(), req, "476573490", ME, "[At:%s] 😘😘😘" % ME)
+    plug._inject_at(FakeEv(), req, "100000001", ME, "[At:%s] 😘😘😘" % ME)
     parts = req.extra_user_content_parts
     ck(len(parts) == 1, "没注入：%r" % parts)
     txt = parts[0] if isinstance(parts[0], str) else getattr(parts[0], "text", "")
     ck("＝**@你**" in txt, "真跑一次没点明是自己：%r" % txt)
     ck(plug._stat["at"] == 1, "计数没加：%r" % plug._stat)
     print("   %s" % txt)
-    print("   成员表读到 %d 个名字（QQ→名字）" % len(plug._names.get("476573490") or {}))
+    print("   成员表读到 %d 个名字（QQ→名字）" % len(plug._names.get("100000001") or {}))
 except BaseException as exc:
     fail.append("装载/真跑异常：%r" % exc)
 
@@ -187,7 +187,7 @@ class Req2:
 
 plug2 = S.Main(FakeCtx())
 req2 = Req2("😘😘😘")                 # ← 正文里真的只有三个表情
-plug2._inject_at(Ev([At(ME), Plain()]), req2, "476573490", ME, "😘😘😘")
+plug2._inject_at(Ev([At(ME), Plain()]), req2, "100000001", ME, "😘😘😘")
 ck(len(req2.extra_user_content_parts) == 1, "点名时没注入：%r" % req2.extra_user_content_parts)
 t2 = req2.extra_user_content_parts[0]
 t2 = t2 if isinstance(t2, str) else getattr(t2, "text", "")
@@ -195,7 +195,7 @@ ck("点你" in t2, "端到端注入块不对：%r" % t2)
 print("   prompt=%r → 注入: %s" % ("😘😘😘", t2[:90]))
 
 req3 = Req2("早上好啊")
-plug2._inject_at(Ev([Plain()]), req3, "476573490", ME, "早上好啊")
+plug2._inject_at(Ev([Plain()]), req3, "100000001", ME, "早上好啊")
 ck(not req3.extra_user_content_parts, "普通消息也注入了：%r" % req3.extra_user_content_parts)
 print("   普通消息 → 零注入 ✓")
 

@@ -75,7 +75,7 @@ class FakeMain:
 
 async def invoke(obj, uid="10000"):
     return await do_ban(
-        obj, object(), "476573490", uid, "u", 600, "attack", "test", False
+        obj, object(), "100000001", uid, "u", 600, "attack", "test", False
     )
 
 
@@ -92,14 +92,14 @@ async def test_concurrency():
     obj = FakeMain(total)
     await asyncio.gather(*(invoke(obj, str(10000 + i)) for i in range(total)))
     assert len(obj.calls) == ns["GROUP_BAN_MAX"], obj.calls
-    assert len(ns["_bans"]["476573490"]) == ns["GROUP_BAN_MAX"]
+    assert len(ns["_bans"]["100000001"]) == ns["GROUP_BAN_MAX"]
     assert ns["_stat"]["skip_ban_quota"] == total - ns["GROUP_BAN_MAX"]
 
 
 async def test_definite_failure_rolls_back():
     reset()
     await invoke(FakeMain(mode="failure"))
-    assert list(ns["_bans"]["476573490"]) == []
+    assert list(ns["_bans"]["100000001"]) == []
     assert ns["_stat"]["ban_fail"] == 1
 
 
@@ -115,7 +115,7 @@ async def test_cancel_keeps_reservation():
         pass
     else:
         raise AssertionError("CancelledError was swallowed")
-    assert len(ns["_bans"]["476573490"]) == 1
+    assert len(ns["_bans"]["100000001"]) == 1
 
 
 async def test_timeout_keeps_reservation():
@@ -138,7 +138,7 @@ async def test_timeout_keeps_reservation():
         await invoke(obj)
     finally:
         ns["asyncio"].wait_for = real_wait_for
-    assert len(ns["_bans"]["476573490"]) == 1
+    assert len(ns["_bans"]["100000001"]) == 1
     assert ns["_stat"]["ban_fail"] == 1
 
 

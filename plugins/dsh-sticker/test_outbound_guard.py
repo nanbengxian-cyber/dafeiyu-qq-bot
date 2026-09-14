@@ -53,7 +53,7 @@ ck(n == 1, "没剥到：n=%r" % n)
 ck(chain.chain[0].text == CLEAN, "剥完文字不对：%r" % chain.chain[0].text)
 
 print("\n=== 2. 干净文字一个字符都不动 ===")
-for t in ["早上好", "", "这个 [不是标记] 是方括号", "1+1=2", "[At:3752949717] 在吗"]:
+for t in ["早上好", "", "这个 [不是标记] 是方括号", "1+1=2", "[At:3752949000] 在吗"]:
     c = MessageChain(chain=[Plain(t)])
     before = c.chain[0].text
     ck(S.guard_outgoing(c) == 0, "干净文字被剥了：%r" % t)
@@ -184,14 +184,14 @@ S._ORIG_CTX_SEND = _rec_ctx
 try:
     c = MessageChain(chain=[Plain(MERGE_LEAK)])
     r = asyncio.new_event_loop().run_until_complete(
-        Context.send_message(object.__new__(Context), "aiocqhttp:GroupMessage:476573490", c)
+        Context.send_message(object.__new__(Context), "aiocqhttp:GroupMessage:100000001", c)
     )
     ck(r is True, "返回值没透传：%r" % r)
     ck(len(ctx_sent) == 1, "原 Context.send_message 没被调到")
     got = [x.text for x in ctx_sent[0][1].chain if isinstance(x, Plain)]
     print("   平台真正收到的文字：%r" % got)
     ck(got == [MERGE_CLEAN], "dsh-merge 这条路还是带标记的：%r" % got)
-    ck(ctx_sent[0][0].endswith("476573490"), "session 被改动了")
+    ck(ctx_sent[0][0].endswith("100000001"), "session 被改动了")
 finally:
     S._ORIG_CTX_SEND = _real_ctx
 
@@ -202,7 +202,7 @@ try:
     ctx_sent.clear()
     c = MessageChain(chain=[Plain(MERGE_LEAK)])
     r = asyncio.new_event_loop().run_until_complete(
-        Context.send_message(object.__new__(Context), "aiocqhttp:GroupMessage:476573490", c)
+        Context.send_message(object.__new__(Context), "aiocqhttp:GroupMessage:100000001", c)
     )
     ck(r is True, "闸炸了之后 merge 的消息被吞了：%r" % r)
     ck(len(ctx_sent) == 1, "闸炸了之后原函数没被调到")

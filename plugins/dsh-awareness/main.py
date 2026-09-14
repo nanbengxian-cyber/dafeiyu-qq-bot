@@ -78,7 +78,7 @@ def _set(name: str, default: str = "") -> set:
 
 ENABLED = _flag("DSH_AWARENESS")
 GROUPS = _set("DSH_AWARENESS_GROUPS")
-OWNERS = _set("DSH_AWARENESS_OWNER", "2774067216")
+OWNERS = _set("DSH_AWARENESS_OWNER", "2774000001")
 DB = os.environ.get("DSH_AWARENESS_DB", "/AstrBot/data/dsh_awareness.db")
 
 KEEP_MIN = _int("DSH_AWARENESS_KEEP_MIN", 120, 5, 1440)

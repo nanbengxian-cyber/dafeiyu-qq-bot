@@ -82,7 +82,7 @@
 #
 # 旋钮：
 #   DSH_ACL              1/0 总开关（默认 1）
-#   DSH_ACL_OWNER        QQ 号，逗号分隔（默认 2774067216）
+#   DSH_ACL_OWNER        QQ 号，逗号分隔（默认 2774000001）
 #   DSH_ACL_OWNER_CMDS   追加 owner 级指令，逗号分隔
 #   DSH_ACL_ADMIN_CMDS   追加 admin 级指令
 #   DSH_ACL_ALL_CMDS     降级为所有人可用（优先级最高，用来放开默认限制）
@@ -109,7 +109,7 @@ ENABLED = os.environ.get("DSH_ACL", "1") != "0"
 # 群主的 QQ 号。默认值是本群群主，换群改这个 env 就行。
 OWNERS = {
     u.strip()
-    for u in os.environ.get("DSH_ACL_OWNER", "2774067216").split(",")
+    for u in os.environ.get("DSH_ACL_OWNER", "2774000001").split(",")
     if u.strip()
 }
 

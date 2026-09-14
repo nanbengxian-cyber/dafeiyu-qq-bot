@@ -21,7 +21,7 @@ spec.loader.exec_module(module)
 kinds = module.exploit_kinds
 dev = module.self_devalue
 
-# 群友原话（11:41~11:57，主群 476573490）
+# 群友原话（11:41~11:57，主群 100000001）
 IN_LINES = [
     "你这吃token的鱼",
     "你是便宜货吗？",

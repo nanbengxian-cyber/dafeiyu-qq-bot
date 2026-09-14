@@ -120,6 +120,14 @@ _AUTO_BLOCK_RE = re.compile(
 # 进程内防重：正在识别的 file id（避免同一张图计数达阈值的瞬间并发触发两次）
 _inflight: set[str] = set()
 
+# [fix:steal-dangling-task 2026-09-14] 后台识别任务的强引用。
+# 原来是裸 asyncio.create_task(...)，返回值没人拿着 —— 事件循环只持弱引用，
+# 任务在第一个 await 挂起时可能被 GC 掉，表现成「偷图偶尔无声失败」：
+# _inflight 里那条 fid 也就永远留着（清理写在任务自己的 finally 里），
+# 于是这张图之后再也不会被偷。dsh-memory 早就踩过同一个坑并写了注释，
+# 这里补齐同样的处理：存引用 + 完成回调里取一次异常再丢弃。
+_tasks: set = set()
+
 
 def _db() -> sqlite3.Connection:
     os.makedirs(HOME, exist_ok=True)

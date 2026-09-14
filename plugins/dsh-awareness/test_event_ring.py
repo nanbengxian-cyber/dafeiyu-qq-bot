@@ -25,7 +25,7 @@ def test_classify():
 
     # @ 只是寻址，不该把消息变成「非文本」。
     kind, text, extra = er.classify([
-        {"type": "At", "qq": "3752949717"}, {"type": "Plain", "text": "在吗"},
+        {"type": "At", "qq": "3752949000"}, {"type": "Plain", "text": "在吗"},
     ])
     assert kind == er.KIND_TEXT and text == "在吗", (kind, text)
 
@@ -153,7 +153,7 @@ def test_limit_and_order():
 
 
 def test_poke_note():
-    BOT = "3752949717"
+    BOT = "3752949000"
     # 没人戳：不注入，零开销。
     assert er.render_poke_note([], now=NOW, me=BOT) == ""
     rows = [_row(NOW - 200, "区", er.KIND_POKE, "", by="1296432570",

@@ -1,0 +1,98 @@
+# 在 GitHub 自己的 Windows 机器上打包桌面控制台，产出单文件 EXE 并挂到 Releases。
+#
+# 触发方式：
+#   1) 推送形如 controller-v1.0.0 的标签 → 自动构建 + 发布到 Releases（发行版页面可直接下载）
+#   2) Actions 页面点 Run workflow → 只构建，产物在本次运行的 Artifacts 里下载
+#
+# 为什么用 Actions：EXE 必须在 Windows 上打包，而部署机器人用的服务器通常是 Linux。
+# 产物不含任何服务器地址、账号、密码、私钥、Token 或机器人配置 —— 全部由使用者运行时填写。
+
+name: Build Windows Controller
+
+on:
+  push:
+    tags:
+      - 'controller-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build single-file EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Locate Python
+        shell: pwsh
+        run: |
+          $py = (Get-Command python).Source
+          Write-Host "python: $py"
+          "PYTHON_EXE=$py" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build EXE
+        shell: pwsh
+        working-directory: desktop-controller
+        run: ./build-windows.ps1 -PythonExe $env:PYTHON_EXE
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path 'out' | Out-Null
+
+          # 用通配符取产物，避免依赖中文文件名在不同编码下的解析。
+          $built = Get-ChildItem -Path 'desktop-controller\dist\*.exe' | Select-Object -First 1
+          if (-not $built) { throw '打包未产出 EXE' }
+
+          # 发布资源统一用 ASCII 文件名，避免浏览器/杀软对中文文件名的兼容问题。
+          Copy-Item -Path $built.FullName -Destination 'out\dafeiyu-controller.exe'
+
+          $hash = (Get-FileHash -Path 'out\dafeiyu-controller.exe' -Algorithm SHA256).Hash.ToLower()
+          "$hash  dafeiyu-controller.exe" | Out-File -FilePath 'out\dafeiyu-controller.exe.sha256' -Encoding ascii
+
+          Get-ChildItem 'out' | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dafeiyu-controller-windows
+          path: out/*
+          if-no-files-found: error
+
+      - name: Publish to Releases
+        if: startsWith(github.ref, 'refs/tags/controller-v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tag = $env:GITHUB_REF_NAME
+          $notes = @(
+            'Windows 桌面控制台（单文件、免安装）。',
+            '',
+            '- 下载 `dafeiyu-controller.exe`，双击即可运行。',
+            '- `dafeiyu-controller.exe.sha256` 是校验值：在 PowerShell 里执行',
+            '  `Get-FileHash .\dafeiyu-controller.exe -Algorithm SHA256`，与文件内容比对。',
+            '- 包内不含任何服务器地址、账号、密码、私钥、Token 或机器人配置，全部在你运行时填写。',
+            '- 用法见 docs/61-桌面控制台-一键部署与在线配置.md。'
+          ) -join "`n"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Windows 控制台 $tag" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "创建 release 失败：$tag" }
+          }
+
+          gh release upload $tag --repo $env:GITHUB_REPOSITORY --clobber `
+            'out/dafeiyu-controller.exe' 'out/dafeiyu-controller.exe.sha256'
+          if ($LASTEXITCODE -ne 0) { throw "上传发布资源失败：$tag" }

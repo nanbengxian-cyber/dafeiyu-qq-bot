@@ -33,8 +33,8 @@ TXT = os.path.join(BASE, "dynamics.log")
 NOTIFY = "/opt/qqbot/notify_mail.py"
 
 WINDOW_H = float(os.environ.get("DYN_WINDOW_H", "3"))
-BOT_QQ = os.environ.get("DYN_BOT_QQ", "3752949717")
-OWNER_QQ = os.environ.get("DYN_OWNER_QQ", "2774067216")
+BOT_QQ = os.environ.get("DYN_BOT_QQ", "3752949000")
+OWNER_QQ = os.environ.get("DYN_OWNER_QQ", "2774000001")
 ALERT_COOLDOWN_S = 3600
 
 TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d{3}\]")

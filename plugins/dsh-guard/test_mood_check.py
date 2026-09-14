@@ -150,7 +150,7 @@ class FakeEvent:
         self.message_str = text
         self.bot = FakeBot(role)
         self.message_obj = type("M", (), {
-            "self_id": "3752949717",
+            "self_id": "3752949000",
             "raw_message": {"sender": {"role": role}},
         })()
         self.uid, self.gid, self.at = str(uid), TEST_GID, at
@@ -163,13 +163,13 @@ class FakeEvent:
         return self.uid
 
     def get_self_id(self):
-        return "3752949717"
+        return "3752949000"
 
     def get_sender_name(self):
         return "阿强"
 
     def get_messages(self):
-        return [type("At", (), {"qq": "3752949717"})()] if self.at else []
+        return [type("At", (), {"qq": "3752949000"})()] if self.at else []
 
     @property
     def unified_msg_origin(self):

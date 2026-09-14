@@ -19,8 +19,8 @@ import time
 # env 必须在 import main 之前设好：DB 路径是模块级常量。
 _TEST_DB = "/tmp/test_awareness.db"
 os.environ["DSH_AWARENESS_DB"] = _TEST_DB
-os.environ["DSH_AWARENESS_GROUPS"] = "476573490"
-os.environ["DSH_AWARENESS_OWNER"] = "2774067216"
+os.environ["DSH_AWARENESS_GROUPS"] = "100000001"
+os.environ["DSH_AWARENESS_OWNER"] = "2774000001"
 os.environ["DSH_AWARENESS_KEEP_MIN"] = "120"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,8 +32,8 @@ except BaseException as exc:  # pragma: no cover
     print("IMPORT_FAIL: %r" % (exc,))
     raise SystemExit(2)
 
-BOT = "3752949717"
-GID = "476573490"
+BOT = "3752949000"
+GID = "100000001"
 
 
 def comp(name, **kw):
@@ -179,7 +179,7 @@ def test_index_and_detail_injection():
     # c) 群主说话也展开明细。
     req = FakeReq()
     asyncio.run(model.inject(
-        FakeEvent(comps=[comp("Plain", text="在吗")], uid="2774067216",
+        FakeEvent(comps=[comp("Plain", text="在吗")], uid="2774000001",
                   name="难谓言", text="在吗"), req))
     assert len(req.extra_user_content_parts) == 2, len(req.extra_user_content_parts)
 

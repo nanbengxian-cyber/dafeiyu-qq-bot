@@ -81,7 +81,7 @@ for raw, want in CASES:
     check("verdict(%r)" % raw, m._parse_censor_verdict(raw), want)
 
 # ------------------------------------------------ 2. 机械提示按群去重
-sid = "group:476573490"
+sid = "group:100000001"
 other = "group:1067341190"
 m.NOTICE_GAP = 90
 m._notice_last.clear()

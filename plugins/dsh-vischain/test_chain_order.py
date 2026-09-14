@@ -16,6 +16,7 @@
 运行：sudo docker cp plugins/dsh-vischain astrbot:/tmp/vs && \
       sudo docker exec astrbot python3 /tmp/vs/test_chain_order.py
 """
+import asyncio
 import os
 import sys
 import types
@@ -140,6 +141,28 @@ def main():
     check("缺档仍能建起来", m2._ensure(pm2, quiet=True) is True)
     check("缺失的档被跳过，只剩 3 档", len(m2.chain.links) == 3, repr(len(m2.chain.links)))
     check("日志文案里点名缺失档", "vision-scnet" in (m2.note or ""), repr(m2.note))
+
+    # ---------- ⑥ 生命周期：取消并等待 watchdog，恢复原 alias ----------
+    async def lifecycle_checks():
+        pm3 = FakePM([scnet, zhipu, alias])
+        m3 = vis.Main(FakeCtx())
+        check("生命周期测试首次接管", m3._ensure(pm3, quiet=True) is True)
+        watch = asyncio.create_task(asyncio.sleep(60))
+        m3._watch = watch
+        await m3.terminate()
+        check("terminate 等待 watchdog 结束", watch.done())
+        check("terminate 恢复原 alias", pm3.inst_map["vision-opus5"] is alias)
+        check("terminate 清空链引用", m3.chain is None and m3._pm is None)
+
+        pm4 = FakePM([scnet, zhipu, alias])
+        m4 = vis.Main(FakeCtx())
+        m4._ensure(pm4, quiet=True)
+        other = FakeProv("vision-opus5", "other")
+        pm4.inst_map["vision-opus5"] = other
+        await m4.terminate()
+        check("terminate 不覆盖后续 alias 替换", pm4.inst_map["vision-opus5"] is other)
+
+    asyncio.run(lifecycle_checks())
 
     print()
     bad = [n for n, ok in CHECKS if not ok]

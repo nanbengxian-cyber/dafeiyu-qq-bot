@@ -39,7 +39,7 @@ finally:
 
 import asyncio  # noqa: E402
 
-SID = "grp:476573490"
+SID = "grp:100000001"
 
 
 class FakeEvent:

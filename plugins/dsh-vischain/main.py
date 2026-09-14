@@ -42,8 +42,9 @@
 #
 # ============================ 2026-09-12 慢档降权 ============================
 # 群主在群里说「现在的主要限制就是速率太慢了」，回查日志坐实了具体落在哪：
-# 近 70000 行里 114 次成功识图，背后 234 次失败重试白花了 1866.9 秒 ——
-# **平均每张图 16.4 秒纯空等**，而成功那次中位只要 4.8 秒。
+# 近 70000 行里 369 次成功识图，背后 293 次失败重试白花了 2190 秒 ——
+# **每成功转述一张图，平均多等 5.9 秒**，其中 58% 的失败是撞满
+# ATTEMPT_TIMEOUT(10s) 的硬超时。
 #
 # 钱花在一条固定的链条上：vision-scnet 已死 → 落到 zhipu-vision，先吃满
 # ATTEMPT_TIMEOUT(10s) 超时、再吃一次 429 限流，才发现同一个 key 上的
@@ -51,12 +52,17 @@
 # 抓不住它：_dead 只在「永久错误」上打标（超时和 429 都不算），_consec 要
 # 连败 3 次，而 AstrBot 一天被重启十几次、进程内存每次清零。
 #
+# 口径提醒：docs/68 记过一次误算 —— 第一版按半角括号去匹配成功行（实际是
+# 全角 `一次过（6.0s）`），只统计到 114 次成功，把成绩算成「平均白花 16.4 秒」，
+# **数字整整错了三倍**。上面的 5.9s 是更正后的口径。
+#
 # 于是加了 SLOW_TTL：**一档只要白白耗掉过一次墙钟时间，就在这段时间里排到
 # 最后**（不拉黑，仍兜底）。群里抛梗二十多秒后才接，梗早凉了 —— 这是最伤
 # 「像真人」的一条，比措辞更像人重要得多。
 # 开关：DSH_VIS_SLOW_TTL（秒，默认 180；0=退回老行为）。
 
 import asyncio
+import contextlib
 import os
 import tempfile
 import time
@@ -561,6 +567,9 @@ class Main(star.Star):
         self.chain: ChainProvider | None = None
         self.note = "未初始化"
         self._watch: asyncio.Task | None = None
+        self._pm = None
+        self._original_alias = None
+        self._has_original_alias = False
         self._reinstalls = 0
 
     # ---------------------------------------------------------------- 安装
@@ -615,6 +624,16 @@ class Main(star.Star):
             self.note = "顶替目标 %s 不存在" % ALIAS
             logger.error("[vischain] %s，识图保持原样", self.note)
             return False
+
+        # [patch:lifecycle-v1] 记住被顶替的裸实例与 provider_manager。
+        # 没有这两样，terminate 时既拿不到 pm、也拿不回原 provider，
+        # 旧 ChainProvider 就会永远留在全局 inst_map 里继续接客。
+        # 取 _live() 而不是 inst_map 原值：ALIAS 上若已挂着别人的
+        # ChainProvider 壳，剥壳后存真实底座，恢复时才不会把壳还回去。
+        if not self._has_original_alias:
+            self._original_alias = self._live(pm, ALIAS)
+            self._has_original_alias = True
+        self._pm = pm
 
         old = self.chain
         self.chain = ChainProvider(links, self.context.get_config() or {})
@@ -673,9 +692,24 @@ class Main(star.Star):
                 logger.warning("[vischain] 看护异常: %s", e)
 
     async def terminate(self):
-        if self._watch is not None:
-            self._watch.cancel()
+        watch = self._watch
+        if watch is not None:
+            watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watch
             self._watch = None
+
+        pm = self._pm
+        chain = self.chain
+        if pm is not None and chain is not None and pm.inst_map.get(ALIAS) is chain:
+            if self._has_original_alias and self._original_alias is not None:
+                pm.inst_map[ALIAS] = self._original_alias
+            else:
+                pm.inst_map.pop(ALIAS, None)
+        self.chain = None
+        self._pm = None
+        self._original_alias = None
+        self._has_original_alias = False
 
     @filter.command("识图状态")
     async def cmd_status(self, event: AstrMessageEvent):

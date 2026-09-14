@@ -14,6 +14,36 @@ config.json
 *.credentials.yaml
 *.idsig
 
+# Windows desktop-controller local packaging artifacts
+/desktop-controller/build/
+/desktop-controller/dist/
+/desktop-controller/.venv-build/
+/desktop-controller/__pycache__/
+/desktop-controller/tests/__pycache__/
+/desktop-controller/*.spec
+/desktop-controller/controller-profile.json
+/desktop-controller/server-profile.json
+
+# 机器人真实运行配置：只留在服务器上，绝不入库
+/deploy/robot.env
+/deploy/*.tmp
+
+# 部署暂存与生产快照：属于本机工作产物，不是源码
+# .deploy-poke-v2/ 是往生产推插件前的暂存副本，prod-ref/ 是生产的只读快照，
+# 两者都会被 plugins/ 下的正式版本取代（内容常有重名但版本更旧），入库只会造成混淆。
+/.deploy-poke-v2/
+/prod-ref/
+
+# 生产环境日志与数据库：可能含群聊原文与 QQ 号，绝不入库
+*.log
+*.db
+*.db.bak*
+*.sqlite
+*.sqlite3
+
+# 目录扫描测试留下的临时目录（如 dsh-poke 的 .test_poke.py.<pid>.<uuid>.tmpdir）
+.*.tmpdir/
+
 # 编辑器与系统
 .DS_Store
 *.swp
