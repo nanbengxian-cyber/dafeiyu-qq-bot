@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Plain
 from astrbot.core import logger
 
 
@@ -38,6 +39,35 @@ BG_MIN = max(1, int(os.environ.get("DSH_SELFGUARD_BIGRAM", "2")))
 BG_RATIO = min(1.0, max(0.05, float(os.environ.get("DSH_SELFGUARD_RATIO", "0.35"))))
 CONFLICT_WINDOW = max(30.0, float(os.environ.get("DSH_SELFGUARD_WINDOW", "180")))
 MIN_LEN = max(2, int(os.environ.get("DSH_SELFGUARD_MIN_LEN", "5")))
+# [patch:short-echo] 极短句复读抑制。
+#
+# 2026-09-15 现场：群友「摸摸」→ 机器人「摸吧摸吧」；群友「抱抱」→ 机器人
+# 「抱吧抱吧」；同一对句子当天各出现两次（12:23、17:19、18:30、18:31）。紧跟着
+# 群友就说「你咋变这么乖了」—— 破绽不在"乖"，在于**输入什么形状、输出就什么
+# 形状**，连着两次一模一样，一眼看出是程序。
+#
+# 现有 repeat_of() 抓不到它们：MIN_LEN=5 而「摸吧摸吧」只有 4 个字，第一条就被
+# 挡在检测之外。把 MIN_LEN 调小会连带影响长句判据，所以这里单开一条只针对
+# **极短句**的通道。
+#
+# 关键取舍：群主明确讨厌「这茬刚聊完／已经聊过／刚说过」这类不耐烦话术
+# （2026-09-12 因此关掉了 DSH_SELFGUARD_REPEAT）。所以这条路**不拦、不换话术、
+# 不说任何关于重复的话**，只是把已经说过的那句短句**换个同义说法**再发，
+# 并且允许返回 None（同义已用尽）表示"那就别重复这条了，让模型换一句"。
+SHORT_ECHO_ON = _flag("DSH_SELFGUARD_SHORT_ECHO", "1")
+SHORT_ECHO_LEN = max(3, int(os.environ.get("DSH_SELFGUARD_SHORT_LEN", "6")))
+# 同义变体表。键是「去掉语气尾巴的短句」，值是一组可直接替换的说法。
+# 只在**同一个群里今天已经发过**时启用，不是每次都换 —— 偶尔重复才是真人。
+_SHORT_VARIANTS = {
+    "摸吧摸吧": ("来", "摸呗", "手给你", "摸一下得了"),
+    "抱吧抱吧": ("抱一下", "来吧", "给你抱", "就一下"),
+    "行吧行吧": ("行", "行吧", "成", "那就这样"),
+    "好啊好啊": ("好", "行呀", "可以", "成啊"),
+    "来吧来吧": ("来", "来呗", "走", "那就来"),
+    "算了算了": ("算了", "那算", "行吧算了", "不说了"),
+}
+# 叠词回显的通用识别：`X吧X吧` / `XX吧` 这类由输入形状直接决定的输出。
+_ECHO_TAIL_RE = re.compile(r"[～~！!。，,、\s]+$")
 MEM_DB = os.environ.get("DSH_MEM_DB", "/AstrBot/data/dsh_memory.db")
 OWNERS = _set("DSH_SELFGUARD_OWNER", "2774000001")
 
@@ -128,6 +158,39 @@ def repeat_of(text: str, recent: list[str]) -> tuple[str, str] | None:
     return None
 
 
+def _norm_short(text: str) -> str:
+    """极短句归一化：去空白与语气尾巴，用来比对"是不是同一句"。"""
+    return _ECHO_TAIL_RE.sub("", core(text))
+
+
+def short_echo_variant(text: str, recent: list[str]) -> tuple[str, str] | None:
+    """极短句跟最近发过的重了，就给一个同义说法。
+
+    返回 (新说法, 原因)；没有合适说法时返回 ("", 原因) 表示**这句别发了**；
+    不属于"极短句复读"则返回 None（交给原来的逻辑）。
+
+    与 repeat_of() 的区别：repeat_of 面向长句、命中就拦；这里面向 ≤SHORT_ECHO_LEN
+    字的短句，命中只**换个说法**，绝不说任何关于"重复/聊过/刚说过"的话 ——
+    群主明确不喜欢那种话术。
+    """
+    cur = _norm_short(text)
+    if not cur or len(cur) > SHORT_ECHO_LEN:
+        return None
+    # 只用"整句完全相同"判定，不用子串/bigram：短句本来就短，模糊匹配极易误伤
+    # （「行吧」和「来吧」共享一个「吧」，按 bigram 算会被当成重复）。
+    for old in recent:
+        if _norm_short(old) != cur:
+            continue
+        pool = _SHORT_VARIANTS.get(cur)
+        if pool:
+            # 变体里挑一个这次没用过的：先按字数差别大的挑，观感上更像换了句话
+            for cand in pool:
+                if _norm_short(cand) != cur:
+                    return cand, "短句复读「%s」-> 换说法" % cur
+        return "", "短句复读「%s」且没有现成变体，这句不重复" % cur
+    return None
+
+
 _TAUNT_RE = re.compile(
     r"这就(急|恼|破防|绷不住)"
     r"|(急|恼|破防)(了|什么|啥)[?？]"
@@ -159,6 +222,7 @@ _stat = {
     "seen": 0, "repeat": 0, "taunt": 0,
     "shadow_repeat": 0, "shadow_taunt": 0,
     "skip_group": 0, "not_model": 0,
+    "short_echo": 0, "short_echo_drop": 0,
 }
 _last: list[str] = []
 
@@ -172,10 +236,12 @@ class Main(star.Star):
         self._last_taunt_reply = ""
         logger.info(
             "[selfguard] 已加载：%s 群=%s｜自我重复=%s(公共子串≥%d 或 共享≥%d组且≥%.0f%%，比最近%d条)｜"
-            "拱火=%s(挑衅 且 %.0fs内群里在冲突)｜重复后不耐烦=%ss内升级/%ss重置",
+            "拱火=%s(挑衅 且 %.0fs内群里在冲突)｜重复后不耐烦=%ss内升级/%ss重置｜"
+            "短句复读抑制=%s(≤%d字整句相同就换说法)",
             "开" if ENABLED else "关", ",".join(sorted(GROUPS)) or "无",
             "开" if REPEAT_ON else "关", LCS_MIN, BG_MIN, BG_RATIO * 100, KEEP,
             "开" if TAUNT_ON else "关", CONFLICT_WINDOW, IMPATIENT_WINDOW, IMPATIENT_RESET,
+            "开" if SHORT_ECHO_ON else "关", SHORT_ECHO_LEN,
         )
 
     @filter.after_message_sent()
@@ -255,6 +321,42 @@ class Main(star.Star):
                 if got:
                     hit = "自我重复"
                     why = "跟「%s」重了（%s）" % (got[0][:24], got[1])
+            # [patch:short-echo] 短句复读**独立于 REPEAT_ON**：群主关掉的是"不耐烦
+            # 话术"那条路，不是"允许自己一句话说两遍"。这里只换说法，不换话术。
+            if hit is None and SHORT_ECHO_ON:
+                echo = short_echo_variant(text, list(self._recent.get(gid, ())))
+                if echo is not None:
+                    new_text, reason = echo
+                    if not new_text:
+                        # 没有现成变体：把这条短句掐掉，让模型重说一句不同的。
+                        try:
+                            event.clear_result()
+                        except BaseException:
+                            pass
+                        event.stop_event()
+                        _stat["short_echo_drop"] = _stat.get("short_echo_drop", 0) + 1
+                        logger.info("[selfguard] 短句复读且无变体，本条不重复：%s", reason)
+                        return
+                    # 逐段改 Plain，和 dsh-aiflavour 的做法一致：不自己构造 chain，
+                    # 免得丢掉 @/图片等非文本段。
+                    done = False
+                    try:
+                        for comp in result.chain:
+                            if isinstance(comp, Plain):
+                                comp.text = new_text
+                                done = True
+                    except BaseException:
+                        done = False
+                    if not done:
+                        try:
+                            event.set_result(new_text)
+                        except BaseException:
+                            pass
+                    _stat["short_echo"] = _stat.get("short_echo", 0) + 1
+                    logger.info("[selfguard] 短句换说法：%s -> %s", text[:20], new_text)
+                    # 换过说法的这句也要记进去，否则下一轮又会被判定成"没说过"
+                    self._recent.setdefault(gid, deque(maxlen=KEEP)).append(new_text)
+                    return
             if hit is None and TAUNT_ON and is_taunt(text):
                 spark = looks_conflict(self._recent_human(gid))
                 if spark:
@@ -316,12 +418,17 @@ class Main(star.Star):
             "影子模式下本来会拦：重复 %d｜拱火 %d\n"
             "判据：公共子串≥%d字 或 共享≥%d组bigram且占≥%.0f%%（比最近%d条）；"
             "重复命中按同一用户在%.0fs内递进为不耐烦1～3级，%.0fs未触发后重置；"
-            "拱火需「自己挑衅」+「%.0fs内群里在吵」同时成立\n最近：%s"
+            "拱火需「自己挑衅」+「%.0fs内群里在吵」同时成立\n"
+            "短句复读抑制：%s（≤%d字整句相同就换说法，不说不耐烦的话）｜换说法 %d 次｜"
+            "无变体不重复 %d 次\n最近：%s"
             % (
                 "开" if ENABLED else "关", "（影子模式）" if SHADOW else "",
                 "、".join(sorted(GROUPS)) or "无", _stat["seen"], stopped,
                 _stat["repeat"], _stat["taunt"], _stat["shadow_repeat"], _stat["shadow_taunt"],
                 LCS_MIN, BG_MIN, BG_RATIO * 100, KEEP, IMPATIENT_WINDOW, IMPATIENT_RESET,
-                CONFLICT_WINDOW, "｜".join(_last[-3:]) or "还没有",
+                CONFLICT_WINDOW,
+                "开" if SHORT_ECHO_ON else "关", SHORT_ECHO_LEN,
+                _stat["short_echo"], _stat["short_echo_drop"],
+                "｜".join(_last[-3:]) or "还没有",
             )
         )

@@ -146,7 +146,16 @@ async def _run_cmd():
 
 texts, calls = asyncio.get_event_loop().run_until_complete(_run_cmd())
 check("冷却期连敲 5 次只提示 1 条", len(texts), 1)
-check("提示文案", texts[0] if texts else None, "慢点，还有 20 秒冷却")
+# 冷却文案是**池子里随机挑**的（main.py 的 _COOL_POOL），原来这里写死
+# 「慢点，还有 20 秒冷却」——那句早就不用了（真人不会说"冷却"，而且它曾是
+# 全群最高频的固定句，一天念 34 遍）。断言写死一句的后果是：这个测试长期是
+# 红的，于是真正的回归也会被这条红淹掉。改成断言「属于池子」，并要求它不再
+# 出现「冷却」「秒」这种机器词。
+_POOL = getattr(m, "_COOL_POOL", ())
+check("冷却提示来自话术池", bool(_POOL), True)
+check("提示文案属于话术池", texts[0] in _POOL, True)
+check("提示里不许出现「冷却」", "冷却" not in (texts[0] or ""), True)
+check("提示里不许出现倒计时秒数", "秒" not in (texts[0] or ""), True)
 check("冷却期一次都没真的去合成", calls, 0)
 
 # ------------------------------------------------ 4. 审核两次都超时 -> 拒发，但原因给人看
