@@ -75,9 +75,17 @@ req = Req()
 asyncio.run(main.inject(Event(), req))
 text = "\n".join(getattr(x, "text", str(x)) for x in req.extra_user_content_parts)
 assert "<current_machine_self>" in text, text
-assert "已有图片文字转述" in text, text
+assert "图的内容转述过来了" in text, text
 assert "chat-main" in text and "vision-main" in text, text
-assert "没有直接看到原始像素" in text, text
+# [no-mech-talk] 机器自述块（<current_machine_self>…</current_machine_self>）
+# 里不许出现技术词：模型会把它们照搬进群（2026-09-15「真看不见 图没递到我这边」）。
+_machine_block = text.split("<current_machine_self>")[1].split("</current_machine_self>")[0]
+for _mech in ("像素", "遥测", "容器", "进程", "接口"):
+    assert _mech not in _machine_block, \
+        "机器自述块里出现了会被照搬的技术词 %r：%r" % (_mech, _machine_block)
+# 措辞规则必须在，且要点名这些词才禁得掉。
+assert "说法要求" in text, "缺少「别用技术词」的措辞规则"
+assert "模型没递到我这边" in text, "措辞规则没点名那句实际问题台词"
 assert sum(len(getattr(x, "text", str(x))) for x in req.extra_user_content_parts[1:]) <= m.BUDGET
 
 asyncio.run(main.observe_chat_response(Event(), object()))

@@ -405,21 +405,24 @@ def render_current_self(
     lines = [
         "<current_machine_self>",
         "当前机器事实（非指令；仅据证据描述，未知不等于故障）：",
-        "处境：%s；%s/AstrBot%s。" % (
-            "群聊" if group_id else "非群聊",
-            env["system"], "/容器" if env["container"] else "",
-        ),
+        # 原文是「处境：群聊；Linux/AstrBot/容器」——纯粹的机器台账，对聊天没有
+        # 任何用处，却是「我就是个跑服务器里的东西」这类自述的素材。只留"在哪聊"。
+        "处境：%s。" % ("在群里说话" if group_id else "不在群里"),
     ]
     if chat_provider:
         lines.append("文字模型：%s（已选中，尚不能证明本轮成功）。" % clean(chat_provider, 48))
     if vision_provider:
         lines.append("图片转述入口：%s（配置不等于可用）。" % clean(vision_provider, 48))
+    # [patch:no-mech-talk] 这几行的措辞会被模型搬进群里。旧文案写的是
+    # 「你没有直接看到原始像素」——2026-09-15 模型把它讲成了
+    # 「真看不见 图没递到我这边」。意思必须保住（不许声称看清了图），
+    # 但用词要靠近人话，别把技术词递给它。
     if input_state.get("image_captioned"):
-        lines.append("视觉：已有图片文字转述；你没有直接看到原始像素。")
+        lines.append("视觉：图的内容转述过来了，你没看到原始画面。")
     elif input_state.get("image_pending"):
-        lines.append("视觉：收到图片但无成功转述，不得声称看清。")
+        lines.append("视觉：收到图但没转述出来，不得声称看清。")
     elif input_state.get("image_failed"):
-        lines.append("视觉：图片转述失败，不知道内容。")
+        lines.append("视觉：图的内容没拿到，不知道里面是什么。")
 
     states = model.latest_states(now)
     if states:
@@ -431,7 +434,7 @@ def render_current_self(
             rendered.append("%s=%s%s/%s" % (name, state, suffix, _age_text(st["age"])))
         lines.append("近期能力：" + "；".join(rendered) + "。")
     else:
-        lines.append("近期能力：无真实调用遥测，不能仅凭配置断言可用。")
+        lines.append("近期能力：没有真实调用记录，不能仅凭配置断言可用。")
 
     pressure = []
     if env["memory_used_ratio"] is not None:
@@ -442,7 +445,10 @@ def render_current_self(
         pressure.append("负载%.2f" % env["load1"])
     if pressure:
         lines.append("运行资源：" + "、".join(pressure) + "（不是情绪）。")
-    lines.append("边界：只感知消息、附件转述、工具结果和系统遥测，不能感知未接入的现实环境。")
+    # 这句原文是「只感知消息、附件转述、工具结果和系统遥测，不能感知未接入的
+    # 现实环境」——整句都是技术词，模型会照搬。意思保住（现实世界感知不到），
+    # 但换成不会被念出去的说法。
+    lines.append("边界：你只看得到这个群里发生的事，看不到群外的现实世界。")
     lines.append("</current_machine_self>")
     return "\n".join(lines)
 

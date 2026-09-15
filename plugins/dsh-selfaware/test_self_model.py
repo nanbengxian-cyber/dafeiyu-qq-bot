@@ -118,8 +118,13 @@ assert m.inspect_input(req)["image_pending"]
 
 current = m.render_current_self(model, "group", "chat-main", "vision-opus5", m.inspect_input(req), now=2011)
 assert current.startswith("<current_machine_self>") and current.endswith("</current_machine_self>")
-assert "收到图片但无成功转述" in current and "不得声称看清" in current
-assert "直接看到原始像素" not in current
+assert "没转述出来" in current and "不得声称看清" in current
+# [no-mech-talk] 技术词不许出现在这个块里：以前写的是「你没有直接看到原始像素」，
+# 模型把技术措辞原样搬进群里，2026-09-15 讲成了「真看不见 图没递到我这边」。
+# 这里同时断言"这件事说了"（上一行）和"没用技术词说"（下面这组）。
+for _mech in ("像素", "遥测", "接入", "容器", "进程", "接口"):
+    assert _mech not in current, \
+        "机器自述块里出现了会被照搬的技术词 %r" % _mech
 assert len(current) < 700, len(current)
 assert m.render_long_self(model, now=2011) == ""
 for offset in range(5):
