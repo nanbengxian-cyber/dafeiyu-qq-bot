@@ -119,5 +119,20 @@ sub(
     '            f"每轮最多转述 {MAX_IMAGES} 张\\n"',
 )
 
+# 加载日志也带上放宽值：否则以后翻日志只看到「回看=4条」，会以为这个补丁没上线。
+sub(
+    '            "[imgctx] 已加载：开关=%s 回看=%d条 每轮最多=%d张 时效=%ds "\n'
+    '            "预算=%.0fs 动图抽帧=%d 缩图=%d 跳过自己=%s",\n'
+    '            "开" if ENABLED else "关",\n'
+    "            LOOKBACK,\n"
+    "            MAX_IMAGES,",
+    '            "[imgctx] 已加载：开关=%s 回看=%d条(说图放宽到%d条) 每轮最多=%d张 时效=%ds "\n'
+    '            "预算=%.0fs 动图抽帧=%d 缩图=%d 跳过自己=%s",\n'
+    '            "开" if ENABLED else "关",\n'
+    "            LOOKBACK,\n"
+    "            ASK_LOOKBACK,\n"
+    "            MAX_IMAGES,",
+)
+
 open(dst, "w", encoding="utf-8").write(s)
 print("已打 %d 处补丁 -> %s" % (n, dst))

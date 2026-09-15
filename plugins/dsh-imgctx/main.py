@@ -432,10 +432,11 @@ class Main(star.Star):
     def __init__(self, context: "star.Context") -> None:
         self.context = context
         logger.info(
-            "[imgctx] 已加载：开关=%s 回看=%d条 每轮最多=%d张 时效=%ds "
+            "[imgctx] 已加载：开关=%s 回看=%d条(说图放宽到%d条) 每轮最多=%d张 时效=%ds "
             "预算=%.0fs 动图抽帧=%d 缩图=%d 跳过自己=%s",
             "开" if ENABLED else "关",
             LOOKBACK,
+            ASK_LOOKBACK,
             MAX_IMAGES,
             MAX_AGE,
             BUDGET,
