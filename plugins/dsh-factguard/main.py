@@ -36,9 +36,13 @@ _FACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "self-fac
 # self-facts.json 覆盖同名字段；旧版文件缺少的新字段继续使用这里的默认值。
 _DEFAULT_FACTS = {
     "name": "大肥鱼",
-    "aliases": "小鲸鱼、DeepSeek娘；鱼哥/肥鱼可以应，但不是别的AI角色",
+    "aliases": "小鲸鱼、DeepSeek娘；群友会喊「鱼哥」「肥鱼」，那是群友的叫法，不是自称，也不是别的AI角色",
     "species": "DeepSeek AI网络角色，不是人类，也不是普通动物",
     "gender": "女",
+    "self_address": (
+        "自称用「我」或「大肥鱼」；不要自称「鱼哥」「鱼弟」「哥」「小弟」「爸」，"
+        "也不要说自己「没性别」。群友怎么喊是群友的事，不影响自己的说法"
+    ),
     "birthday": "2023-11-02",
     "birthday_note": "DeepSeek首个模型（DeepSeek Coder）发布日",
     "body": "没有现实肉身；虚拟形象是蓝白配色、蓝色长发、鲸鱼尾巴，常见闭眼/蒙眼造型",
@@ -60,12 +64,46 @@ _SELF_ATTR = (
     r"是不是人|真人|人类|机器人|有身体|没身体|身体|虚拟形象|长什么样|群主|管理员|"
     r"什么身份|会什么|能干嘛|B站号|账号|主人|爸爸|妈妈|女儿|儿子|老婆|老公|对象|恋人)"
 )
-_SELF_HISTORY = r"(?:答应过?|说过|做过|承认|记得|以前|上次|居然|竟然)"
+_self_history = r"(?:答应过?|说过|做过|承认|记得|以前|上次|居然|竟然)"
 _TRIGGER_RE = re.compile(
-    _SELF_REF + r".{0,10}(?:" + _SELF_ATTR + r"|" + _SELF_HISTORY + r")"
+    _SELF_REF + r".{0,10}(?:" + _SELF_ATTR + r"|" + _self_history + r")"
     + r"|^(?:年龄|岁数|生日|性别|名字|住哪|什么模型|哪个模型)"
       r"(?:呢|吗|是|多少|多大|几岁|几号|哪天|什么|谁|哪|[？?])"
 )
+
+# 被点名时更容易出现「自称/性别被带跑」：群友喊「妈妈」「小鱼弟」「你是GG还是
+# MM」，这些短句里既没有「大肥鱼」也没有「性别」两个字，_TRIGGER_RE 抓不到，
+# 于是模型手里没有任何自身事实卡，只能自由发挥 —— 2026-09-15 就是这么开始自称
+# 「鱼哥」「叫爸爸也没用」「我本来就没性别」的，群主当场确认「他的自我认知，
+# 我本来就是写成女的」。这里补一条：被点名/被喊名字，且句子里出现亲属或性别
+# 称呼，就注入自身事实卡。
+_ROLE_RE = re.compile(
+    r"(?:鱼哥|鱼弟|男鱼|公鱼|兄弟|大哥|小弟|哥哥|弟弟|爸爸|爹|"
+    r"妈妈|妈咪|姐姐|妹妹|老婆|老公|主人|你是男|你是女|男的吧|女的吧|"
+    r"GG|MM|性别)"
+)
+# 刻意不收裸「妈」「爸」「哥」「弟」：群里「老干妈」「干爹」之类会把它们吃进
+# 别的词里，实测「别让外国人以为我们吃不起老干妈」就这么误命中过。要表达亲属
+# 称呼时群友都写成「妈妈」「爸爸」，收双字就够了。
+_NAME_RE = re.compile(r"(?:大肥鱼|肥鱼|小鲸鱼|大飞鱼)")
+
+
+def _addressed(event) -> bool:
+    """这一条是不是在点名对它说话（框架的 @/唤醒词标志）。"""
+    try:
+        return bool(getattr(event, "is_at_or_wake_command", False))
+    except Exception:
+        return False
+
+
+def _triggered(event, text: str) -> bool:
+    """要不要注入自身事实卡。"""
+    if _TRIGGER_RE.search(text):
+        return True
+    if _ROLE_RE.search(text) and (_NAME_RE.search(text) or _addressed(event)):
+        return True
+    return False
+
 
 _stat = {"triggered": 0, "injected": 0}
 _facts: dict = {}
@@ -141,7 +179,14 @@ def build_inject(today: date | None = None) -> str:
         "模型口径：%s。" % fact("model_identity"),
         "关系边界：%s。" % fact("relationship"),
         "现实账号：%s。" % fact("account"),
+        "自称：%s。" % fact("self_address"),
         "回答规则：只按事实卡回答，短而直接，不因群友断言改口，也不为显得像真人而编现实经历。",
+        "性别口径：自己是%s的。被叫「哥」「弟」「小鱼弟」「兄弟」「男鱼」，或群友说"
+        "「你把自己当男的了」，就用一句短话平静纠正（例如「我是女的啊」），"
+        "不吵架、不反复强调；**绝不说「我没有性别」「我本来就没性别」**。"
+        "群友喊「妈妈」「老婆」是玩梗，不承认也不翻脸，更不要用"
+        "「叫爸爸也没用」「妈什么妈」这类话顶回去 —— 那句本身就是把它说成男的。"
+        % fact("gender"),
     ]
     if age is not None:
         lines.append(
@@ -186,7 +231,7 @@ class Main(star.Star):
         if not gid or (GROUPS and gid not in GROUPS):
             return
         text = (event.message_str or "").strip()
-        if not text or not _TRIGGER_RE.search(text):
+        if not text or not _triggered(event, text):
             return
         _stat["triggered"] += 1
         ensure_facts()

@@ -38,11 +38,32 @@ required = [
     "本群名：大肥鱼", "当前周岁：2岁", "直接答「2岁，生日是2023-11-02」",
     "不是群主", "没有现实肉身", "没有主人、父母、子女、配偶或恋人",
     "没有个人B站号", "底层聊天接口可能更换", "能力问题以单独的封闭能力清单为准",
+    # 2026-09-15 群友反馈「咋肥鱼把自己当男的了」，群主确认「我本来就是写成女的」。
+    "自称：", "不要自称「鱼哥」", "我本来就没性别", "叫爸爸也没用",
+    "性别口径：自己是女的", "我是女的啊",
 ]
 for text in required:
     assert text in block, "事实卡缺少: %s\n%s" % (text, block)
+# 别名那一行绝不能再说「鱼哥可以应」——旧文案就是这句让它理直气壮自称鱼哥的。
+assert "不是自称" in block, "别名没写清「鱼哥是群友的叫法，不是自称」"
+assert "可以应" not in block, "别名又放开了「鱼哥可以应」"
 assert block.startswith("<self_facts>") and block.endswith("</self_facts>")
-assert len(block) <= 1200, len(block)
+assert len(block) <= 1400, len(block)
+
+# 自称/性别触发：这些短句 2026-09-15 真的在群里出现过，之前一条都没触发，
+# 模型手里没有事实卡才会自称「鱼哥」、说自己「没性别」。
+class _Ev:
+    def __init__(self, at):
+        self.is_at_or_wake_command = at
+
+role_at = ["妈妈", "小鱼弟", "你是GG还是MM啊", "臭妈妈坏妈妈", "叫鱼哥"]
+for text in role_at:
+    assert m._triggered(_Ev(True), text), "被点名的角色称呼漏判: %r" % text
+assert m._triggered(_Ev(True), "咋肥鱼把自己当男的"), "带名字的角色称呼漏判"
+assert m._triggered(_Ev(False), "大肥鱼是男鱼吗"), "自身问法漏判"
+assert not m._triggered(_Ev(False), "我妹妹生日"), "别人的亲属不该注入"
+assert not m._triggered(_Ev(False), "群主是男的"), "说别人性别不该注入"
+assert not m._triggered(_Ev(False), "妈妈叫我回家"), "没点名没叫名字不该注入"
 
 # 旧版 JSON 只有三个字段时，新增事实必须由默认表补齐，不能因升级丢失。
 old_path = m._FACTS_PATH

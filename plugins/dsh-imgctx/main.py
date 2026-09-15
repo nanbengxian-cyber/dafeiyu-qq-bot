@@ -79,6 +79,14 @@ WARM_MAX = int(os.environ.get("DSH_IMGCTX_WARM", "4"))
 # 不等之后，有人发完图再@它问「这图是啥」，那张图算「历史图」，就会变成没看图
 # 直接答 —— 那正是答非所问。所以判不准的时候一律退回旧行为，慢一点好过瞎答。
 ASK_IMAGE_RE = re.compile(r"图|截图|表情|照片|画的|p的", re.IGNORECASE)
+# 「这一轮在说图」时往回多看几条（LOOKBACK 之外的加宽，只在说图时生效）。
+# 2026-09-15 实测翻车：群友 11:57:32 发图，12:00:24 才 @ 它问「图片里面的内容是
+# 什么意思」，中间隔了 6 条 —— LOOKBACK=4 够不着那张图，于是它没图可看，还被
+# clarify 判成「图片内容未知」，最后反问「图片里是什么意思？」并说「真看不见
+# 图没递到我这边」，群友当场不满（「为什么不吐槽一下图片里的内容」「你看不见
+# 吗」）。图片 URL 的 rkey 只活约 18 分钟，MAX_AGE=300s 已经在兜底，所以这里
+# 放宽到 ASK_LOOKBACK 条是安全的。
+ASK_LOOKBACK = int(os.environ.get("DSH_IMGCTX_ASK_LOOKBACK", "12"))
 # 第二种情形：图刚发出来没多久，大概率就是眼下在聊的那张。
 RECENT_IMAGE_S = int(os.environ.get("DSH_IMGCTX_RECENT", "45"))
 # 单张图下载超时
@@ -357,6 +365,7 @@ def _pick_images(
     self_id: str,
     cur_msg_id: str,
     include_current: bool = False,
+    lookback: int | None = None,
 ) -> list[dict]:
     """从群历史里挑出值得转述的图片，返回 [{file, url, who, age}]，新的在前。
 
@@ -364,11 +373,15 @@ def _pick_images(
 
     include_current=True 时连当前这条消息一起看 —— 只在框架转述失败
     （动图）的场合才这样，正常情况下当前消息是框架的地盘，别抢。
+
+    lookback 覆盖默认的 LOOKBACK：这一轮在说图时由调用方放大，好让「发完图隔
+    几条再问」也能找到那张图。不传就用 LOOKBACK。
     """
+    span = LOOKBACK if lookback is None else lookback
     now = time.time()
     picked: list[dict] = []
-    # 从最新往旧走，只看 LOOKBACK 条
-    for msg in reversed(messages[-LOOKBACK:] if LOOKBACK > 0 else messages):
+    # 从最新往旧走，只看 span 条
+    for msg in reversed(messages[-span:] if span > 0 else messages):
         mid = str(msg.get("message_id", ""))
         is_current = bool(cur_msg_id) and mid == cur_msg_id
         # 当前这条消息交给框架处理，不重复
@@ -679,8 +692,11 @@ class Main(star.Star):
         # ApiNotAvailable —— 实测刷了 25 条这个异常。
         _sid = str(getattr(event.message_obj, "self_id", "") or "")
         _kw = {"self_id": int(_sid)} if _sid.isdigit() else {}
+        # 这一轮在说图就多往回捞几条：有人发完图隔了几条才 @ 它问「图里是啥」，
+        # 只捞 LOOKBACK 条根本够不着那张图（见 ASK_LOOKBACK 的注释）。
+        span = max(LOOKBACK, ASK_LOOKBACK) if _turn_asks_about_image(req) else LOOKBACK
         history = await bot.get_group_msg_history(
-            group_id=int(group_id), count=LOOKBACK + 2, **_kw
+            group_id=int(group_id), count=span + 2, **_kw
         )
         # aiocqhttp 的 _handle_api_result 已经剥掉了 OneBot 的 data 外层，
         # 所以正常拿到的就是 {"messages": [...]}。但为了不被某个适配器版本
@@ -694,8 +710,31 @@ class Main(star.Star):
 
         self_id = str(getattr(event.message_obj, "self_id", "") or "")
         cur_id = str(getattr(event.message_obj, "message_id", "") or "")
-        items = _pick_images(messages, self_id, cur_id, include_current=rescue)
+        items = _pick_images(
+            messages, self_id, cur_id, include_current=rescue, lookback=span
+        )
         if not items:
+            # 这一轮在问图，但回看到底还是没捞到（图太老、rkey 过期、被撤了）。
+            # 什么都不说的话，模型会开始解释自己的内部机制 —— 2026-09-15 它就是这么
+            # 说出「图我这轮没拿到内容」「真看不见 图没递到我这边」的，群友当场回
+            # 「你看不见吗」「为什么不吐槽一下图片里的内容」。这两种说法都是硬伤：
+            # 既是内部状态泄露，又把自己说成没有看图能力（其实能力是有的，只是这
+            # 张拿不到）。所以这里明确告诉它：照常接话，别提机制、别否认能力。
+            if _turn_asks_about_image(req):
+                try:
+                    req.extra_user_content_parts.append(
+                        TextPart(
+                            text=(
+                                "（这轮没能取到群里那张图的内容：图太旧、链接已过期或"
+                                "已被撤回。就按现有信息正常接话，或者直说没跟上、让对方"
+                                "再发一次；**不要说自己看不见图／没有看图能力，也不要"
+                                "解释图片是怎么到你这儿的**。）"
+                            )
+                        )
+                    )
+                    logger.info("[imgctx] 在说图但这轮取不到图，已注入「别否认看图能力」提示")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[imgctx] 兜底提示注入失败: %s", exc)
             return
         await self._emit(req, provider_id, items, rescue=rescue)
 
@@ -852,7 +891,8 @@ class Main(star.Star):
         pid = self._caption_provider_id() or "（未配置）"
         yield event.plain_result(
             f"图片上下文：{'开' if ENABLED else '关'}\n"
-            f"回看最近 {LOOKBACK} 条消息，每轮最多转述 {MAX_IMAGES} 张\n"
+            f"回看最近 {LOOKBACK} 条消息（说图时放宽到 {ASK_LOOKBACK} 条），"
+            f"每轮最多转述 {MAX_IMAGES} 张\n"
             f"图片时效 {MAX_AGE}s，总预算 {BUDGET:.0f}s\n"
             f"当前消息/引用图：等到转述完；历史顺带图：只吃缓存、其余后台转述\n"
             f"历史图例外（照旧等）：当轮提到图，或图在 {RECENT_IMAGE_S}s 内\n"
