@@ -33,7 +33,9 @@ KS_ALIAS=${KS_ALIAS:-release}
 
 APP=app
 BUILD=build
-OUT=$BUILD/dafeiyu-controller.apk
+# 产物路径可用 OUT_APK 覆盖。定制版构建会指向另一个文件名 —— 否则它会覆盖掉
+# 公开版产物（同一路径），一不小心就会把带内置服务器的包当成公开版发出去。
+OUT=${OUT_APK:-$BUILD/dafeiyu-controller.apk}
 
 say() { printf '\033[1m› %s\033[0m\n' "$1"; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
@@ -166,6 +168,28 @@ if ! grep -qa 'com/jcraft/jsch/Session' "$BUILD/check.dex"; then
 fi
 if ! grep -qa 'io/nayuki/qrcodegen/QrCode' "$BUILD/check.dex"; then
   die "dex 里没有 QR 库"
+fi
+# 预设闸门：**默认构建必须是空预设**（公开仓库零真实信息的硬规矩）。
+# build-preset.sh 会注入真实地址后构建并自动还原；万一还原失败（脚本被杀/磁盘满），
+# 真实地址就会被编进这个包 —— 这条闸拦住它。
+# 定制版构建时用 DSH_PRESET_BUILD=1 显式声明，跳过本闸（它本来就要带预设）。
+if [ "${DSH_PRESET_BUILD:-0}" != "1" ]; then
+  if grep -qa '这是定制版：服务器地址已内置' "$BUILD/check.dex"; then
+    die "这个包含内置服务器（定制版），不能当公开版发布 —— 请检查 Preset.java 是否已还原"
+  fi
+  # 只拦「真实基础设施特征」，不拦文档里的占位符（如 1.2.3.4:6099）：
+  #   * *.ts.net —— Tailscale 域名，一定是真实服务器；
+  #   * 非文档段的公网 IP（RFC 5737 的 192.0.2/198.51.100/203.0.113 与私网段不算）。
+  if grep -qaE 'https?://[A-Za-z0-9.-]+\.ts\.net' "$BUILD/check.dex"; then
+    die "dex 里出现 Tailscale 真实域名 —— 拒绝产出公开包"
+  fi
+  if grep -qaE '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}' "$BUILD/check.dex"; then
+    HIT=$(grep -aoE '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}' "$BUILD/check.dex" | sort -u | tr '\n' ' ')
+    case "$HIT" in
+      *1.2.3.4*|*192.0.2.*|*198.51.100.*|*203.0.113.*|*0.0.0.0*|*127.0.0.1*) ;;
+      *) die "dex 里出现疑似真实服务器地址（$HIT）—— 拒绝产出公开包" ;;
+    esac
+  fi
 fi
 
 SIZE=$(stat -c %s "$OUT")

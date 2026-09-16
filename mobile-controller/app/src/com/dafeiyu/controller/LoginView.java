@@ -62,6 +62,8 @@ public final class LoginView {
     private Button refreshQrBtn;
     private EditText uin;
     private TextView uinNote;
+    private EditText presetPass;
+    private Button presetBtn;
     private EditText qqPassword;
     private TextView pwResult;
     private LinearLayout quickBox;
@@ -102,6 +104,20 @@ public final class LoginView {
         c1.addView(token);
         totp = UiKit.input(ctx, "两步验证动态码（没开 2FA 就留空）", false);
         c1.addView(totp);
+        // 定制版（Preset.HAS_PRESET）：地址已内置，Token 以密文形式在包里，
+        // 用构建时给的一次性口令解锁。公开版这块完全不出现 —— 代码路径都不走。
+        if (Preset.HAS_PRESET) {
+            address.setText(Preset.WEBUI_BASE);
+            c1.addView(UiKit.text(ctx, "这是定制版：服务器地址已内置，"
+                    + "填解锁口令就能连（口令不会保存）。", 12, Theme.GOOD));
+            presetPass = UiKit.input(ctx, "解锁口令", true);
+            c1.addView(presetPass);
+            presetBtn = UiKit.button(ctx, "解锁并连接", false);
+            c1.addView(presetBtn);
+            if (!Preset.HINT.isEmpty()) {
+                c1.addView(UiKit.text(ctx, Preset.HINT, 11, Theme.DIM));
+            }
+        }
         connectBtn = UiKit.button(ctx, "连接", true);
         c1.addView(connectBtn);
         connState = UiKit.text(ctx, "未连接。", 12, Theme.DIM);
@@ -233,8 +249,36 @@ public final class LoginView {
 
         address.setText(store.webuiBase());
         uin.setText(store.lastUin());
+        if (Preset.HAS_PRESET) {
+            presetBtn.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    unlockAndConnect();
+                }
+            });
+        }
         root = scroll;
         return root;
+    }
+
+    /**
+     * 定制版专用：用口令解开内置的加密 Token，填进 Token 框后走正常连接流程。
+     * 解出来的 Token 只存在于 EditText 与内存里，和手填完全同一条路（不落盘、不进日志）。
+     */
+    private void unlockAndConnect() {
+        String pass = presetPass.getText().toString();
+        if (pass.isEmpty()) {
+            host.toast("请填写解锁口令");
+            return;
+        }
+        try {
+            token.setText(PresetCrypto.decrypt(pass, Preset.TOKEN_SALT, Preset.TOKEN_IV,
+                    Preset.TOKEN_CT));
+        } catch (PresetCrypto.PresetException e) {
+            host.toast(e.getMessage());
+            return;
+        }
+        presetPass.setText("");   // 口令用完即弃，不留内存里
+        connect();
     }
 
     // ------------------------------------------------------------ 连接与轮询

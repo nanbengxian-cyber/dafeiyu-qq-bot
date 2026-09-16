@@ -17,7 +17,8 @@ SRC=app/src/com/dafeiyu/controller
 # 一旦有人把 android.* 的 import 加进这些文件，这里会立刻编译失败 ——
 # 这正是我们要的信号（可测的核心被污染了），而不是悄悄失去可测性。
 PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
-$SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java"
+$SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
+$SRC/PresetCrypto.java $SRC/Preset.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
@@ -27,6 +28,14 @@ done
 if grep -l '^import android\.' $PURE 2>/dev/null | grep -q .; then
   echo "以下文件混进了 android.* import，会失去可测性：" >&2
   grep -l '^import android\.' $PURE >&2
+  exit 1
+fi
+
+# 反向检查（血的教训）：UI 类里的控件字段，凡是「声明了但从未赋值」又「被 .方法() 调用」的，
+# 就是启动即崩的 NPE —— v1.0.0 的 testBtn/deployBtn 漏了创建，App 一打开就闪退。
+# 这类 bug 编译期不报、单测也碰不到（View 类不进测试面），只能靠静态扫。
+if ! python3 test/check-unassigned-fields.py; then
+  echo "控件字段未赋值检查未通过：上面的字段会以 null 被调用，App 启动就会崩。" >&2
   exit 1
 fi
 

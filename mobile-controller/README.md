@@ -69,6 +69,22 @@ bash test/run-tests.sh    # 纯 JVM，秒级，不需要模拟器
 改一份临时 `cmd_config.json`，并带变异验证（把落盘内容改坏，回读校验必须报错）。
 Activity/View 类刻意不进测试面（见 run-tests.sh 里的反向检查）。
 
+## 私有定制版 / Private preset build
+
+想让 App **默认就连你这台服务器**（不用每次填地址），用定制版构建：
+
+```bash
+bash build-preset.sh --base https://your-host.your-tailnet.ts.net:6099 \
+                    --token <WebUI_TOKEN> --pass '<一次性长口令>'
+# 产物：build/dafeiyu-controller-mine.apk（**不要提交、不要上传公开 Release**）
+```
+
+- Token 以 **AES-256-GCM 密文**编入 APK，密钥由 `--pass` 经 PBKDF2(20 万轮) 派生 ——
+  反编译只能拿到密文，没有口令解不开。**口令太弱时离线暴力破解仍可行**，请用长随机串。
+- 构建脚本把「注入 → 构建 → 还原」做成原子流程（还原在 `trap` 里），
+  公开仓库永远只有空模板；`build.sh` 另有一道闸：公开版里出现真实域名/定制版文案就拒绝产出。
+- 公开版（`build.sh`）与定制版产物**路径不同**，互不覆盖。
+
 ## 安全设计 / Security
 
 - **App 里不存任何密钥。** SSH 密码、WebUI Token、QQ 密码、TOTP 动态码、

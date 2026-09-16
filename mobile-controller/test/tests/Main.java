@@ -9,6 +9,7 @@ public final class Main {
         KnobsTest.run();
         DeployScriptTest.run();
         NapCatClientTest.run();
+        PresetCryptoTest.run();
         System.exit(T.report());
     }
 }

@@ -97,6 +97,9 @@ public final class ConsoleView {
 
         page.addView(UiKit.text(ctx, "三步：填配置 → 测试连接 → 开始部署。"
                 + "部署完成后到「登录」页扫码或用密码登录 QQ。", 12, Theme.DIM));
+        // 页面级状态行：部署/测试的进度都写在这里（setBusy 会更新它）。
+        statusLine = UiKit.text(ctx, "就绪。填好配置后点「测试连接」。", 12, Theme.DIM);
+        page.addView(statusLine);
 
         // ① 服务器连接
         LinearLayout c1 = UiKit.column(ctx);
@@ -115,6 +118,12 @@ public final class ConsoleView {
         trust.setTextSize(13);
         checks.put("trust_new_host", trust);
         c1.addView(trust);
+        // 这两个按钮是「三步」里的第二步和第三步。注意：**必须在这里创建** ——
+        // 它们下面的 setOnClickListener 直接引用字段，漏掉赋值就是启动即崩的 NPE。
+        testBtn = UiKit.button(ctx, "测试连接（只读预检，不改服务器）", false);
+        c1.addView(testBtn);
+        deployBtn = UiKit.button(ctx, "开始部署", true);
+        c1.addView(deployBtn);
         page.addView(cardWith("① 服务器连接", c1));
 
         // ② 源码与部署
