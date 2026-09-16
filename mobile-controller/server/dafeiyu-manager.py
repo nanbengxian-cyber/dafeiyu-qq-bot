@@ -375,7 +375,15 @@ def astrbot_started_marker(name):
     return "AstrBot started" in out.stdout.decode("utf-8", "replace")
 
 
-def wait_astrbot_ready(name, timeout=90):
+# App 端读超时是 120 秒（ManagerClient.request 里 setReadTimeout(120000)）。
+# apply_config 里会等两次（写之前一次、重启之后一次），所以每次的上限必须
+# 让**总时长**留在 120 秒以内，否则 App 会先超时报「连不上」，
+# 而服务端其实还在正常干活 —— 用户看到的就是「明明成功了却提示失败」。
+# 40 + 40 秒 + 重启开销，留足余量。
+READY_TIMEOUT = 40
+
+
+def wait_astrbot_ready(name, timeout=READY_TIMEOUT):
     """等实例的 AstrBot 真正启动完，最多等 timeout 秒。
 
     为什么要等：AstrBot 启动/退出时会把**内存里**的配置写回 cmd_config.json。
@@ -598,7 +606,7 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
     # 如果它还没启动完就重启它，那次「保存」会拿未初始化的状态覆盖我们的写入
     # —— 表现为「提示成功，过一会儿配置全空」。
     # 等它起来再写，就没有这个窗口。这样用户不用知道任何时序细节。
-    if not wait_astrbot_ready(name, timeout=90):
+    if not wait_astrbot_ready(name):
         raise ManagerError("这个机器人的聊天服务还没启动完，稍等半分钟再试。")
 
     write_json_bom(path, cfg)
@@ -631,7 +639,7 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
     compose(name, "restart", "astrbot", check=False)
 
     # 等 AstrBot 起来（它启动要十几秒），再回读校验
-    wait_astrbot_ready(name, timeout=90)
+    wait_astrbot_ready(name)
 
     back2 = read_json_maybe_bom(path)
     if gids or fids:

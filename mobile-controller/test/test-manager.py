@@ -12,6 +12,7 @@ dafeiyu-manager 的单元测试。
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -452,6 +453,48 @@ def test_read_config_reports_provider_ok():
     ok("prov[0]" not in body, "★ read_config 里不再出现 prov[0]")
 
 
+def test_apply_config_fits_app_timeout():
+    """★ 改配置的总耗时必须留在 App 的读超时之内。
+
+    为什么单独测这个：apply_config 会等两次 AstrBot 就绪（写之前一次、
+    重启之后一次）。如果哪天有人把等待上限调大（比如为了「更稳」调到 90 秒），
+    总耗时就会超过 App 的 120 秒读超时 ——
+    表现是 **App 报「连不上」，但服务端其实已经成功写好了**，
+    用户会反复重试，很难查。
+
+    这里把「两次等待 + 重启开销」的预算钉住，改大了就红。
+    """
+    src = open(SRC, encoding="utf-8").read()
+    m = re.search(r"^READY_TIMEOUT\s*=\s*(\d+)", src, re.M)
+    ok(m is not None, "有 READY_TIMEOUT 常量（等待上限集中定义，别散在调用处）")
+    if not m:
+        return
+    per = int(m.group(1))
+
+    # App 端读超时（ManagerClient.java）
+    app_src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "app", "src", "com", "dafeiyu", "controller",
+                           "ManagerClient.java")
+    app_timeout = 120
+    if os.path.exists(app_src):
+        t = open(app_src, encoding="utf-8").read()
+        tm = re.search(r"setReadTimeout\((\d+)\)", t)
+        if tm:
+            app_timeout = int(tm.group(1)) // 1000
+    ok(app_timeout >= 60, "App 读超时不少于 60 秒（现在 %d 秒）" % app_timeout)
+
+    # apply_config 里等两次；再给重启本身留 30 秒
+    worst = per * 2 + 30
+    ok(worst < app_timeout,
+       "★ 最坏耗时 %d 秒 < App 读超时 %d 秒（单次等待上限 %d 秒）"
+       % (worst, app_timeout, per))
+
+    # 等待次数也不能失控
+    body = src[src.find("def apply_config("):src.find("\ndef read_config(")]
+    ok(body.count("wait_astrbot_ready(") == 2,
+       "★ apply_config 里正好等两次（写前一次、重启后一次）")
+
+
 def test_route_ordering():
     """路由顺序：/instance/config 不能被 /instance/<名字> 抢走。
 
@@ -512,6 +555,7 @@ def main():
         test_apply_config_verifies_after_restart,
         test_main_provider_is_first_in_list,
         test_read_config_reports_provider_ok,
+        test_apply_config_fits_app_timeout,
     ]
     for t in tests:
         try:
