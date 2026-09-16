@@ -2,3 +2,9 @@ build/
 test/out/
 *.jks
 *.keystore
+test/desensitize-patterns.local.txt
+
+# Python 缓存（服务器脚本跑过就会生成）
+server/__pycache__/
+__pycache__/
+*.pyc

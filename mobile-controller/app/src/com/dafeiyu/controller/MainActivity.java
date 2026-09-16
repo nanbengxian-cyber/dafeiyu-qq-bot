@@ -3,7 +3,6 @@ package com.dafeiyu.controller;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
-import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -12,17 +11,19 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 /**
- * 壳 Activity：三个页签（登录 QQ / 控制台 / 教程）+ 各页面的宿主。
+ * 壳 Activity：四个页签（机器人 / 登录 QQ / 服务器 / 教程）。
  *
- * 页签切换只是改可见性 —— 两个页面各自持有状态（连接、已渲染的旋钮），
- * 切走再切回来不丢。竖屏锁定：旋钮和二维码的排版按竖屏设计，旋转重建
- * 会把这些状态冲掉，不值得为它写恢复逻辑。
+ * 页签切换只是改可见性 —— 各页面各自持有状态（连接、已渲染的列表），
+ * 切走再切回来不丢。竖屏锁定：列表和二维码的排版按竖屏设计。
+ *
+ * 「机器人」页是主界面：只填三个配置就能把机器人跑起来，而且能多开。
  */
 public final class MainActivity extends Activity {
 
     private Store store;
     private LoginView loginView;
-    private ConsoleView consoleView;
+    private RobotsView robotsView;
+    private ServerView serverView;
     private Button[] tabs;
     private View[] pages;
 
@@ -40,30 +41,31 @@ public final class MainActivity extends Activity {
         header.setOrientation(LinearLayout.VERTICAL);
         header.setPadding(Theme.dp(this, 16), Theme.dp(this, 14), Theme.dp(this, 16),
                 Theme.dp(this, 6));
-        TextView title = UiKit.text(this, "大肥鱼控制台", 19, Theme.TEXT);
+        TextView title = UiKit.text(this, "大肥鱼", 19, Theme.TEXT);
         title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
         header.addView(title);
-        header.addView(UiKit.text(this, "开放式登录 + 部署控制 · 第 1 版", 11, Theme.DIM));
+        header.addView(UiKit.text(this, "填三个配置就能跑 · 支持多个 QQ 号同时在线",
+                11, Theme.DIM));
         root.addView(header);
 
         // 页签
         LinearLayout tabRow = new LinearLayout(this);
         tabRow.setOrientation(LinearLayout.HORIZONTAL);
-        int pad = Theme.dp(this, 12);
+        int pad = Theme.dp(this, 8);
         tabRow.setPadding(pad, Theme.dp(this, 4), pad, 0);
-        String[] names = {"登录 QQ", "控制台", "教程"};
+        String[] names = {"机器人", "登录 QQ", "服务器", "教程"};
         tabs = new Button[names.length];
         for (int i = 0; i < names.length; i++) {
             final int index = i;
             Button b = new Button(this);
             b.setText(names[i]);
             b.setAllCaps(false);
-            b.setTextSize(13);
+            b.setTextSize(12);
             b.setTextColor(Theme.TEXT);
             b.setBackground(tabStyle(false));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            lp.setMargins(Theme.dp(this, 3), 0, Theme.dp(this, 3), 0);
+            lp.setMargins(Theme.dp(this, 2), 0, Theme.dp(this, 2), 0);
             b.setLayoutParams(lp);
             b.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
@@ -88,21 +90,46 @@ public final class MainActivity extends Activity {
                 startActivity(it);
             }
         }, store);
-        consoleView = new ConsoleView(this, new ConsoleView.Host() {
+
+        robotsView = new RobotsView(this, new RobotsView.Host() {
             public void toast(String msg) {
                 android.widget.Toast.makeText(MainActivity.this, msg,
-                        android.widget.Toast.LENGTH_LONG).show();
+                        android.widget.Toast.LENGTH_SHORT).show();
             }
-        }, store);
-        pages = new View[]{loginView.view(), consoleView.view(), tutorialView()};
+
+            public boolean connected() {
+                return Session.connected();
+            }
+
+            public void gotoServerTab() {
+                selectTab(2);
+            }
+
+            public void gotoLoginTab() {
+                selectTab(1);
+            }
+        });
+
+        serverView = new ServerView(this, new ServerView.Host() {
+            public void toast(String msg) {
+                android.widget.Toast.makeText(MainActivity.this, msg,
+                        android.widget.Toast.LENGTH_SHORT).show();
+            }
+
+            public void onConnectionChanged() {
+                robotsView.onShow();
+            }
+        });
+
+        pages = new View[]{robotsView.view(), loginView.view(),
+                serverView.view(), tutorialView()};
         for (View p : pages) {
-            // 高度 0 + weight 1：让 ScrollView 吃掉标题和页签之外的剩余空间，
-            // 写 WRAP_CONTENT 会让滚动区缩成内容高度，页面短时底部留白、长时滚不动。
+            // 高度 0 + weight 1：让 ScrollView 吃掉标题和页签之外的剩余空间
             root.addView(p, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         }
         setContentView(root);
-        selectTab(Math.max(0, Math.min(2, store.tab())));
+        selectTab(Math.max(0, Math.min(3, store.tab())));
     }
 
     private android.graphics.drawable.GradientDrawable tabStyle(boolean active) {
@@ -120,6 +147,15 @@ public final class MainActivity extends Activity {
             pages[i].setVisibility(i == index ? View.VISIBLE : View.GONE);
         }
         store.setTab(index);
+        if (index == 0) {
+            robotsView.onShow();
+        }
+        if (index == 1) {
+            loginView.onShow();
+        }
+        if (index == 2) {
+            serverView.onShow();
+        }
     }
 
     @Override
@@ -147,58 +183,41 @@ public final class MainActivity extends Activity {
     }
 
     private static final String TUTORIAL = ""
-            + "这个 App 做两件事：把机器人 QQ 登录到你自己的服务器上，"
-            + "以及像桌面控制台一样一键部署。\n"
+            + "这个 App 让你在手机上把机器人跑起来，并且能同时挂好几个 QQ 号。\n"
             + "\n"
-            + "【先准备一台服务器】\n"
-            + " · 一台 Linux 服务器（推荐 Debian 12 或 Ubuntu 22.04），内存 2 GB 以上。\n"
-            + " · 你能用 SSH 登录它（有地址、端口、用户名和密码）。\n"
-            + " · 安全组放行：SSH 端口、NapCat 端口、AstrBot 端口（默认 6185/6186）。\n"
+            + "【怎么用：填三个配置就行】\n"
+            + " 1. 打开 App，「服务器」页会自动连上（如果没连上，点一下「连接」）。\n"
+            + " 2. 到「机器人」页，起个名字点「新建」—— 一个机器人 = 一个 QQ 号。\n"
+            + " 3. 点这个机器人的「启动」，等十几秒。\n"
+            + " 4. 到「登录 QQ」页扫码，把这个号登上去。\n"
+            + " 5. 回到「机器人」页，点「展开配置」，填三样东西：\n"
+            + "    ① 主聊天 API：接口地址、API Key、模型名（用你自己的）。\n"
+            + "    ② 聊天范围：要它说话的群号，和允许私聊的 QQ 号，逗号隔开。\n"
+            + "    ③ 人格提示词：它是谁、该怎么说话。\n"
+            + "    点「保存到服务器」，约 10 秒后生效。\n"
             + "\n"
-            + "【部署机器人】（「控制台」页）\n"
-            + " 1. 填服务器地址、SSH 端口、用户名、密码。\n"
-            + " 2. 源码仓库地址保持默认（官方镜像仓库），或换成你自己的 fork。\n"
-            + " 3. 点「测试连接」—— 只读检查系统、Git、Docker 和磁盘，不改服务器。\n"
-            + " 4. 点「开始部署」—— 自动完成：下载源码 → 准备目录与配置 → 拉镜像 → 启动。\n"
-            + "    部署目录默认 ~/dafeiyu-bot，只管理带专用标记的目录，不会动你已有的项目。\n"
-            + " 5. 部署完成后在「配置」里按需调参数；没把握就先不动。\n"
+            + "【想同时挂好几个 QQ 号？】\n"
+            + " · 在「机器人」页再点一次「新建」，起另一个名字（比如 qq2）。\n"
+            + " · 各自「启动」，各自到「登录 QQ」页扫码登录不同的号。\n"
+            + " · 每个号的配置互相独立，互不影响。\n"
+            + " · 服务器会自动给每个机器人分配独立的端口和数据目录，\n"
+            + "   你不用管这些，也不会串号。\n"
             + "\n"
-            + "【告诉机器人该在哪儿说话、用哪个模型】（「控制台」页 ⑤）\n"
-            + " · 群号：填允许机器人说话的群，多个用逗号隔开（如 100000001,100000002）。\n"
-            + " · 私聊 QQ 号：填允许机器人回私聊的人，多个用逗号隔开。\n"
-            + " · 两个都填就群聊私聊都管；填完点「写入服务器」——\n"
-            + "   服务器只会在这几个会话里说话，别处一律不理（这是机器人的白名单）。\n"
-            + " · 主聊天 API：接口地址、API Key、模型名，用**你自己的**。\n"
-            + "   这个 App 不带任何 API Key，你不填机器人就没法回答。\n"
-            + "   API Key 只上传到你的服务器，App 不保存、界面不回显。\n"
-            + " · 写完 App 会自动重启 AstrBot 让配置生效（约 10 秒）。\n"
+            + "【API Key 从哪来？】\n"
+            + " · 去你想用的模型服务商那里申请（DeepSeek、通义、智谱、月之暗面等）。\n"
+            + " · 接口地址一般形如 https://api.xxx.com/v1，模型名问服务商要。\n"
+            + " · App 不保存 Key，界面上也不回显；Key 只写进服务器上该机器人的配置里。\n"
             + "\n"
-            + "【登录 QQ】（「登录」页）\n"
-            + " 1. 填 NapCat WebUI 的地址（服务器 IP:WebUI 端口）和 Token。\n"
-            + "    Token 在服务器的 webui.json 里，或容器启动日志里找。\n"
-            + " 2. 点「连接」。之后三个登录方式任选：\n"
-            + "    · 扫码 —— 页面直接出二维码，用手机 QQ 扫；\n"
-            + "    · 密码 —— 填 QQ 号和密码点登录；要求安全验证时按提示切网页；\n"
-            + "    · 快速登录 —— 服务器上登录过的号一键再登。\n"
-            + " 3. 密码框上面那个 QQ 号还是**防呆校验**：登录后 App 会拿服务器上\n"
-            + "   真正登录的号和它比，对不上会红字提醒你（登录错号从二维码上看不出来）。\n"
-            + " 4. 顶部「机器人状态」每 2.5 秒自动刷新，在线变绿就成功了。\n"
+            + "【机器人不回话怎么办？】\n"
+            + " · 先看「机器人」页那行状态是不是「运行中」。\n"
+            + " · 再看「登录 QQ」页顶部状态是不是在线（离线就重新扫码）。\n"
+            + " · 再看群号/私聊号填对没有 —— 机器人只在你填的会话里说话。\n"
+            + " · 还不行就检查 API Key 和模型名，填错会导致它收到消息但答不出来。\n"
             + "\n"
-            + "【安全边界】\n"
-            + " · App 里不保存任何密码/Token/密钥：SSH 密码、WebUI Token、QQ 密码\n"
-            + "   都只在内存里，退出即没。保存的只有地址类的非敏感配置。\n"
-            + " · App 与服务器之间是明文 HTTP/SSH 2，别在不可信的公共 Wi-Fi 下操作。\n"
-            + " · 部署只动带 .dafeiyu-managed 标记的目录，绝不会覆盖你已有的部署。\n"
-            + " · 部署日志全部脱敏后上屏，不会把密码打进日志。\n"
-            + "\n"
-            + "【常见问题】\n"
-            + " · 「首次连接该服务器」：勾选「首次连接接受服务器指纹」再连一次。\n"
-            + " · 「当前账号无权访问 Docker」：用 root，或把用户加入 docker 组。\n"
-            + " · 「部署目录已存在且不是本控制台创建的」：换一个部署目录。\n"
-            + " · 二维码扫不动：点「刷新二维码」；还不行就「重启 NapCat」出新码。\n"
-            + " · 密码登录要求验证码/新设备验证：点「打开内置网页登录页」完成那一步。\n"
-            + " · 「服务器上还没有 AstrBot 配置」：先点「开始部署」把容器跑起来一次，\n"
-            + "   再回来写聊天范围和主聊天 API。\n"
-            + " · 机器人不回复：先看「运行状态」两个容器是不是 running；\n"
-            + "   再看群号/私聊号有没有写对（机器人只在白名单里的会话说话）。\n";
+            + "【安全说明】\n"
+            + " · App 和服务器之间是一条加密隧道，服务器上的管理端口不对公网开放。\n"
+            + " · App 里内置的是一把「只能连管理端口」的专用钥匙，\n"
+            + "   它登不了服务器的命令行，也连不了别的端口。\n"
+            + " · 手机上不保存 QQ 密码、API Key 这类东西，退出 App 就没了。\n"
+            + " · 这个 App 只管理它自己创建的那些机器人，不碰服务器上别的东西。\n";
 }

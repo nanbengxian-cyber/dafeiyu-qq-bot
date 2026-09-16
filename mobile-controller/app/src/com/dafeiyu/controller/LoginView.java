@@ -47,7 +47,8 @@ public final class LoginView {
     private final Store store;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService pool = Executors.newSingleThreadExecutor();
-    private final NapCatClient client = new NapCatClient(new NapCatClient.Real());
+    // 走 RoutingTransport：连了服务器就经隧道，没连就直连。
+    private final NapCatClient client = new NapCatClient(new RoutingTransport());
 
     private View root;
     private EditText address;
@@ -55,6 +56,8 @@ public final class LoginView {
     private EditText totp;
     private Button connectBtn;
     private TextView connState;
+    private TextView serverNote;
+    private TextView manualNote;
     private TextView statusLine;
     private TextView detailLine;
     private ImageView qrImage;
@@ -62,8 +65,6 @@ public final class LoginView {
     private Button refreshQrBtn;
     private EditText uin;
     private TextView uinNote;
-    private EditText presetPass;
-    private Button presetBtn;
     private EditText qqPassword;
     private TextView pwResult;
     private LinearLayout quickBox;
@@ -95,29 +96,18 @@ public final class LoginView {
         // ① 连接
         LinearLayout connCard = UiKit.card(ctx, "① 连接机器人的 NapCat 网页");
         LinearLayout c1 = UiKit.inner(connCard);
-        c1.addView(UiKit.text(ctx, "填你服务器上 NapCat WebUI 的地址和 Token。"
+        serverNote = UiKit.text(ctx, "", 12, Theme.GOOD);
+        c1.addView(serverNote);
+        manualNote = UiKit.text(ctx, "填你服务器上 NapCat WebUI 的地址和 Token。"
                 + "地址形如 1.2.3.4:6099；Token 在服务器 webui.json 里（或启动日志）。",
-                12, Theme.DIM));
+                12, Theme.DIM);
+        c1.addView(manualNote);
         address = UiKit.input(ctx, "WebUI 地址，例如 1.2.3.4:6099", false);
         c1.addView(address);
         token = UiKit.input(ctx, "WebUI Token（不会保存）", true);
         c1.addView(token);
         totp = UiKit.input(ctx, "两步验证动态码（没开 2FA 就留空）", false);
         c1.addView(totp);
-        // 定制版（Preset.HAS_PRESET）：地址已内置，Token 以密文形式在包里，
-        // 用构建时给的一次性口令解锁。公开版这块完全不出现 —— 代码路径都不走。
-        if (Preset.HAS_PRESET) {
-            address.setText(Preset.WEBUI_BASE);
-            c1.addView(UiKit.text(ctx, "这是定制版：服务器地址已内置，"
-                    + "填解锁口令就能连（口令不会保存）。", 12, Theme.GOOD));
-            presetPass = UiKit.input(ctx, "解锁口令", true);
-            c1.addView(presetPass);
-            presetBtn = UiKit.button(ctx, "解锁并连接", false);
-            c1.addView(presetBtn);
-            if (!Preset.HINT.isEmpty()) {
-                c1.addView(UiKit.text(ctx, Preset.HINT, 11, Theme.DIM));
-            }
-        }
         connectBtn = UiKit.button(ctx, "连接", true);
         c1.addView(connectBtn);
         connState = UiKit.text(ctx, "未连接。", 12, Theme.DIM);
@@ -249,36 +239,8 @@ public final class LoginView {
 
         address.setText(store.webuiBase());
         uin.setText(store.lastUin());
-        if (Preset.HAS_PRESET) {
-            presetBtn.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    unlockAndConnect();
-                }
-            });
-        }
         root = scroll;
         return root;
-    }
-
-    /**
-     * 定制版专用：用口令解开内置的加密 Token，填进 Token 框后走正常连接流程。
-     * 解出来的 Token 只存在于 EditText 与内存里，和手填完全同一条路（不落盘、不进日志）。
-     */
-    private void unlockAndConnect() {
-        String pass = presetPass.getText().toString();
-        if (pass.isEmpty()) {
-            host.toast("请填写解锁口令");
-            return;
-        }
-        try {
-            token.setText(PresetCrypto.decrypt(pass, Preset.TOKEN_SALT, Preset.TOKEN_IV,
-                    Preset.TOKEN_CT));
-        } catch (PresetCrypto.PresetException e) {
-            host.toast(e.getMessage());
-            return;
-        }
-        presetPass.setText("");   // 口令用完即弃，不留内存里
-        connect();
     }
 
     // ------------------------------------------------------------ 连接与轮询
@@ -287,15 +249,21 @@ public final class LoginView {
         if (busy) {
             return;
         }
-        final String base = NapCatClient.normalize(address.getText().toString());
-        final String tok = token.getText().toString();
-        final String code = totp.getText().toString();
+        final boolean via = RoutingTransport.viaServer();
+        final String base = via ? "http://127.0.0.1"
+                : NapCatClient.normalize(address.getText().toString());
+        final String tok = via ? "" : token.getText().toString();
+        final String code = via ? "" : totp.getText().toString();
         if (base.isEmpty()) {
             host.toast("请填 WebUI 地址");
             return;
         }
-        if (tok.isEmpty()) {
+        if (!via && tok.isEmpty()) {
             host.toast("请填 WebUI Token");
+            return;
+        }
+        if (via && RoutingTransport.activeInstance().isEmpty()) {
+            host.toast("先回「机器人」页点「登录这个 QQ」");
             return;
         }
         busy = true;
@@ -304,19 +272,39 @@ public final class LoginView {
         connState.setTextColor(Theme.DIM);
         bg(new Runnable() {
             public void run() {
-                client.configure(base, tok, code);
+                String useTok = tok;
+                if (via) {
+                    // NapCat 的 WebUI Token 由服务器生成，用户看不到也不需要知道 ——
+                    // 直接向管理服务要，经隧道用。
+                    try {
+                        useTok = Session.client().webuiToken(
+                                RoutingTransport.activeInstance());
+                    } catch (Exception e) {
+                        fail("拿不到这个机器人的 WebUI 凭据：" + e.getMessage());
+                        return;
+                    }
+                    if (useTok == null || useTok.isEmpty()) {
+                        fail("这个机器人还没跑起来，先回「机器人」页点「启动」。");
+                        return;
+                    }
+                }
+                client.configure(base, useTok, code);
                 try {
                     client.login();
                 } catch (NapCatClient.ApiError e) {
                     fail(e.getMessage());
                     return;
                 }
-                store.setWebuiBase(base);
+                if (!via) {
+                    store.setWebuiBase(base);
+                }
                 onUi(new Runnable() {
                     public void run() {
                         busy = false;
                         connectBtn.setEnabled(true);
-                        connState.setText("已连接：" + base);
+                        connState.setText(via
+                                ? "已连接：" + RoutingTransport.activeInstance()
+                                : "已连接：" + base);
                         connState.setTextColor(Theme.GOOD);
                         token.setText("");
                         totp.setText("");
@@ -327,6 +315,33 @@ public final class LoginView {
                 loadQuickList();
             }
         });
+    }
+
+    /**
+     * 页面显示时调用。连了服务器的话，用户什么都不用填 ——
+     * 地址、Token 都从管理服务取，请求经隧道代理到选中的那个实例。
+     */
+    public void onShow() {
+        boolean via = RoutingTransport.viaServer();
+        serverNote.setVisibility(via ? View.VISIBLE : View.GONE);
+        manualNote.setVisibility(via ? View.GONE : View.VISIBLE);
+        address.setVisibility(via ? View.GONE : View.VISIBLE);
+        token.setVisibility(via ? View.GONE : View.VISIBLE);
+        totp.setVisibility(via ? View.GONE : View.VISIBLE);
+        connectBtn.setText(via ? "登录选中的机器人" : "连接");
+
+        if (via) {
+            String inst = RoutingTransport.activeInstance();
+            serverNote.setText("正在操作「" + inst + "」（经服务器，无需填地址）。"
+                    + "在「机器人」页点别的机器人可以切换。");
+        } else if (Session.connected()) {
+            serverNote.setVisibility(View.VISIBLE);
+            serverNote.setText("已连服务器，但还没选机器人。"
+                    + "回「机器人」页点「登录这个 QQ」。");
+        }
+        if (client.connected()) {
+            startPolling();
+        }
     }
 
     public void onResume() {

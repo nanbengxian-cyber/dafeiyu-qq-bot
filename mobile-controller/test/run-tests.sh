@@ -18,7 +18,8 @@ SRC=app/src/com/dafeiyu/controller
 # 这正是我们要的信号（可测的核心被污染了），而不是悄悄失去可测性。
 PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
 $SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
-$SRC/PresetCrypto.java $SRC/Preset.java"
+$SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
+$SRC/ProxyTransport.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
@@ -42,7 +43,16 @@ fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-javac -encoding UTF-8 -nowarn -d "$OUT" -cp app/src \
+# Tunnel.java 用到 JSch（端口转发），测试面里要带上这个 jar
+JSCH=lib/jsch-0.2.17.jar
+[ -f "$JSCH" ] || { echo "缺 $JSCH" >&2; exit 1; }
+
+javac -encoding UTF-8 -nowarn -d "$OUT" -cp "app/src:$JSCH" \
   $PURE test/tests/*.java
 
-java -cp "$OUT" tests.Main
+java -cp "$OUT:$JSCH" tests.Main
+
+# 产物脱敏自检（有产物才跑 —— 纯测试时 build/ 可能是空的）
+if [ -f build/dafeiyu-controller.apk ]; then
+  bash test/check-desensitize.sh || exit 1
+fi

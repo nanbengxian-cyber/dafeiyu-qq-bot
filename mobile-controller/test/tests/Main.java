@@ -10,6 +10,8 @@ public final class Main {
         DeployScriptTest.run();
         NapCatClientTest.run();
         PresetCryptoTest.run();
+        // 隧道/管理服务/代理 —— 新增的「连服务器」这一层
+        TunnelManagerTest.run();
         System.exit(T.report());
     }
 }
