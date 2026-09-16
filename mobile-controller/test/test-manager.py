@@ -240,6 +240,19 @@ def test_apply_config_writes_and_verifies():
         eq(back["provider_sources"][0]["api_base"], "https://api.example.com/v1",
            "接口地址写入")
         eq(back["provider_sources"][0]["key"], ["sk-test-key"], "API Key 写入")
+
+        # ★ 字段完整性：这些字段少了 AstrBot 会直接 KeyError 崩在加载阶段
+        #   （实测：provider 缺 "enable" → KeyError: 'enable'，日志只有 traceback，
+        #    界面上完全看不出是「少了个字段」，表现就是「设了 API 但不说话」）。
+        #   断言写成「缺任何一个都失败」，而不是逐个 isTrue —— 这样删掉哪个都会红。
+        prov = back["provider"][0]
+        for f in ("id", "provider_source_id", "enable", "model",
+                  "modalities", "custom_extra_body"):
+            ok(f in prov, "★ provider 条目含 %s（缺了会 KeyError）" % f)
+        src_entry = back["provider_sources"][0]
+        for f in ("id", "provider", "type", "provider_type", "key",
+                  "api_base", "timeout", "proxy", "custom_headers", "enable"):
+            ok(f in src_entry, "★ provider_sources 条目含 %s" % f)
         # 人格要落到数据库（不是 cmd_config.json 的废弃字段）
         import sqlite3 as _sq2
         c2 = _sq2.connect(dbp)
@@ -344,14 +357,99 @@ def test_readback_verification_catches_bad_write():
         raises(lambda: m.apply_config("t1", "476573490", "", "", "", "", ""),
                "回读校验失败", "★ 写入被篡改时，回读校验必须报错")
 
-        # 同理：API provider 没落盘也要被抓住
+        # 同理：API provider 没落盘也要被抓住。
+        # 注意篡改的是 provider 列表 —— 判据已从 default_provider_id
+        # 改成「provider[0] 是不是我们的」（4.28+ 会删掉 default_provider_id，
+        # 所以那个键不能再当判据）。
         m.write_json_bom = lambda path, data: real_write(
-            path, {k: v for k, v in data.items() if k != "provider_settings"})
+            path, {k: v for k, v in data.items() if k != "provider"})
         raises(lambda: m.apply_config("t1", "", "", "https://x.example/v1",
                                       "sk-k", "mdl", ""),
                "回读校验失败", "★ provider 没落盘时也要报错")
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_apply_config_verifies_after_restart():
+    """★ 回归测试：写配置后必须**在重启之后**再回读一次。
+
+    这个 bug 真的发生过，而且非常隐蔽：
+      AstrBot 启动时会用内存里的配置**重写** cmd_config.json。
+      用户在实例刚起来时写配置 → 我们写文件成功、回读也通过 →
+      紧接着的重启把内存里的旧状态写回去 → 配置全没了。
+      而接口返回的是 {"ok": true, "verified": true} —— 用户以为成功了。
+
+    判据（静态检查源码结构）：
+      ① apply_config 里要有「重启」调用；
+      ② 重启之后还要有一次回读校验（不能只在重启前校验）。
+    """
+    src = open(SRC, encoding="utf-8").read()
+    i_apply = src.find("def apply_config(")
+    i_next = src.find("\ndef read_config(", i_apply)
+    assert i_apply > 0 and i_next > i_apply, "找不到 apply_config 函数体"
+    body = src[i_apply:i_next]
+
+    i_restart = body.find('"restart"')
+    ok(i_restart > 0, "apply_config 里有重启 astrbot 的调用")
+
+    # 重启之后必须还有回读校验
+    after = body[i_restart:]
+    ok("read_json_maybe_bom" in after or "read_config" in after,
+       "★ 重启之后还有回读校验（只在重启前校验不够）")
+    ok("配置没保住" in after,
+       "★ 重启后校验失败时给出可行动提示（而不是静默成功）")
+    # 而且要等 AstrBot 起来
+    ok("wait_astrbot_ready" in after,
+       "★ 重启后等 AstrBot 启动完再校验（否则读到假象）")
+
+
+def test_main_provider_is_first_in_list():
+    """★ 主聊天 API 必须排在 provider 列表的**第一位**。
+
+    为什么不能用 default_provider_id：
+      AstrBot 4.27 有 provider_settings.default_provider_id，
+      4.28 起这个键被**删掉了**（default.py 里已经没有它）。
+      而 check_config_integrity 对 schema 里不认识的键是**直接删**，
+      所以写进去也会被静默抹掉，日志里只有一句 "Config key removed"。
+
+      4.28 选 provider 的实际逻辑（provider/manager.py:_resolve_using_provider）：
+        先看 agent_runner 的 model.provider_id，没有就取 provider_insts[0]。
+      也就是说 —— **列表第一个就是默认**。
+
+    这个测试钉住「顺序」这个真正生效的机制：
+    即使有人把 default_provider_id 那行删了，顺序对了功能就还对。
+    """
+    src = open(SRC, encoding="utf-8").read()
+    i = src.find("def apply_config(")
+    j = src.find("\ndef read_config(", i)
+    body = src[i:j]
+
+    # 必须把新条目拼在**前面**（[src] + [...] 而不是 [...] + [src]）
+    ok('cfg["provider_sources"] = [src] + [' in body,
+       "★ provider_sources 把主 API 放第一位（4.28 靠顺序选 provider）")
+    ok('cfg["provider"] = [prov] + [' in body,
+       "★ provider 把主 API 放第一位")
+    # 判据也不能依赖被删掉的键
+    ok('(back.get("provider_settings") or {}).get("default_provider_id")' not in body,
+       "★ 回读校验不看 default_provider_id（4.28 会删它）")
+    ok('provs[0].get("id") != "dafeiyu-main"' in body,
+       "★ 回读校验改成看 provider[0]")
+
+
+def test_read_config_reports_provider_ok():
+    """★ read_config 的 provider_ok 必须反映「主 API 是否真的生效」。
+
+    这个字段直接决定 App 上显示「已配置」还是「没配置」。
+    踩过的坑：prov 变量从「列表」改成「字符串」后，判断里还在用 prov[0]，
+    结果永远返回 False —— 用户明明配好了，界面却说没配。
+    """
+    src = open(SRC, encoding="utf-8").read()
+    i = src.find("def read_config(")
+    j = src.find("\ndef webui_token(", i)
+    body = src[i:j]
+    ok('"provider_ok": prov == "dafeiyu-main"' in body,
+       "★ provider_ok 用字符串比较（别再当列表索引）")
+    ok("prov[0]" not in body, "★ read_config 里不再出现 prov[0]")
 
 
 def test_route_ordering():
@@ -411,6 +509,9 @@ def main():
         test_webui_token_isolation,
         test_proxy_path_safety,
         test_route_ordering,
+        test_apply_config_verifies_after_restart,
+        test_main_provider_is_first_in_list,
+        test_read_config_reports_provider_ok,
     ]
     for t in tests:
         try:

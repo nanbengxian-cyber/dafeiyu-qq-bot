@@ -355,6 +355,50 @@ def normalize_ids(raw, label):
     return out
 
 
+def astrbot_started_marker(name):
+    """看这个实例的 AstrBot 日志里有没有「启动完成」的标记。
+
+    返回 True / False；**拿不到日志时返回 None**（不代表没启动）。
+    区分 None 很重要：测试环境和容器名不同时 docker logs 必然失败，
+    那时不能当成「没启动」去反复等 —— 会把测试拖死。
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "logs", "--tail", "80", "dafeiyu-%s-astrbot" % name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+    except FileNotFoundError:
+        return None          # 没有 docker 命令
+    except Exception:
+        return None          # 超时等其它异常
+    if out.returncode != 0:
+        return None          # 容器不存在
+    return "AstrBot started" in out.stdout.decode("utf-8", "replace")
+
+
+def wait_astrbot_ready(name, timeout=90):
+    """等实例的 AstrBot 真正启动完，最多等 timeout 秒。
+
+    为什么要等：AstrBot 启动/退出时会把**内存里**的配置写回 cmd_config.json。
+    它没启动完就重启，那次写回会拿未初始化状态覆盖我们的配置 ——
+    表现为「提示成功，过一会儿全空了」。
+
+    返回 True（已启动）或 False（等超时）。若环境里拿不到日志（测试环境、
+    没有 docker），直接返回 True 让调用方继续 —— 真正的判据是写完后的回读。
+    """
+    import time as _t
+    first = astrbot_started_marker(name)
+    if first is None:
+        return True          # 拿不到日志，不阻塞
+    if first:
+        return True
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        _t.sleep(3)
+        if astrbot_started_marker(name) is True:
+            return True
+    return False
+
+
 def persona_db_path(name):
     return os.path.join(instance_dir(name), "astrbot", "data", "data_v4.db")
 
@@ -469,19 +513,56 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
         changed.append("聊天范围（%d 个群 / %d 个私聊）" % (len(gids), len(fids)))
 
     # ② 主聊天 API
+    #
+    # 字段必须和生产机上能正常工作的条目**完全一致** —— 少一个就出问题，
+    # 而且报错很难懂。实测踩到的：
+    #   * provider 缺 "enable" → 加载时报 KeyError: 'enable'，
+    #     日志里只有一段 traceback，界面上完全看不出是「配置少了个字段」。
+    #   * 缺 "modalities" / "custom_extra_body" 同样会被下游代码直接索引。
+    #   * source 里多写了 "model_config" 会干扰 provider→source 的迁移逻辑。
+    # 所以这里照抄生产机的形状（provider_sources 9 个字段 / provider 5 个字段）。
     if api_base and api_key and api_model:
         src_id = "dafeiyu-main_source"
         pid = "dafeiyu-main"
         src = {
-            "id": src_id, "provider": "openai", "type": "openai_chat_completion",
-            "provider_type": "chat_completion", "key": [api_key],
-            "api_base": api_base, "model_config": {}, "timeout": 120,
+            "id": src_id,
+            "provider": "openai",
+            "type": "openai_chat_completion",
+            "provider_type": "chat_completion",
+            "key": [api_key],
+            "api_base": api_base,
+            "timeout": 120,
+            "proxy": "",
+            "custom_headers": {},
+            "enable": True,
         }
-        prov = {"id": pid, "provider_source_id": src_id, "model": api_model}
-        cfg["provider_sources"] = [s for s in (cfg.get("provider_sources") or [])
-                                   if s.get("id") != src_id] + [src]
-        cfg["provider"] = [p for p in (cfg.get("provider") or [])
-                           if p.get("id") != pid] + [prov]
+        prov = {
+            "id": pid,
+            "provider_source_id": src_id,
+            "enable": True,
+            "model": api_model,
+            "modalities": ["text", "tool_use"],
+            "custom_extra_body": {},
+        }
+        # ★ 顺序很重要：把我们的 provider 放在**第一个**。
+        #
+        # AstrBot 4.28 起删掉了 provider_settings.default_provider_id
+        # （4.27 还有，4.28 的 default.py 里已经没有这个键）。
+        # 现在它选 provider 的逻辑是（provider/manager.py:_resolve_using_provider）：
+        #   先看 agent_runner 的 model.provider_id → 没有就取 provider_insts[0]。
+        # 而 check_config_integrity 会把 schema 里不认识的键**直接删掉**，
+        # 所以我们写进去的 default_provider_id 会被静默抹掉 ——
+        # 表现是「提示配置成功，但机器人用回默认的接口」。
+        #
+        # 结论：不能靠 default_provider_id，只能靠**列表顺序**。
+        # 把主聊天 API 放第一位，它就成了 provider_insts[0]。
+        cfg["provider_sources"] = [src] + [
+            s for s in (cfg.get("provider_sources") or []) if s.get("id") != src_id]
+        cfg["provider"] = [prov] + [
+            p for p in (cfg.get("provider") or []) if p.get("id") != pid]
+
+        # 老版本（4.27 及以前）认这个键，写上没坏处；
+        # 新版本会在启动时把它删掉，那时靠上面的顺序生效。
         cfg.setdefault("provider_settings", {})["default_provider_id"] = pid
         changed.append("主聊天 API（%s）" % api_model)
 
@@ -497,11 +578,28 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
     if has_persona:
         pid = "dafeiyu-mine"
         write_persona_db(name, pid, persona.strip())
+        # 人格写进库了，还要**告诉 AstrBot 用哪一条**。两个版本位置不同，
+        # 所以两处都写（不认的那个会被新版本当未知键删掉，无害）：
+        #   4.27：provider_settings.default_personality
+        #   4.28：agent_runner.config.persona.persona_id
+        # 只写前者的话，4.28 上表现为「人格存进库了但机器人不用」——
+        # 日志里能看到 "Loaded 1 personas" 却依然用 default 人格。
         cfg.setdefault("provider_settings", {})["default_personality"] = pid
+        ar = cfg.setdefault("agent_runner", {})
+        ar.setdefault("config", {}).setdefault("persona", {})["persona_id"] = pid
         changed.append("人格提示词（%d 字）" % len(persona.strip()))
 
     if not changed:
         raise ManagerError("没填任何要改的内容。")
+
+    # ★ 写之前先等 AstrBot 完全启动。
+    #
+    # 为什么：AstrBot 启动过程中会在退出时把**内存里**的配置存回文件。
+    # 如果它还没启动完就重启它，那次「保存」会拿未初始化的状态覆盖我们的写入
+    # —— 表现为「提示成功，过一会儿配置全空」。
+    # 等它起来再写，就没有这个窗口。这样用户不用知道任何时序细节。
+    if not wait_astrbot_ready(name, timeout=90):
+        raise ManagerError("这个机器人的聊天服务还没启动完，稍等半分钟再试。")
 
     write_json_bom(path, cfg)
 
@@ -514,12 +612,48 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
                 for f in fids]:
             raise ManagerError("回读校验失败：聊天范围没写进去。")
     if api_base:
-        got = (back.get("provider_settings") or {}).get("default_provider_id")
-        if got != "dafeiyu-main":
+        # 判据用「provider 列表第一个是不是我们的」而不是 default_provider_id ——
+        # 后者在 4.28+ 会被删掉（见上面写配置处的说明）。
+        provs = back.get("provider") or []
+        if not provs or provs[0].get("id") != "dafeiyu-main":
             raise ManagerError("回读校验失败：主聊天 API 没写进去。")
 
-    # 重启实例的 astrbot 让配置生效
+    # 重启 astrbot 让配置生效。
+    #
+    # ★ 这里有个**真会咬人**的坑：AstrBot 启动时会把 cmd_config.json
+    #   用内存里的配置**重写一遍**（实测重启后文件 md5 就变了）。
+    #   如果用户在实例刚启动、AstrBot 还没初始化完的时候写配置，
+    #   那么紧接着的重启会拿旧的内存状态把我们的写入**覆盖掉** ——
+    #   表现是「提示配置成功，但过一会儿全空了」，而且完全没有报错。
+    #
+    #   所以：写完必须**等重启完成后再回读一次**。只在重启前回读是不够的 ——
+    #   那正是我们第一次踩的坑（回读通过 → 重启覆盖 → 用户看到空配置）。
     compose(name, "restart", "astrbot", check=False)
+
+    # 等 AstrBot 起来（它启动要十几秒），再回读校验
+    wait_astrbot_ready(name, timeout=90)
+
+    back2 = read_json_maybe_bom(path)
+    if gids or fids:
+        got = (back2.get("platform_settings") or {}).get("id_whitelist") or []
+        if got != list(gids) + ["%s:FriendMessage:%s" % (
+                ((back2.get("platform") or [{}])[0].get("id") or "default"), f)
+                for f in fids]:
+            raise ManagerError(
+                "配置没保住：重启后聊天范围又变回 %r 了。"
+                "这通常是 AstrBot 还没启动完就被写了配置。"
+                "请等它完全起来（状态显示「运行中」约半分钟）再改。" % (got,))
+    if api_base:
+        provs2 = back2.get("provider") or []
+        if not provs2 or provs2[0].get("id") != "dafeiyu-main":
+            raise ManagerError("配置没保住：重启后主聊天 API 丢了。"
+                               "请等实例完全起来再改。")
+    if has_persona:
+        got_pid = (((back2.get("agent_runner") or {}).get("config") or {})
+                   .get("persona") or {}).get("persona_id") or ""
+        if got_pid != "dafeiyu-mine":
+            raise ManagerError("配置没保住：重启后人格又变回 %r 了。"
+                               "请等实例完全起来再改。" % (got_pid,))
 
     return {"ok": True, "changed": changed, "verified": True,
             "backup": os.path.basename(backup)}
@@ -538,7 +672,14 @@ def read_config(name):
         m = re.match(r"^[^:]+:FriendMessage:([0-9]+)$", str(x))
         if m:
             friends.append(m.group(1))
-    prov = (cfg.get("provider_settings") or {}).get("default_provider_id") or ""
+    # 主 provider 的判据：**列表第一个**。
+    # 4.27 有 provider_settings.default_provider_id，4.28 删掉了它，
+    # 改为「agent_runner.config.model.provider_id → 没有就取 provider_insts[0]」。
+    # 列表顺序在哪个版本都有效，所以统一用顺序判断。
+    prov = ""
+    _provs = cfg.get("provider") or []
+    if _provs and _provs[0].get("id") == "dafeiyu-main":
+        prov = "dafeiyu-main"
     src = {}
     for s in (cfg.get("provider_sources") or []):
         if s.get("id") == "dafeiyu-main_source":
@@ -549,7 +690,17 @@ def read_config(name):
             model = p.get("model") or ""
     # 人格要从数据库读（cmd_config.json 里的 persona 字段是废弃的，永远是空）
     persona = ""
-    default_pid = (cfg.get("provider_settings") or {}).get("default_personality") or ""
+    # 人格 id 的取法也随版本变：
+    #   4.27：provider_settings.default_personality
+    #   4.28：agent_runner.config.persona.persona_id（provider_settings 里那个键
+    #         同样已被 schema 删掉，写了也会被抹）
+    # 两个都试，哪个有值用哪个。
+    default_pid = ((cfg.get("provider_settings") or {}).get("default_personality")
+                   or (((cfg.get("agent_runner") or {}).get("config") or {})
+                       .get("persona") or {}).get("persona_id")
+                   or "")
+    if default_pid in ("default", "[%None]"):
+        default_pid = ""
     if default_pid:
         db = persona_db_path(name)
         if os.path.exists(db):
@@ -577,7 +728,10 @@ def read_config(name):
         "api_key_set": bool(src.get("key")),
         "api_model": model,
         "persona": persona,
-        "provider_ok": bool(prov),
+        # provider_ok：第一个 provider 就是主聊天 API 才算配好。
+        # 不能看 default_provider_id —— 4.28+ 会删掉那个键。
+        # 注意 prov 是上面算好的字符串（不是列表），别再当列表索引。
+        "provider_ok": prov == "dafeiyu-main",
     }
 
 
