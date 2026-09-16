@@ -106,18 +106,30 @@ final class PresetCryptoTest {
      */
     private static void templateIsEmpty() {
         T.isFalse("Preset.HAS_PRESET 为 false（仓库里是空模板）", Preset.HAS_PRESET);
-        T.eq("Preset.WEBUI_BASE 为空", "", Preset.WEBUI_BASE);
-        T.eq("Preset.TOKEN_SALT 为空", "", Preset.TOKEN_SALT);
-        T.eq("Preset.TOKEN_IV 为空", "", Preset.TOKEN_IV);
-        T.eq("Preset.TOKEN_CT 为空", "", Preset.TOKEN_CT);
+        // 新版字段：服务器地址、账号、密钥、指纹、口令都必须为空。
+        // 任何一项非空都说明有人（或忘了还原的构建）把真实值提交上来了。
+        T.eq("Preset.HOST 为空", "", Preset.HOST);
+        T.eq("Preset.SSH_PORT 为 0", 0, Preset.SSH_PORT);
+        T.eq("Preset.SSH_USER 为空", "", Preset.SSH_USER);
+        T.eq("Preset.SSH_KEY 为空", "", Preset.SSH_KEY);
+        T.eq("Preset.HOST_FINGERPRINT 为空", "", Preset.HOST_FINGERPRINT);
+        T.eq("Preset.MANAGER_TOKEN 为空", "", Preset.MANAGER_TOKEN);
+        T.isFalse("空模板 usable() 为 false（没配好就不该声称可用）", Preset.usable());
     }
 
-    /** 空模板里不许出现像 IP / 域名 / 密钥的东西（防止「以为清空了其实没有」）。 */
+    /**
+     * 空模板里不许出现像 IP / 域名 / 密钥的东西。
+     *
+     * 注意不能拿 HINT 一起检查 —— 提示文案里有中文句号「。」，
+     * 会被「不含点号」那条误判。上一版就是因为把 HINT 拼进来才必须
+     * 让 HINT 也保持为空；现在 HINT 是有意义的文案，所以只查真值字段。
+     */
     private static void noPlaintextInTemplate() {
-        String all = Preset.WEBUI_BASE + Preset.HINT + Preset.TOKEN_SALT + Preset.TOKEN_IV
-                + Preset.TOKEN_CT;
+        String all = Preset.HOST + Preset.SSH_USER + Preset.SSH_KEY
+                + Preset.HOST_FINGERPRINT + Preset.MANAGER_TOKEN;
         T.notContains("空模板不含点号（IP/域名特征）", all, ".");
         T.notContains("空模板不含 http", all, "http");
-        T.isTrue("空模板整体为空", all.isEmpty());
+        T.notContains("空模板不含私钥标记", all, "PRIVATE KEY");
+        T.isTrue("空模板的真值字段整体为空", all.isEmpty());
     }
 }

@@ -139,9 +139,13 @@ fi
 
 # ---------------------------------------------------------------- ② 具体值
 
+# 只在公开版上跑。内部版本来就该含这些值 ——
+# 拿同一份清单去查内部版必然全红，那这个检查就没法用了。
 PATTERN_FILE=test/desensitize-patterns.local.txt
 echo
-if [ -f "$PATTERN_FILE" ]; then
+if [ "$mode" != "public" ]; then
+  echo "② 具体值检查：内部版跳过（它本就该含服务器信息）"
+elif [ -f "$PATTERN_FILE" ]; then
   echo "② 具体值检查（$PATTERN_FILE）"
   n_pat=0
   while IFS= read -r pat; do
