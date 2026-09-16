@@ -14,7 +14,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 
 一个跑在 QQ 群里的 AI 群友（人格叫「小鲸鱼」）。它不是客服式问答机器人 —— 目标是**混在群里像个真人**：会潜水、会插话、会发表情包、会戳回去、看得见图片和视频、记得住群友是谁。
 
-仓库包含六块可独立使用的东西：
+仓库包含七块可独立使用的东西：
 
 | 目录 | 内容 | 语言 |
 |---|---|---|
@@ -22,6 +22,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness 桥接（另一条技术路线） | Node.js |
 | [`console/`](console/) | 安卓控制台 App + 服务端后台 | Java / Python |
 | [`desktop-controller/`](desktop-controller/) | Windows EXE 控制台：填服务器信息 → 自动部署并启动 → 在线改配置 | Python |
+| [`mobile-controller/`](mobile-controller/) | 安卓 APK：开放式登录（QQ 号密码 / 本地渲染扫码 / 快速登录）+ 三步部署，无任何预置配置 | Java |
 | [`deploy/`](deploy/) | 部署接口：配置项清单 + 运行配置模板 | JSON / env |
 | [`node-studio/`](node-studio/) | 行为节点 Studio：把行为拆成可视化节点的离线编排原型（与机器人完全隔离，不连 QQ/AstrBot/服务器） | Python / JavaScript |
 | [`docs/`](docs/) | 部署手册与 45 份技术文档（根因分析、设计方案与实施记录） | Markdown |
@@ -343,6 +344,7 @@ A complete engineering effort to make a QQ group bot *talk like an actual group 
 | [50-多模态接入与验证记录](docs/50-多模态接入与验证记录.md) | 图/视频/语音/联网的逐项实测，含失败记录 |
 | [60-长期目标与技术方案](docs/60-长期目标与技术方案.md) | 整体架构与演进方向 |
 | [61-桌面控制台](docs/61-桌面控制台-一键部署与在线配置.md) | Windows EXE 一键部署：填服务器与仓库信息 → 自动拉代码/起容器 → 在线改配置；含安全边界与已知边界 |
+| [89-手机控制台APK](docs/89-手机控制台APK-开放式登录与部署-20260916.md) | 安卓 APK 第一版：开放式登录（密码/本地渲染扫码/快速登录 + 内置网页兜底）与三步部署合并，零预置配置 |
 | [62-社交关系](docs/62-社交关系-按群隔离的社交距离.md) | 按群隔离的社交距离：数据模型、只认哪些信号（以及哪些明确不算）、五档口吻、影子模式与隐私边界 |
 | [63-自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md) | 四类损己发言的真语料证据、为什么人格治不了、为什么判据是「输入侧证据 + 输出侧形状」两侧同时成立 |
 | [64-联网出口审核](docs/64-联网出口审核-先审后发防炸群.md) | 五条出口的审核路径、为什么必须 fail-closed、回复出口闸的降级策略与残留风险 |
@@ -428,7 +430,7 @@ MIT，见 [LICENSE](LICENSE)。
 
 An AI "group member" that lives in a QQ group (persona: *Little Whale*). Not a Q&A support bot — the goal is to **blend in as a real person**: it lurks, jumps into conversations, sends stickers, pokes back, sees images and videos, and remembers who people are.
 
-Seven independently usable parts:
+Eight independently usable parts:
 
 | Directory | Contents | Language |
 |---|---|---|
@@ -436,6 +438,7 @@ Seven independently usable parts:
 | [`bridge/`](bridge/) | QQ ↔ DeepSeek Harness bridge (an alternative approach) | Node.js |
 | [`console/`](console/) | Android console app + server backend | Java / Python |
 | [`desktop-controller/`](desktop-controller/) | Windows EXE console: enter server details → auto-deploy and start → edit config online | Python |
+| [`mobile-controller/`](mobile-controller/) | Android APK: open login (QQ password / locally-rendered QR / quick login) + three-step deploy, zero baked-in configuration | Java |
 | [`deploy/`](deploy/) | Deployment interface: config item list + runtime config template | JSON / env |
 | [`node-studio/`](node-studio/) | Behaviour-node Studio: an offline visual node-graph prototype, fully isolated from the bot (no QQ/AstrBot/server) | Python / JavaScript |
 | [`docs/`](docs/) | Deployment manual and 45 technical documents (root-cause analyses, designs, implementation records) | Markdown |
@@ -786,6 +789,7 @@ Each was re-validated across multiple plugins:
 | [48 黑话自动审核](docs/48-黑话自动审核-更新详解.md) | `dsh-slang` auto-review: mine candidates → research with main model → AI auto-review every 8h, owner commands as fallback |
 | [60 长期目标与技术方案](docs/60-长期目标与技术方案.md) | Overall architecture and direction |
 | [61 桌面控制台](docs/61-桌面控制台-一键部署与在线配置.md) | Windows EXE one-click deployment, online configuration, security boundary and verification record |
+| [89 手机控制台 APK](docs/89-手机控制台APK-开放式登录与部署-20260916.md) | Android APK v1: open login (password / locally-rendered QR / quick login with built-in web fallback) merged with three-step deploy; zero baked-in config |
 | [62 社交关系](docs/62-社交关系-按群隔离的社交距离.md) | Per-group social-distance ledger, accepted signals, five style tiers, shadow mode and fairness boundary |
 | [63 自身利益](docs/63-自身利益-不认账不自贬不替外人记账.md) | Four self-harming reply classes and the two-sided input-evidence + output-shape verdict |
 | [64 联网出口审核](docs/64-联网出口审核-先审后发防炸群.md) | Review-before-send across five outbound paths, fail-closed behavior and residual risks |

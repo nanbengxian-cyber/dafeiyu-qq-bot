@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 颜色在代码里由 Theme.java 统一定义（见那里的注释：状态色必须和 tone 语义绑死）。
+     这份文件只放**资源系统必须知道**的两个颜色：图标背景和窗口底色。
+     两处颜色重复定义会走向不一致，所以其余一律不放这里。 -->
+<resources>
+    <color name="ic_launcher_background">#12161C</color>
+    <color name="window_bg">#12161C</color>
+</resources>
