@@ -981,7 +981,8 @@ public final class RobotsView {
                             String lockPw = unlockedPasswords.containsKey(it.name)
                                     ? unlockedPasswords.get(it.name) : "";
                             final List<String> changed = client().applyConfig(
-                                    it.name, g, f, ab, ak, am, pe, lockPw);
+                                    it.name, g, f, ab, ak, am, pe, lockPw,
+                                    vb, vk, vm);
                             ui.post(new Runnable() {
                                 public void run() {
                                     apiKey.setText("");

@@ -89,6 +89,14 @@ if ! python3 test/test-pairing.py; then
   exit 1
 fi
 
+# 识图 API 的接线。逻辑单测全绿但生产代码没调用，是这个项目踩过的真坑
+# （「修 APK 不显示二维码」时，四个接口没剥 data 外壳，单测照样全过）。
+# 这条检查刚写出来就抓到一个真 bug：保存时根本没把 vision_* 提交上去。
+if ! python3 test/check-vision-wiring.py; then
+  echo "识图接线检查未通过：防呆做了但没接上，用户看到的和没做一样。" >&2
+  exit 1
+fi
+
 # 「Key 留空=不改」是否真的成立。
 # App 的 Key 框一直这么写（因为 Key 不回显），但服务器原来要求三样填全，
 # 于是用户**只改人格或只改模型名都做不到**，必须回官网重新复制 Key。
