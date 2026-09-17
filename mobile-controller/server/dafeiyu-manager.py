@@ -375,6 +375,31 @@ def astrbot_started_marker(name):
     return "AstrBot started" in out.stdout.decode("utf-8", "replace")
 
 
+def astrbot_container_exists(name):
+    """这个实例的 AstrBot 容器**存在过**吗（不管现在跑没跑）。
+
+    返回 True / False；拿不到结论（没有 docker 命令等）时返回 None。
+
+    为什么需要它：缺 cmd_config.json 的有两种人，该说的话正好相反 ——
+      * 从没点过「启动」→ 该说「请先点启动」（他确实还没启动）
+      * 刚点完「启动」、容器还在拉镜像 → 该说「正在初始化，等一会儿」
+    只看文件在不在是分不出这两者的，会有一半人被指错方向。
+    """
+    cname = "dafeiyu-%s-astrbot" % name
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "-a", "--filter", "name=^%s$" % cname,
+             "--format", "{{.Names}}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+    except FileNotFoundError:
+        return None          # 没有 docker 命令
+    except Exception:
+        return None          # 超时等其它异常
+    if out.returncode != 0:
+        return None
+    return cname in out.stdout.decode("utf-8", "replace")
+
+
 # App 端读超时是 120 秒（ManagerClient.request 里 setReadTimeout(120000)）。
 # apply_config 里会等两次（写之前一次、重启之后一次），所以每次的上限必须
 # 让**总时长**留在 120 秒以内，否则 App 会先超时报「连不上」，
@@ -382,27 +407,66 @@ def astrbot_started_marker(name):
 # 40 + 40 秒 + 重启开销，留足余量。
 READY_TIMEOUT = 40
 
+# 拿不到容器日志时的等待上限（短）。
+#
+# 为什么单独设一个小值：docker logs 拿不到（测试环境、容器不存在、docker 不可用）
+# 时，我们**没有任何证据**说明这个实例在往好的方向走 —— 文件可能 2 秒后出现，
+# 也可能永远不会出现。这时等满 READY_TIMEOUT 只是在让用户干等，最后给的还是
+# 同一句报错。给它几秒的宽限（磁盘慢、刚建目录），然后老实报「还在初始化」。
+NO_LOG_WAIT = 5
 
-def wait_astrbot_ready(name, timeout=READY_TIMEOUT):
+
+def wait_astrbot_ready(name, timeout=READY_TIMEOUT, need_db=False, need_cfg=False):
     """等实例的 AstrBot 真正启动完，最多等 timeout 秒。
 
     为什么要等：AstrBot 启动/退出时会把**内存里**的配置写回 cmd_config.json。
     它没启动完就重启，那次写回会拿未初始化状态覆盖我们的配置 ——
     表现为「提示成功，过一会儿全空了」。
 
-    返回 True（已启动）或 False（等超时）。若环境里拿不到日志（测试环境、
-    没有 docker），直接返回 True 让调用方继续 —— 真正的判据是写完后的回读。
+    就绪的判据是**一组文件**，不是一个瞬间：
+      * need_cfg=True → cmd_config.json 存在（AstrBot 启动早期就会写出来）
+      * need_db=True  → data_v4.db 存在（要等 ORM 初始化完才落盘）
+
+    need_db 为什么不能省：cmd_config.json 生成得很早（所以界面会显示「运行中」），
+    但 data_v4.db 要晚得多。只等日志里的 "AstrBot started" 就去写人格，会撞上
+    「文件还不存在」—— 用户看到的是「请先启动一次」，而他明明刚启动过。
+    这正是实测踩到的坑。
+
+    把 cfg 也并进同一个判据里（而不是在外面再补一次等待），是为了守住
+    App 的读超时预算：apply_config 里只等两次，每次上限 READY_TIMEOUT。
+
+    返回 True（已就绪）或 False（等超时）。
     """
     import time as _t
+
+    def files_ready():
+        if need_cfg and not os.path.exists(astrbot_cfg_path(name)):
+            return False
+        if need_db and not os.path.exists(persona_db_path(name)):
+            return False
+        return True
+
+    def ready_now():
+        return astrbot_started_marker(name) is True and files_ready()
+
     first = astrbot_started_marker(name)
     if first is None:
-        return True          # 拿不到日志，不阻塞
-    if first:
+        # 拿不到日志（测试环境、容器不存在、docker 不可用）：**没有任何证据**
+        # 说明它在往好的方向走，所以不能按 READY_TIMEOUT 死等 —— 那只是让用户
+        # 干等，最后给的还是同一句报错。给几秒宽限（磁盘慢、刚建目录），
+        # 文件出现了就继续；否则老实说「还在初始化」，让用户过一会儿再点。
+        deadline = _t.time() + (timeout if files_ready() else NO_LOG_WAIT)
+        while _t.time() < deadline:
+            if files_ready():
+                return True
+            _t.sleep(1)
+        return files_ready()
+    if ready_now():
         return True
     deadline = _t.time() + timeout
     while _t.time() < deadline:
         _t.sleep(3)
-        if astrbot_started_marker(name) is True:
+        if ready_now():
             return True
     return False
 
@@ -498,9 +562,41 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
     load_meta(name)  # 实例不存在 → 在这里就报清楚
 
     path = astrbot_cfg_path(name)
+
+    # ★ 写之前先等 AstrBot 完全启动 —— 这一次等待同时管两件事。
+    #
+    # 为什么必须等（不只是在文件缺失时才等）：
+    #   AstrBot 启动过程中会在退出时把**内存里**的配置存回文件。
+    #   如果它还没启动完就重启它，那次「保存」会拿未初始化的状态覆盖我们的写入
+    #   —— 表现为「提示成功，过一会儿配置全空」。等它起来再写，就没有这个窗口。
+    #
+    # 为什么把「文件存在」并进这一次等待，而不是文件缺失时另起一次：
+    #   用户点完「启动」马上来填配置时，容器还在拉镜像/建目录，cmd_config.json
+    #   还没生成。这时直接报「请先点启动」是在冤枉他 —— 他刚点过。
+    #   但也不能在外面再补一次等待：apply_config 的等待总时长必须留在 App 的
+    #   120 秒读超时之内（见 READY_TIMEOUT 的说明），三次等待会把它撑爆。
+    #   所以判据合成一个：**文件都在 且 日志说启动完成**。
+    #
+    # need_db：要写人格时必须连 data_v4.db 一起等。只等日志标记是不够的 ——
+    #   实测 cmd_config.json 早就有了（界面显示「运行中」），而 data_v4.db 还没
+    #   落盘，于是刚点完「启动」就填配置的用户会收到「请先启动一次」，
+    #   而他明明刚启动过。
+    ready = wait_astrbot_ready(name, need_db=has_persona, need_cfg=True)
+
     if not os.path.exists(path):
-        raise ManagerError("实例还没跑起来过，AstrBot 配置还没生成。"
-                           "请先点「启动」，等它初始化完再填配置。")
+        # 等过了还是没有。分两种人给话 —— 他们的下一步动作完全相反。
+        if astrbot_container_exists(name) is False:
+            # 容器压根没建过：他确实还没点过「启动」。
+            raise ManagerError("这个机器人还没跑起来过，配置要等它先启动一次。"
+                               "点上面的「启动」，等十几秒再回来。")
+        # 容器在（或在建）：他刚点过启动，正在初始化。别把他打发回启动按钮。
+        raise ManagerError("这个机器人还在初始化（第一次启动要拉镜像、建目录，"
+                           "可能要一两分钟）。请稍等一会儿再点「保存」。")
+    if not ready:
+        if has_persona and not os.path.exists(persona_db_path(name)):
+            raise ManagerError("这个机器人刚启动，内部数据库还在初始化，"
+                               "请等半分钟再点「保存」。")
+        raise ManagerError("这个机器人的聊天服务还没启动完，稍等半分钟再试。")
 
     cfg = read_json_maybe_bom(path)
     backup = path + ".bak.%d" % int(time.time())
@@ -583,31 +679,24 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
     # 真实的人格存在 SQLite 的 personas 表里（core/persona_mgr.py 用
     # db.get_persona_by_id 取），再由 provider_settings.default_personality
     # 指定当前用哪一条。所以这里要写库，并且把默认人格指过去。
+    persona_id = "dafeiyu-mine"
     if has_persona:
-        pid = "dafeiyu-mine"
-        write_persona_db(name, pid, persona.strip())
-        # 人格写进库了，还要**告诉 AstrBot 用哪一条**。两个版本位置不同，
-        # 所以两处都写（不认的那个会被新版本当未知键删掉，无害）：
-        #   4.27：provider_settings.default_personality
-        #   4.28：agent_runner.config.persona.persona_id
-        # 只写前者的话，4.28 上表现为「人格存进库了但机器人不用」——
-        # 日志里能看到 "Loaded 1 personas" 却依然用 default 人格。
-        cfg.setdefault("provider_settings", {})["default_personality"] = pid
+        # 注意：这里**只改内存里的 cfg**，真正的写库放在「等就绪」之后。
+        # 顺序反了就是实测踩到的那个坑（见下面 wait_astrbot_ready 的说明）。
+        cfg.setdefault("provider_settings", {})["default_personality"] = persona_id
         ar = cfg.setdefault("agent_runner", {})
-        ar.setdefault("config", {}).setdefault("persona", {})["persona_id"] = pid
+        ar.setdefault("config", {}).setdefault("persona", {})["persona_id"] = persona_id
         changed.append("人格提示词（%d 字）" % len(persona.strip()))
 
     if not changed:
         raise ManagerError("没填任何要改的内容。")
 
-    # ★ 写之前先等 AstrBot 完全启动。
-    #
-    # 为什么：AstrBot 启动过程中会在退出时把**内存里**的配置存回文件。
-    # 如果它还没启动完就重启它，那次「保存」会拿未初始化的状态覆盖我们的写入
-    # —— 表现为「提示成功，过一会儿配置全空」。
-    # 等它起来再写，就没有这个窗口。这样用户不用知道任何时序细节。
-    if not wait_astrbot_ready(name):
-        raise ManagerError("这个机器人的聊天服务还没启动完，稍等半分钟再试。")
+    # 就绪等待已经在上面做过了（和「配置文件存在」合并成同一次等待，
+    # 见那里的说明）—— 这里直接写，不要再等一次，否则会把 App 的超时预算吃掉。
+
+    # 人格写库（必须在就绪之后：数据库比配置文件晚落盘）
+    if has_persona:
+        write_persona_db(name, persona_id, persona.strip())
 
     write_json_bom(path, cfg)
 
@@ -639,7 +728,7 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
     compose(name, "restart", "astrbot", check=False)
 
     # 等 AstrBot 起来（它启动要十几秒），再回读校验
-    wait_astrbot_ready(name)
+    wait_astrbot_ready(name, need_db=has_persona)
 
     back2 = read_json_maybe_bom(path)
     if gids or fids:
@@ -670,7 +759,13 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
 def read_config(name):
     path = astrbot_cfg_path(name)
     if not os.path.exists(path):
-        return {"ready": False}
+        # ready=False 有两种情况，App 要分开说话：
+        #   started=False → 他真没点过「启动」，该让他去点启动
+        #   started=True  → 他点过了，容器正在初始化，该让他稍等
+        # 不区分的话，刚点完启动的人会被打发去反复点启动 —— 实测踩过。
+        # 拿不到结论（没有 docker 等）时给 True：宁可让人稍等，别让他白点。
+        return {"ready": False,
+                "started": astrbot_container_exists(name) is not False}
     cfg = read_json_maybe_bom(path)
     ps = cfg.get("platform_settings") or {}
     wl = ps.get("id_whitelist") or []

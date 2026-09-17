@@ -183,16 +183,28 @@ def test_apply_config_requires_instance():
         # 实例不存在 → 明确报错，不能默默写坏
         raises(lambda: m.apply_config("nope", "123456", "", "", "", "", ""),
                 "没有这个实例", "实例不存在时报错")
-        # 实例存在但没跑过 → 提示先启动
+        # 实例存在但没跑过 → 提示先启动。
+        #
+        # 这里把「容器是否存在」钉成 False（= 从没启动过），而不是靠环境：
+        # 本机 docker 是 permission denied，函数会返回 None（未知），
+        # 那时走的是「还在初始化」那一支。两条支路各有各的测试，
+        # 这里要验的是「真没启动过的人得到正确的话」。
         m.create_instance("t1")
+        m.astrbot_container_exists = lambda n: False
         raises(lambda: m.apply_config("t1", "123456", "", "", "", "", ""),
                 "还没跑起来过", "配置未生成时提示先启动")
         # 什么都没填 → 报错
         raises(lambda: m.apply_config("t1", "", "", "", "", "", ""),
                 "没填任何", "空配置报错")
         # 人格要在数据库没生成时给出可行动提示（而不是静默失败）
+        #
+        # 注意这里期望的是「还在初始化」而不是「请先启动一次」：
+        # 容器存在（= 他刚点过启动、还在拉镜像/初始化），
+        # 所以走的是「不确定就说正在初始化」那一支 —— 宁可让刚启动的人多等一会儿，
+        # 也不要把「请先启动」甩给一个明明刚点过启动的用户（实测踩过这个坑）。
+        m.astrbot_container_exists = lambda n: True
         raises(lambda: m.apply_config("t1", "", "", "", "", "", "你是一只鱼。"),
-                "还没生成", "数据库没生成时提示先启动")
+                "还在初始化", "数据库没生成时提示还在初始化")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -452,10 +464,274 @@ def test_read_config_reports_provider_ok():
        "★ provider_ok 用字符串比较（别再当列表索引）")
     ok("prov[0]" not in body, "★ read_config 里不再出现 prov[0]")
 
+    # ready=False 时必须带 started，App 靠它区分「没启动过」和「正在初始化」
+    i_not = body.find("if not os.path.exists(path):")
+    ok(i_not > 0, "read_config 会检查配置文件是否存在")
+    seg = body[i_not:i_not + 400]
+    ok('"started"' in seg,
+       "★ 未就绪时带上 started（App 据此区分两种人，否则一半人被指错方向）")
+    ok("astrbot_container_exists" in seg,
+       "★ started 用容器是否存在来判断")
+
+    # 行为验证：容器不存在 → started=False；存在 → started=True；未知 → True（别冤枉人）
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        m.create_instance("t1")
+        m.astrbot_container_exists = lambda n: False
+        eq(m.read_config("t1").get("started"), False,
+           "★ 容器不存在时 started=False（真没启动过）")
+        m.astrbot_container_exists = lambda n: True
+        eq(m.read_config("t1").get("started"), True,
+           "★ 容器存在时 started=True（正在初始化）")
+        m.astrbot_container_exists = lambda n: None
+        eq(m.read_config("t1").get("started"), True,
+           "★ 查不到容器状态时 started=True（宁可让人稍等，别让他白点启动）")
+        eq(m.read_config("t1").get("ready"), False, "未就绪时 ready 仍是 False")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_app_does_not_block_save_when_not_ready():
+    """★ App 不能因为 ready=false 就禁用「保存」。
+
+    服务器侧的 apply_config 已经会先等 AstrBot 就绪再写（连配置文件没生成
+    都会等），所以「刚点完启动就来填配置」是完全正常的操作顺序。
+    App 如果在这里把「保存」灰掉，用户就会卡住 —— 明明能成功的事做不了。
+
+    而且提示文案也要分开：刚点过启动的人该被告知「正在初始化，稍等」，
+    而不是「你还没启动过」（他刚点过，这句话把他往错方向引）。
+    """
+    print("\n【App：未就绪时的保存与提示】")
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "app", "src", "com", "dafeiyu", "controller", "RobotsView.java")
+    if not os.path.exists(p):
+        ok(False, "找得到 RobotsView.java")
+        return
+    src = open(p, encoding="utf-8").read()
+    i = src.find('!Json.bool(cfg, "ready", false)')
+    ok(i > 0, "RobotsView 会检查 ready")
+    seg = src[i:i + 1200]
+    ok("save.setEnabled(false)" not in seg,
+       "★ 未就绪时不再禁用「保存」（服务器会等就绪，用户不该被卡住）")
+    ok('Json.bool(cfg, "started"' in seg,
+       "★ 按 started 区分两种人的提示文案")
+    ok("正在初始化" in seg, "★ 刚点过启动的人看到「正在初始化」")
+    ok("还没启动过" in seg, "★ 真没启动过的人看到「还没启动过」")
+
+
+def test_persona_written_after_ready():
+    """★ 回归测试：写人格必须排在「等就绪」**之后**。
+
+    这是实测踩到的真 bug（用 App 自己的代码跑端到端时撞上）：
+      apply_config 里先调 write_persona_db()，再调 wait_astrbot_ready()。
+      但 data_v4.db 比 cmd_config.json **晚落盘**：
+      cmd_config.json 早就有了（所以界面显示「运行中」），
+      而 AstrBot 的 ORM 还没初始化完，data_v4.db 还不存在。
+      于是刚点完「启动」就来填三配置的用户会收到
+      「实例的数据库还没生成。请先「启动」一次」——
+      他明明刚启动过，这句话把他往完全错的方向引。
+
+    判据（静态检查源码顺序）：
+      ① wait_astrbot_ready 的调用位置必须早于 write_persona_db；
+      ② 等就绪时要带 need_db（否则只等日志标记，照样撞上文件不存在）；
+      ③ 真撞上时给的是「正在初始化、等半分钟」，不是「请先启动一次」。
+    """
+    src = open(SRC, encoding="utf-8").read()
+    i = src.find("def apply_config(")
+    j = src.find("\ndef read_config(", i)
+    assert i > 0 and j > i, "找不到 apply_config 函数体"
+    body = src[i:j]
+
+    i_wait = body.find("wait_astrbot_ready(")
+    i_db = body.find("write_persona_db(")
+    ok(i_wait > 0, "apply_config 里会等 AstrBot 就绪")
+    ok(i_db > 0, "apply_config 里会写人格库")
+    ok(i_wait < i_db,
+       "★ 等就绪排在写人格之前（数据库比配置文件晚落盘，反了就会误报「请先启动一次」）")
+
+    # 注意：不能只写 `"need_db=has_persona" in body`。
+    # apply_config 里有**两处** wait 调用（写前、重启后），
+    # 只匹配「出现过」的话，把第一处的 need_db 去掉测试照样绿 —— 假绿。
+    # 必须逐个调用点检查：两处都要带 need_db。
+    calls = [ln.strip() for ln in body.splitlines() if "wait_astrbot_ready(" in ln]
+    eq(len(calls), 2, "apply_config 里正好两处就绪等待（写前 + 重启后）")
+    for c in calls:
+        ok("need_db=has_persona" in c,
+           "★ 每处就绪等待都带 need_db：%s" % c)
+
+    # 写前那次还要带 need_cfg：刚点完「启动」的用户，cmd_config.json 可能还没生成。
+    # 这一条不能省 —— 缺了它，「文件还没生成就直接报错」会回来。
+    ok("need_cfg=True" in calls[0],
+       "★ 写前的就绪等待带 need_cfg（配置文件还没生成时先等，不直接报错）")
+
+    # 就绪等待函数本身要认 need_db，且拿不到日志时的降级路径也不能跳过等库
+    k = src.find("def wait_astrbot_ready(")
+    l = src.find("\ndef ", k + 1)
+    fn = src[k:l]
+    ok("need_db" in fn, "wait_astrbot_ready 支持 need_db 参数")
+    ok("persona_db_path" in fn, "★ 就绪判据里包含数据库文件是否存在")
+    ok("数据库还在初始化" in body or "数据库还没生成" in body,
+       "★ 撞上未就绪时给的是可行动提示")
+
+    # 「请先启动一次」这句话不能再作为「刚启动就填配置」的答案 ——
+    # 用户确实启动过了，这句话是误导。它只该在真正没启动时出现。
+    ok("请先「启动」一次，等 AstrBot" not in body,
+       "★ 不再对「刚启动」的用户说「请先启动一次」")
+
+    # 第二个人口：配置**文件**还没生成时（刚点启动、容器还在初始化）
+    # 也不能直接报错，要先等。
+    #
+    # 判据是「写前那次等待带 need_cfg」—— 它把「文件在不在」并进了同一个
+    # 就绪判据里。这样既先等了，又没多加一次等待（多等一次会把 App 的
+    # 120 秒读超时撑爆）。
+    i_wait = body.find("wait_astrbot_ready(")
+    first_call = body[i_wait:body.find("\n", i_wait)]
+    ok("need_cfg=True" in first_call,
+       "★ 配置文件还没生成时先等（写前的等待带 need_cfg），而不是直接报「请先点启动」")
+    ok("请先点「启动」" not in body,
+       "★ 不再把「刚点过启动」的用户打发回启动按钮")
+    # 而且要和「真没启动过」区分开：容器不存在才说「还没跑起来过」。
+    ok("astrbot_container_exists" in body,
+       "★ 用容器是否存在区分「从没启动」和「正在初始化」两种人")
+
+
+def test_missing_config_tells_two_people_apart():
+    """★ 缺 cmd_config.json 的有两种人，说的话必须相反。
+
+    这是实测踩到的坑：用户点完「启动」马上来填配置，容器还在拉镜像，
+    cmd_config.json 还没生成，服务端回「请先点启动」—— 他刚点过。
+    这句话把他往完全错的方向引（他会去反复点启动，而问题只是"再等等"）。
+
+    判据：
+      ① 容器存在（他点过启动）→ 说「还在初始化，等一会儿」
+      ② 容器不存在（真没启动过）→ 才说「还没跑起来过」
+      ③ 拿不到结论（没有 docker）→ 宁可说「还在初始化」（不冤枉刚启动的人）
+    """
+    print("\n【配置写入：区分「从没启动」和「正在初始化」】")
+    src = open(SRC, encoding="utf-8").read()
+
+    # ① 有一个能查容器是否存在的函数，且**查不动时**返回 None（不是 False）。
+    #
+    # 这里必须用行为验证，不能只 grep "return None"：
+    # 函数里有好几处 return None（FileNotFoundError、Exception 分支），
+    # 把 docker ps 失败那处的 None 改成 False，字符串断言照样绿 —— 假绿（实测踩过）。
+    k = src.find("def astrbot_container_exists(")
+    ok(k > 0, "有 astrbot_container_exists（用来区分两种人）")
+    fn = src[k:src.find("\ndef ", k + 1)]
+    ok("docker" in fn, "用 docker ps 判断容器是否存在")
+
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        import subprocess as _sp
+
+        class _R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+
+        real_run = _sp.run
+        try:
+            # docker ps 失败（权限不足 / 守护进程没跑）→ 必须是 None（不知道）
+            _sp.run = lambda *a, **kw: _R(1, b"permission denied")
+            eq(m.astrbot_container_exists("t1"), None,
+               "★ docker ps 失败时返回 None（不知道），不是 False（不存在）")
+            # docker 命令都没有 → 也是 None
+            def _boom(*a, **kw):
+                raise FileNotFoundError("no docker")
+            _sp.run = _boom
+            eq(m.astrbot_container_exists("t1"), None,
+               "★ 没有 docker 命令时返回 None")
+            # 正常查到容器 → True；查不到 → False
+            _sp.run = lambda *a, **kw: _R(0, b"dafeiyu-t1-astrbot\n")
+            eq(m.astrbot_container_exists("t1"), True, "查到容器时返回 True")
+            _sp.run = lambda *a, **kw: _R(0, b"")
+            eq(m.astrbot_container_exists("t1"), False, "查不到容器时返回 False")
+        finally:
+            _sp.run = real_run
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # ② apply_config 里：文件缺失时先按容器存在与否分流
+    i = src.find("def apply_config(")
+    j = src.find("\ndef read_config(", i)
+    body = src[i:j]
+    i_missing = body.find("if not os.path.exists(path):")
+    ok(i_missing > 0, "apply_config 会检查配置文件是否存在")
+    seg = body[i_missing:i_missing + 600]
+    ok("astrbot_container_exists" in seg,
+       "★ 文件缺失时用容器是否存在来分流（否则一半人被指错方向）")
+    ok("还没跑起来过" in seg, "★ 真没启动过的人得到「还没跑起来过」")
+    ok("还在初始化" in seg, "★ 刚点过启动的人得到「还在初始化」")
+
+    # ③ 拿不到结论（没有 docker / 查不动）时走「还在初始化」那一支 ——
+    #    宁可让刚启动的人多等一会儿，也不要把「请先启动」甩给他。
+    #    显式钉住 None，别依赖跑测试的机器上 docker 能不能用。
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        m.create_instance("t1")
+        m.astrbot_container_exists = lambda n: None
+        raises(lambda: m.apply_config("t1", "123456", "", "", "", "", ""),
+               "还在初始化", "★ 查不到容器状态时给的是「还在初始化」而不是「请先启动」")
+        # 真没启动过（容器不存在）才说「还没跑起来过」
+        m.astrbot_container_exists = lambda n: False
+        raises(lambda: m.apply_config("t1", "123456", "", "", "", "", ""),
+               "还没跑起来过", "★ 容器不存在时说「还没跑起来过」")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_no_log_wait_is_capped():
+    """★ 拿不到容器日志时不能按 READY_TIMEOUT 死等。
+
+    为什么：docker logs 拿不到（测试环境、容器不存在）时，我们没有任何证据
+    说明实例在往好的方向走 —— 文件可能 2 秒后出现，也可能永远不会出现。
+    等满 40 秒只是让用户干等，最后给的还是同一句报错。实测把测试拖到超时
+    60 秒就是这么来的。
+
+    判据：有一个明显更小的 NO_LOG_WAIT，且远小于 READY_TIMEOUT。
+    """
+    print("\n【就绪等待：拿不到日志时的上限】")
+    src = open(SRC, encoding="utf-8").read()
+    m1 = re.search(r"^READY_TIMEOUT\s*=\s*(\d+)", src, re.M)
+    m2 = re.search(r"^NO_LOG_WAIT\s*=\s*(\d+)", src, re.M)
+    ok(m2 is not None, "有 NO_LOG_WAIT 常量（拿不到日志时的上限）")
+    if not (m1 and m2):
+        return
+    ready, nolog = int(m1.group(1)), int(m2.group(1))
+    ok(nolog < ready,
+       "★ NO_LOG_WAIT(%d) < READY_TIMEOUT(%d)" % (nolog, ready))
+    ok(nolog <= 10, "★ 拿不到日志时最多等 %d 秒（用户不该干等）" % nolog)
+
+    # 且 wait_astrbot_ready 真的用了它
+    k = src.find("def wait_astrbot_ready(")
+    fn = src[k:src.find("\ndef ", k + 1)]
+    ok("NO_LOG_WAIT" in fn, "★ wait_astrbot_ready 在无日志分支里用了 NO_LOG_WAIT")
+
+    # 行为验证：无 docker 环境下，文件缺失时不该等满 40 秒
+    import time as _t
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        m.create_instance("t1")
+        # 显式钉住「拿不到日志」，别依赖跑测试的机器上 docker 的权限状态
+        m.astrbot_started_marker = lambda n: None
+        t0 = _t.time()
+        r = m.wait_astrbot_ready("t1", need_cfg=True)
+        dt = _t.time() - t0
+        eq(r, False, "文件缺失且无日志时返回 False（老实说没就绪）")
+        ok(dt < 15, "★ 实际只等了 %.1f 秒（没按 40 秒死等）" % dt)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
 
 def test_apply_config_fits_app_timeout():
     """★ 改配置的总耗时必须留在 App 的读超时之内。
-
     为什么单独测这个：apply_config 会等两次 AstrBot 就绪（写之前一次、
     重启之后一次）。如果哪天有人把等待上限调大（比如为了「更稳」调到 90 秒），
     总耗时就会超过 App 的 120 秒读超时 ——
@@ -555,6 +831,10 @@ def main():
         test_apply_config_verifies_after_restart,
         test_main_provider_is_first_in_list,
         test_read_config_reports_provider_ok,
+        test_app_does_not_block_save_when_not_ready,
+        test_persona_written_after_ready,
+        test_missing_config_tells_two_people_apart,
+        test_no_log_wait_is_capped,
         test_apply_config_fits_app_timeout,
     ]
     for t in tests:

@@ -301,9 +301,21 @@ public final class RobotsView {
                     ui.post(new Runnable() {
                         public void run() {
                             if (cfg == null || !Json.bool(cfg, "ready", false)) {
-                                note.setText("这个机器人还没启动过，配置要等它先跑起来一次。"
-                                        + "点上面的「启动」，等十几秒再回来看。");
-                                save.setEnabled(false);
+                                // 配置还没生成时有两种人，说的话正好相反：
+                                //   started=false → 真没点过「启动」
+                                //   started=true  → 刚点过，容器在拉镜像/初始化
+                                // 不区分就会把刚点过启动的人打发回去反复点启动，
+                                // 而他要做的其实只是「等一会儿」。
+                                boolean started = cfg != null
+                                        && Json.bool(cfg, "started", true);
+                                note.setText(started
+                                        ? "这个机器人正在初始化（第一次启动要拉镜像、建目录）。"
+                                          + "配置生成后就能填了，稍等一两分钟再回来。"
+                                        : "这个机器人还没启动过，配置要等它先跑起来一次。"
+                                          + "点上面的「启动」，等十几秒再回来看。");
+                                // 不禁用「保存」：服务器那边会先等 AstrBot 就绪再写，
+                                // 刚点完启动就来填配置是完全正常的操作顺序。
+                                save.setEnabled(true);
                                 return;
                             }
                             groups.setText(join(Json.arr(cfg, "groups")));

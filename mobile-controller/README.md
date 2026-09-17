@@ -71,19 +71,35 @@ Activity/View 类刻意不进测试面（见 run-tests.sh 里的反向检查）�
 
 ## 私有定制版 / Private preset build
 
-想让 App **默认就连你这台服务器**（不用每次填地址），用定制版构建：
+想让 App **默认就连你这台服务器**（用户只需填三配置：API、群/私聊号、人格），用定制版构建：
 
 ```bash
-bash build-preset.sh --base https://your-host.your-tailnet.ts.net:6099 \
-                    --token <WebUI_TOKEN> --pass '<一次性长口令>'
-# 产物：build/dafeiyu-controller-mine.apk（**不要提交、不要上传公开 Release**）
+bash build-preset.sh --host <服务器> --ssh-port <端口> \
+                    --ssh-user <受限账号> --key-file <RSA私钥路径> \
+                    --fingerprint SHA256:... --token <管理口令>
+# 产物：build/dafeiyu-controller-mine.apk
 ```
 
-- Token 以 **AES-256-GCM 密文**编入 APK，密钥由 `--pass` 经 PBKDF2(20 万轮) 派生 ——
-  反编译只能拿到密文，没有口令解不开。**口令太弱时离线暴力破解仍可行**，请用长随机串。
+### ⚠ 发放口径：只私下给，绝不上公开 Release
+
+内置服务器信息的 APK **等同于一把能管服务器的钥匙**（拿到的人就能管理实例）。
+因此本项目的规定是：
+
+- **公开仓库只放源码**，不放任何 APK 产物；
+- 定制版 APK 一律**私下发放**（直接发文件给信得过的人），不走 GitHub Release；
+- 公开版（`build.sh`，无预设）只作源码可复现的构建产物，同样不必上传。
+
+> 背景：早期版本曾把 APK 发到公开 Release（`mobile-v1.0.0/1.0.1/1.0.2`）。
+> 事后核查过这三个包**不含**任何服务器地址、账号、私钥或口令，
+> 但「把可执行产物挂在公开渠道」这件事本身就是不该养成的习惯 —— 以后不再这么做。
+
+- 内置账号在服务器上被限制成**只能转发到管理端口**：登不了 shell、连不了别的端口，
+  所以即使 APK 泄露，损失面也只限于机器人管理，不涉及整台服务器。
 - 构建脚本把「注入 → 构建 → 还原」做成原子流程（还原在 `trap` 里），
   公开仓库永远只有空模板；`build.sh` 另有一道闸：公开版里出现真实域名/定制版文案就拒绝产出。
 - 公开版（`build.sh`）与定制版产物**路径不同**，互不覆盖。
+- 密钥必须是 **RSA**：JSch 的 ed25519 实现要 Java 15+，安卓的 Ed25519 要 API 33+，
+  用 ed25519 会一直 Auth fail（脚本会提前拦住）。
 
 ## 安全设计 / Security
 
