@@ -265,6 +265,15 @@ def instance_detail(name, password=""):
     if ls["locked"] and not _check_lock_password(password, meta):
         # 只给「这个实例存在、它是锁着的、它在不在跑」，
         # 够 App 画出列表和锁图标，但一个字都不泄露。
+        #
+        # ★ pairing 是**例外，要照给**：它只有 4 个布尔值
+        #   （两端配没配、token 一不一致、总的是否配对），
+        #   不含 token 本身、不含任何 ID、不含配置内容。
+        #   不给的话有个真实的坏结果：用户给机器人设了私密，
+        #   之后机器人不回话，App 因为拿不到 pairing 就不显示
+        #   「修复消息通道」按钮 —— 恰恰是最需要它的那台机器修不了。
+        #   实测踩到：ap/dfy/maon/wdf 都锁着，配对其实是好的，
+        #   但 HTTP 响应里没这个字段，看起来像「坏了」。
         return {"meta": {"name": meta.get("name"),
                          "created_at": meta.get("created_at"),
                          "status": meta.get("status"),
@@ -275,6 +284,7 @@ def instance_detail(name, password=""):
                 "locked": True,
                 "containers": container_state(name),
                 "config": None,
+                "pairing": pairing_state(name),
                 "webui_token": ""}
     return {"meta": meta,
             "lock": ls,

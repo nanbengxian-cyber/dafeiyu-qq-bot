@@ -731,6 +731,54 @@ public final class RobotsView {
         Button save = UiKit.button(ctx, "保存到服务器", true);
         panel.addView(save);
 
+        // 「修复消息通道」：默认隐藏，只有自检发现没配对时才显示。
+        // 为什么藏起来：正常用户不该看到这个按钮 —— 看到了会以为机器人有问题。
+        // 它只在真的坏了的时候出现，那时它是唯一能救命的东西。
+        final Button repair = UiKit.button(ctx, "修复消息通道（不回话就点这里）", false);
+        repair.setVisibility(View.GONE);
+        panel.addView(repair);
+
+        repair.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                note.setText("正在修复消息通道（会让这个机器人重新连一次，约半分钟）…");
+                UiKit.setEnabledDeep(repair, false);
+                pool.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            final Map<String, Object> r =
+                                    client().repairChannel(it.name);
+                            final Map<String, Object> after =
+                                    Json.obj(r, "after");
+                            final boolean ok = after != null
+                                    && Json.bool(after, "paired", false);
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(repair, true);
+                                    if (ok) {
+                                        note.setText("✓ 消息通道已接上。"
+                                                + "现在去 QQ 里给这个机器人发条消息试试，"
+                                                + "它应该会回你了。");
+                                        repair.setVisibility(View.GONE);
+                                    } else {
+                                        note.setText("还是没接上。"
+                                                + "请把这个机器人「停止」再「启动」一次，"
+                                                + "然后回来再点一次修复。");
+                                    }
+                                }
+                            });
+                        } catch (final Deployer.DeployException e) {
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(repair, true);
+                                    note.setText("修复失败：" + e.getMessage());
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        });
+
         // 先把现有配置读回来填进框里（Key 除外，服务器不回显）
         pool.execute(new Runnable() {
             public void run() {
@@ -769,9 +817,23 @@ public final class RobotsView {
                             apiKey.setHint(keySet
                                     ? "API Key 已设置（要换就填新的，留空=不改）"
                                     : "API Key（必填）");
-                            note.setText(keySet
-                                    ? "已读取当前配置。API Key 已在服务器上，这里不回显。"
-                                    : "已读取当前配置。还没设 API Key。");
+
+                            // ★ 消息通道自检：这是「机器人一个字都不回」的判据。
+                            //
+                            // 没配对时用户看到的现象和「API 填错」一模一样（都是
+                            // 不回话），他会反复改 API 却永远改不好 —— 因为病根
+                            // 不在那里。所以这里必须主动说出来，并且给一个按钮。
+                            Map<String, Object> pr = Json.obj(d, "pairing");
+                            if (pr != null && !Json.bool(pr, "paired", false)) {
+                                note.setText("⚠ 这个机器人的「消息通道」没接上，"
+                                        + "它会收不到消息、一个字都不回。"
+                                        + "点下面的「修复消息通道」就能修好。");
+                                repair.setVisibility(View.VISIBLE);
+                            } else {
+                                note.setText(keySet
+                                        ? "已读取当前配置。API Key 已在服务器上，这里不回显。"
+                                        : "已读取当前配置。还没设 API Key。");
+                            }
                         }
                     });
                 } catch (final Deployer.DeployException e) {

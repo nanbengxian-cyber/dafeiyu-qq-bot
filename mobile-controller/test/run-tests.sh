@@ -74,11 +74,25 @@ bash test/run-shim-test.sh
 # 两者症状一样（用户对着「请输入token」发愣），所以必须分开验证。
 bash test/run-weblogin-test.sh
 
+# 反向检查（第三次踩同一个坑的风险）：服务器加了接口、App 加了按钮，
+# 但按钮没接到接口 / 自检结果没显示出来 —— 用户看到的和没修一样。
+if ! python3 test/check-channel-wiring.py; then
+  echo "消息通道接线检查未通过：按钮或提示是死的，用户依然会觉得「没修」。" >&2
+  exit 1
+fi
+
 # 消息通道配对（「机器人一个字都不回」的根因修复）：
 # 光有配置逻辑不够，必须证明「两端 token 一致才算配对成功」——
 # 这条判据错了的话，用户看到的是「保存成功但依然不回话」。
 if ! python3 test/test-pairing.py; then
   echo "消息通道配对检查未通过：机器人会收不到消息（表现是一个字都不回）。" >&2
+  exit 1
+fi
+
+# 锁着的实例：必须给 pairing（否则私密机器人坏了修不了），
+# 但绝不能借这个字段泄露 token / API key / 白名单。
+if ! python3 test/test-locked-pairing.py; then
+  echo "私密实例的 pairing 检查未通过：要么修不了，要么泄露了秘密。" >&2
   exit 1
 fi
 

@@ -172,6 +172,31 @@ public final class ManagerClient {
         post("destroy", name);
     }
 
+    /**
+     * 修复「消息通道」——机器人一个字都不回时的救命按钮。
+     *
+     * 服务器会做三件事：把 NapCat 和 AstrBot 两端配对写对、
+     * 热加载 NapCat（不重启，保住 QQ 登录态）、重启 AstrBot 让它重开端口。
+     *
+     * 返回服务器给的修复前后状态，App 可以据此说「修好了」或「还是不行」。
+     */
+    public Map<String, Object> repairChannel(String name)
+            throws Deployer.DeployException {
+        Map<String, Object> b = new HashMap<String, Object>();
+        b.put("name", name);
+        return request("POST", "/instance/repair-channel", Json.write(b));
+    }
+
+    /** 额度与闲置情况（纯查询，不会删任何东西）。 */
+    public Map<String, Object> quota() throws Deployer.DeployException {
+        return request("GET", "/quota", null);
+    }
+
+    /** 预览「哪些机器人会被自动清理」，不真删。 */
+    public Map<String, Object> cleanupPreview() throws Deployer.DeployException {
+        return request("GET", "/cleanup/preview", null);
+    }
+
     private void post(String action, String name) throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
