@@ -236,7 +236,7 @@ def test_apply_config_writes_and_verifies():
         c.commit()
         c.close()
 
-        r = m.apply_config("t1", "476573490,225400545", "2774067216",
+        r = m.apply_config("t1", "123456789,225400545", "987654321",
                            "https://api.example.com/v1", "sk-test-key", "test-model",
                            "你是一只测试用的鱼。")
         ok(r.get("verified") is True, "返回 verified=true")
@@ -244,9 +244,9 @@ def test_apply_config_writes_and_verifies():
 
         back = m.read_json_maybe_bom(os.path.join(d, "cmd_config.json"))
         wl = back["platform_settings"]["id_whitelist"]
-        ok("476573490" in wl, "群号以裸号写入白名单")
+        ok("123456789" in wl, "群号以裸号写入白名单")
         ok("225400545" in wl, "第二个群号也写入")
-        ok("default:FriendMessage:2774067216" in wl, "★ 私聊写成 平台id:FriendMessage:QQ")
+        ok("default:FriendMessage:987654321" in wl, "★ 私聊写成 平台id:FriendMessage:QQ")
         eq(back["provider_settings"]["default_provider_id"], "dafeiyu-main",
            "默认 provider 指向新配的")
         eq(back["provider"][0]["model"], "test-model", "模型名写入")
@@ -278,7 +278,7 @@ def test_apply_config_writes_and_verifies():
         eq(back.get("persona"), [], "★ 不再往废弃的 persona 字段里写")
 
         # 幂等：再写一次不应产生重复条目
-        m.apply_config("t1", "476573490", "", "", "", "", "")
+        m.apply_config("t1", "123456789", "", "", "", "", "")
         back2 = m.read_json_maybe_bom(os.path.join(d, "cmd_config.json"))
         eq(len(back2["provider_sources"]), 1, "重复写入不产生重复 source")
         eq(len(back2["provider"]), 1, "重复写入不产生重复 provider")
@@ -296,7 +296,7 @@ def test_apply_config_writes_and_verifies():
         # read_config 要能读回来
         rc = m.read_config("t1")
         ok(rc["ready"] is True, "read_config ready")
-        ok("476573490" in rc["groups"], "read_config 读回群号")
+        ok("123456789" in rc["groups"], "read_config 读回群号")
         ok(rc["api_key_set"] is True, "read_config 只报告 key 是否设置")
         ok("sk-test-key" not in json.dumps(rc), "★ read_config 不回显 API Key 明文")
     finally:
@@ -367,7 +367,7 @@ def test_readback_verification_catches_bad_write():
             real_write(path, data)
 
         m.write_json_bom = evil_write
-        raises(lambda: m.apply_config("t1", "476573490", "", "", "", "", ""),
+        raises(lambda: m.apply_config("t1", "123456789", "", "", "", "", ""),
                "回读校验失败", "★ 写入被篡改时，回读校验必须报错")
 
         # 同理：API provider 没落盘也要被抓住。

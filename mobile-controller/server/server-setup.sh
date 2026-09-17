@@ -182,16 +182,34 @@ fi
 # ---------------------------------------------------------------- ④ 输出信息
 say "④ 完成 —— App 需要的连接信息"
 TOKEN=$(cat "$MANAGER_DIR/manager.token")
+
+# SSH 端口和受限账号从**实际系统状态**里读，不写死。
+# 写死的坏处有两个：换台机器跑就会打印错的值（照着填必然连不上），
+# 以及把「我们这台机器用哪个端口、哪个账号名」印进了公开仓库。
+APP_SSH_PORT=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+if [ -z "$APP_SSH_PORT" ]; then
+  APP_SSH_PORT=$(grep -iE '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null \
+                 | awk '{print $2; exit}')
+fi
+[ -n "$APP_SSH_PORT" ] || APP_SSH_PORT=22
+
+# 受限账号：取名字里带 dafeiyu 的那个；找不到就提示自己去填
+APP_SSH_USER=$(awk -F: '$1 ~ /dafeiyu/ {print $1}' /etc/passwd 2>/dev/null | head -1)
+[ -n "$APP_SSH_USER" ] || APP_SSH_USER="<你给 App 建的那个受限账号>"
+
 cat <<EOF
 
   服务器地址   : $(hostname -I | awk '{print $1}')（对外用你连 SSH 的那个地址）
-  SSH 端口     : 10313
-  SSH 账号     : dafeiyu-app
+  SSH 端口     : $APP_SSH_PORT
+  SSH 账号     : $APP_SSH_USER
   管理服务端口 : $PORT（仅 127.0.0.1）
   管理口令     : $TOKEN
 
-  安全提示：这台机器上 dafeiyu-app 这个账号被限制成「只能转发到 $PORT」，
+  安全提示：$APP_SSH_USER 这个账号应当被限制成「只能转发到 $PORT」，
   不能登录 shell、不能转发别的端口。App 里内置的是它的专用密钥。
+  建账号时在 ~/.ssh/authorized_keys 的行首加限制，形如：
+    restrict,port-forwarding,permitopen="127.0.0.1:$PORT" <公钥> $APP_SSH_USER
+  这样即便 App 的私钥泄露，也只能被用来管机器人，登不上整台机器。
 
   常用命令：
     systemctl status dafeiyu-manager      # 看服务状态
