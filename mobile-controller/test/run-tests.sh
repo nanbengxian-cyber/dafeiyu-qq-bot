@@ -40,6 +40,15 @@ if ! python3 test/check-unassigned-fields.py; then
   exit 1
 fi
 
+# 反向检查（血的教训之二）：逻辑单测全绿，但生产代码**根本没调用**它。
+# 「修 APK 不显示二维码」时就是这么被骗过去的：WebProxyPath 测得好好的，
+# 实际四个接口没剥 data 外壳。这次的同类风险是网页自动登录的三处接线，
+# View/Activity 不进单测面，只能静态扫。
+if ! python3 test/check-weblogin-wiring.py; then
+  echo "网页自动登录接线检查未通过：逻辑对了但没接上，用户看到的现象和没修一样。" >&2
+  exit 1
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -59,6 +68,11 @@ java -cp "$OUT:$JSCH:$ZXING" tests.Main
 # 证明不了它真的能工作。这段脚本坏了的表现是「页面能打开但一登录就失败」，
 # 看起来一切正常，所以必须实测。
 bash test/run-shim-test.sh
+
+# 网页自动登录也要用真 JS 引擎跑一遍 —— 单测只能证明地址拼得对，
+# 证明不了 NapCat 的登录页**真的会**因为它而自动登录。
+# 两者症状一样（用户对着「请输入token」发愣），所以必须分开验证。
+bash test/run-weblogin-test.sh
 
 # 产物脱敏自检（有产物才跑 —— 纯测试时 build/ 可能是空的）
 if [ -f build/dafeiyu-controller.apk ]; then

@@ -74,11 +74,14 @@ public final class WebLoginActivity extends Activity {
     public static final String EXTRA_INSTANCE = "instance";
     /** 管理口令（走 X-Dafeiyu-Token 头）。 */
     public static final String EXTRA_MANAGER_TOKEN = "manager_token";
+    /** 实例的 WebUI 口令；有值时网页自动登录，用户不用手输 Token。 */
+    public static final String EXTRA_WEBUI_TOKEN = "webui_token";
 
     private WebView webView;
     private int tunnelPort;
     private String instance = "";
     private String managerToken = "";
+    private String webuiToken = "";
     private boolean viaProxy;
 
     @Override
@@ -92,6 +95,7 @@ public final class WebLoginActivity extends Activity {
         tunnelPort = getIntent().getIntExtra(EXTRA_TUNNEL_PORT, 0);
         instance = str(getIntent().getStringExtra(EXTRA_INSTANCE));
         managerToken = str(getIntent().getStringExtra(EXTRA_MANAGER_TOKEN));
+        webuiToken = str(getIntent().getStringExtra(EXTRA_WEBUI_TOKEN));
         viaProxy = tunnelPort > 0 && !instance.isEmpty() && !managerToken.isEmpty();
 
         LinearLayout root = new LinearLayout(this);
@@ -100,8 +104,13 @@ public final class WebLoginActivity extends Activity {
 
         TextView hint = UiKit.text(this,
                 viaProxy
-                        ? "下面是你服务器上这个机器人的 NapCat 网页。登录后可扫码或密码登录；"
-                          + "完成后按返回键回到 App。"
+                        ? (webuiToken.isEmpty()
+                            // 拿不到口令时如实说明，并告诉用户去哪找，
+                            // 而不是让他对着「请输入token」发愣。
+                            ? "下面是你服务器上这个机器人的 NapCat 网页。"
+                              + "没能自动登录 —— 请在机器人页确认它是「已解锁」状态再进来。"
+                            : "下面是你服务器上这个机器人的 NapCat 网页，已自动登录；"
+                              + "登录后可扫码或密码登录；完成后按返回键回到 App。")
                         : "下面是你填的那个 NapCat 网页：输 Token 登录后可扫码或密码登录。"
                           + "完成后按返回键回到 App。",
                 12, Theme.DIM);
@@ -133,8 +142,19 @@ public final class WebLoginActivity extends Activity {
         // 经代理时直接加载代理地址下的 /webui/ —— 不要加载 base 的根路径。
         // 根路径在管理服务上没有对应路由（会 404），而且 WebUI 的正确入口
         // 就是实例的 /webui/（实测 /proxy/<实例>/webui/ 返回完整页面）。
+        //
+        // ★ 带上 ?token= 让网页**自动登录**。
+        //
+        // 不带的话会被路由守卫踢到 /web_login，那儿是个写着「请输入token」的
+        // 输入框 —— 用户看到的就是这个（报过「网页让我输入 token 是什么情况」）。
+        // 那个 token 是 NapCat WebUI 的访问口令，用户既不知道也没处找。
+        //
+        // NapCat 的登录页支持从地址栏取 token 并自动提交，守卫跳转时也会
+        // 把 token 原样带到新地址，所以这里塞一次就够了。
         webView.loadUrl(viaProxy
-                ? WebProxyPath.proxyUrlFor(tunnelPort, instance, "/webui/")
+                ? WebProxyPath.withToken(
+                        WebProxyPath.proxyUrlFor(tunnelPort, instance, "/webui/"),
+                        webuiToken)
                 : NapCatClient.normalize(base) + "/");
     }
 

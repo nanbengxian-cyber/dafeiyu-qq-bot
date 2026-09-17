@@ -85,12 +85,13 @@ public final class MainActivity extends Activity {
             }
 
             public void openWebLogin(String base, int tunnelPort, String instance,
-                                     String managerToken) {
+                                     String managerToken, String webuiToken) {
                 Intent it = new Intent(MainActivity.this, WebLoginActivity.class);
                 it.putExtra("base", base);
                 it.putExtra(WebLoginActivity.EXTRA_TUNNEL_PORT, tunnelPort);
                 it.putExtra(WebLoginActivity.EXTRA_INSTANCE, instance);
                 it.putExtra(WebLoginActivity.EXTRA_MANAGER_TOKEN, managerToken);
+                it.putExtra(WebLoginActivity.EXTRA_WEBUI_TOKEN, webuiToken);
                 startActivity(it);
             }
         }, store);

@@ -150,6 +150,38 @@ public final class WebProxyPath {
     }
 
     /**
+     * 给 WebUI 地址带上 `?token=`，让网页**自动登录**，不用用户手输 Token。
+     *
+     * ── 为什么需要这个（用户报过「网页让我输入 token 是什么情况」）──────────
+     *
+     * NapCat 的 WebUI 有它自己的一套登录：页面没凭据时会被路由守卫踢到
+     * `/web_login`，那儿有个输入框写着「请输入token」。用户当然不知道这是什么 ——
+     * 那是 NapCat WebUI 的访问口令，不是 QQ 密码，App 里也从没让他填过。
+     *
+     * 关键发现：NapCat 的登录页支持从地址栏取 token 并**自动提交**
+     * （`web_login` 的 `useEffect`：`if(j){C(!1),m();return}`，j 就是
+     * `new URLSearchParams(location.search).get("token")`）。
+     * 而路由守卫在跳转时会把当前地址上的 token 原样带过去：
+     * `o&&(a+=\`?token=${o}\`)`。
+     *
+     * 所以只要打开 `/webui/?token=xxx`，守卫就会转到
+     * `/web_login?token=xxx`，登录页拿到 token 自动登录 —— 全程无需用户输入。
+     *
+     * 注意：`token` 要 URL 编码（口令里可能有 + / = 等字符，不编码会被截断）。
+     * 管理服务的日志会把 `token=***` 打码，所以不会明文留在 journald 里。
+     *
+     * @param url   已经拼好的地址（如 .../proxy/qq1/webui/）
+     * @param token WebUI 口令；空则原样返回（不硬塞空参数，免得页面报错）
+     */
+    public static String withToken(String url, String token) {
+        if (url == null || token == null || token.isEmpty()) {
+            return url;
+        }
+        String sep = url.indexOf('?') >= 0 ? "&" : "?";
+        return url + sep + "token=" + enc(token);
+    }
+
+    /**
      * 从完整 URL 里取出「/路径?查询串」。返回 null 表示这不是一个该代理的 HTTP 地址。
      *
      * 这是改写的核心：主机部分一律丢掉 —— WebView 请求的主机（隧道回环地址）

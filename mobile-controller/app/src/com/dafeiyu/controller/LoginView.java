@@ -42,8 +42,13 @@ public final class LoginView {
          *
          * tunnelPort/instance/managerToken 三者都有值时，网页会经管理服务代理
          * 访问实例的 WebUI（手机连不到服务器本机的实例端口）；否则直连 base。
+         *
+         * webuiToken 是实例的 WebUI 访问口令，会拼成 `?token=` 让网页自动登录。
+         * 不传的话用户会撞上 NapCat 自己的登录页（一个写着「请输入token」的输入框），
+         * 而那个口令他既不知道也没处找。
          */
-        void openWebLogin(String base, int tunnelPort, String instance, String managerToken);
+        void openWebLogin(String base, int tunnelPort, String instance, String managerToken,
+                          String webuiToken);
     }
 
     private static final long POLL_MS = 2500L;
@@ -215,9 +220,35 @@ public final class LoginView {
                     // 这里不能直接把地址给 WebView：实例的 WebUI 只监听服务器的
                     // 127.0.0.1，手机连不上；而且 NapCat 网页用绝对路径引资源，
                     // 少了代理前缀就全是 404（症状是「网页老是连不上」）。
-                    host.openWebLogin("http://127.0.0.1",
-                            Session.tunnel().port(), RoutingTransport.activeInstance(),
-                            Session.client().token());
+                    //
+                    // ★ 还要把实例的 WebUI 口令一并带过去。
+                    // 不带的话网页会弹「请输入token」—— 那是 NapCat WebUI 自己的
+                    // 访问口令，用户既不知道也没处找（报过这个）。
+                    // 取口令要走网络，所以放到后台线程，别卡住界面。
+                    final String inst = RoutingTransport.activeInstance();
+                    final String pw = RoutingTransport.activeUnlockPassword();
+                    final String mt = Session.client().token();
+                    final int port = Session.tunnel().port();
+                    webBtn.setEnabled(false);
+                    pool.execute(new Runnable() {
+                        public void run() {
+                            String tok = "";
+                            try {
+                                tok = Session.client().webuiToken(inst, pw);
+                            } catch (Exception e) {
+                                // 拿不到就当没解锁：网页会显示登录页，
+                                // 上面的提示已经告诉用户该怎么办，不至于卡死。
+                                tok = "";
+                            }
+                            final String useTok = tok == null ? "" : tok;
+                            onUi(new Runnable() {
+                                public void run() {
+                                    webBtn.setEnabled(true);
+                                    host.openWebLogin("http://127.0.0.1", port, inst, mt, useTok);
+                                }
+                            });
+                        }
+                    });
                     return;
                 }
                 String base = client.base().isEmpty() ? store.webuiBase() : client.base();
@@ -225,7 +256,8 @@ public final class LoginView {
                     host.toast("先填上面的 WebUI 地址");
                     return;
                 }
-                host.openWebLogin(base, 0, "", "");
+                // 直连模式：用户自己填了 Token，原样带进网页帮他自动登录。
+                host.openWebLogin(base, 0, "", "", token.getText().toString().trim());
             }
         });
         restartBtn.setOnClickListener(new View.OnClickListener() {

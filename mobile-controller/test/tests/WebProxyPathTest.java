@@ -87,6 +87,8 @@ public final class WebProxyPathTest {
                 "http://127.0.0.1:41000/proxy/a%20b/x",
                 WebProxyPath.proxyUrlFor(41000, "a b", "http://h/x"));
 
+        withToken();
+
         // ── pathAndQuery 单独测（它是核心，且被两处用到）────────────────
         T.eq("pathAndQuery：完整地址", "/a/b?c=1",
                 WebProxyPath.pathAndQuery("https://h:1/a/b?c=1"));
@@ -194,6 +196,71 @@ public final class WebProxyPathTest {
                 WebProxyPath.injectIntoHtml(html, ""));
         T.eq("脚本为 null 时原样返回", html,
                 WebProxyPath.injectIntoHtml(html, null));
+    }
+
+    /**
+     * 网页自动登录（修「网页让我输入 token 是什么情况」）。
+     *
+     * 用户打开内置网页登录页时撞上了一个写着「请输入token」的输入框 ——
+     * 那是 **NapCat WebUI 自己的访问口令**，不是 QQ 密码，App 里也从没让他填过，
+     * 所以他当然不知道这是什么。
+     *
+     * 实测确认的机制（对着线上 NapCat 的 webui 前端 bundle 读出来的）：
+     *  - 路由守卫：`if(!isAuth){const o=new URLSearchParams(location.search)
+     *    .get("token"); let a="/web_login"; o&&(a+=\`?token=${o}\`); navigate(a)}`
+     *    → 地址栏上的 token 会被**原样带**到登录页；
+     *  - 登录页：`useEffect(()=>{if(j){C(!1),m();return} ...},[])`，其中
+     *    `j=new URLSearchParams(location.search).get("token")`、`m()` 是提交函数
+     *    → 带 token 进来自动提交，**不需要用户点任何东西**。
+     *
+     * 所以修复就是拼一个 `?token=`。这里把拼接规则钉死：
+     * 少一个 & 或多一层 ? 都会让页面取不到 token，退回「请输入token」，
+     * 而症状跟没修一模一样 —— 属于不看测试根本发现不了的那类。
+     */
+    private static void withToken() {
+        T.group("网页自动登录（修「网页让我输入 token」）");
+
+        // 核心：代理地址 + token
+        T.eq("★ 拼上 ?token=",
+                "http://127.0.0.1:41000/proxy/qq1/webui/?token=abc123",
+                WebProxyPath.withToken(
+                        "http://127.0.0.1:41000/proxy/qq1/webui/", "abc123"));
+
+        // 已经有查询串时必须用 & 接（用 ? 会拼出两个 ?，页面取不到 token）
+        T.eq("★ 已有查询串时用 & 接（不能用第二个 ?）",
+                "http://127.0.0.1:41000/proxy/qq1/webui/?a=1&token=abc",
+                WebProxyPath.withToken(
+                        "http://127.0.0.1:41000/proxy/qq1/webui/?a=1", "abc"));
+
+        // token 必须 URL 编码：NapCat 的口令可能含 + / = 等字符，
+        // 不编码会被当成别的含义（+ 变空格）或直接截断。
+        T.eq("★ token 里的特殊字符被编码（+ 不能当空格）",
+                "http://h/x?token=a%2Bb",
+                WebProxyPath.withToken("http://h/x", "a+b"));
+        T.eq("★ token 里的 / 被编码（否则路径就断了）",
+                "http://h/x?token=a%2Fb",
+                WebProxyPath.withToken("http://h/x", "a/b"));
+        T.eq("★ token 里的 = 被编码（否则查询串被切错）",
+                "http://h/x?token=a%3Db",
+                WebProxyPath.withToken("http://h/x", "a=b"));
+        T.eq("token 里的空格编码成 %20（不是 +）",
+                "http://h/x?token=a%20b",
+                WebProxyPath.withToken("http://h/x", "a b"));
+
+        // 没有 token 时**不能**硬塞一个空参数：
+        // `?token=` 会让登录页拿到空串，反而可能覆盖掉用户手填的值。
+        T.eq("★ token 为空时不加参数", "http://h/x",
+                WebProxyPath.withToken("http://h/x", ""));
+        T.eq("★ token 为 null 时不加参数", "http://h/x",
+                WebProxyPath.withToken("http://h/x", null));
+        T.eq("url 为 null 时返回 null（不崩）", null,
+                WebProxyPath.withToken(null, "abc"));
+
+        // 真实形状：从实例详情拿到的 token 是 12 位字母数字（线上实测三个实例一致）
+        T.eq("★ 真实形状（12 位字母数字）拼出来可读",
+                "http://127.0.0.1:41000/proxy/666/webui/?token=Ab3xY9zQ7wEr",
+                WebProxyPath.withToken(
+                        "http://127.0.0.1:41000/proxy/666/webui/", "Ab3xY9zQ7wEr"));
     }
 
     private static void apiGuide() {
