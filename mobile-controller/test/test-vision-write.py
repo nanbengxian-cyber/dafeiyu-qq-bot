@@ -72,15 +72,28 @@ ck("vision_model", rc["vision_model"]=="glm-4v", rc.get("vision_model"))
 ck("★ vision_key_set=True 但 Key 不回显", rc["vision_key_set"] is True and "sk-vision" not in json.dumps(rc), rc.get("vision_key_set"))
 ck("主 API 也没受影响", rc["api_model"]=="text-model", rc.get("api_model"))
 
-print("== 4) 只填一半 → 必须报错（不许写半套）==")
-for args,desc in ((("https://api.b.com/v1","","glm-4v"),"缺 Key"),
-                  (("","sk-v","glm-4v"),"缺地址"),
+print("== 4) 缺地址/模型名 → 必须报错（不许写半套）==")
+# 注意「缺 Key」不在此列：Key 留空=沿用已保存的（见 test-blank-key.py）。
+# 地址和模型名则**不能**沿用 —— 用户想换成另一家的识图 API 时，
+# 沿用旧地址会配出「新模型名 + 旧地址」的坏组合，报错还会指向模型名把人带偏。
+for args,desc in ((("","sk-v","glm-4v"),"缺地址"),
                   (("https://api.b.com/v1","sk-v",""),"缺模型名")):
     try:
         m.apply_config(n,"","","https://api.a.com/v1","sk-main","text-model","p","",*args)
         ck("只填一半要报错（%s）"%desc, False, "竟然通过了")
     except m.ManagerError as e:
-        ck("只填一半报错（%s）"%desc, "填全" in str(e), str(e))
+        ck("只填一半报错（%s）"%desc, "还差" in str(e) or "填全" in str(e), str(e))
+
+print("== 4b) 缺 Key → 沿用已保存的（Key 不回显，用户改不动才怪）==")
+m.apply_config(n,"","","https://api.a.com/v1","sk-main","text-model","p","",
+               "https://api.b.com/v1","","glm-4v-3")
+vs=[x for x in m.read_json_maybe_bom(m.astrbot_cfg_path(n))["provider_sources"]
+    if x.get("id")=="dafeiyu-vision_source"][0]
+# 此刻保存的 Key 是第 2 步写入的 sk-vision（sk-v2 要等第 6 步才写）
+ck("★ 识图 Key 沿用了旧的", vs["key"]==["sk-vision"], vs["key"])
+ck("识图模型名更新了",
+   [p2 for p2 in m.read_json_maybe_bom(m.astrbot_cfg_path(n))["provider"]
+    if p2.get("id")=="dafeiyu-vision"][0]["model"]=="glm-4v-3")
 
 print("== 5) 识图和主聊天填成同一个 → 拦下来 ==")
 try:

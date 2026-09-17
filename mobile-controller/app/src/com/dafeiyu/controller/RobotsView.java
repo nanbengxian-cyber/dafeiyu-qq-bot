@@ -679,6 +679,89 @@ public final class RobotsView {
         });
         panel.addView(testBtn);
 
+        // ── ③ 识图 API（可选）────────────────────────────────────────────
+        //
+        // 为什么单独一块、而且默认折叠：
+        //   ① 它不是必填的 —— 不填机器人照样聊天，只是看不懂图；
+        //   ② 它是「进阶」配置，新手看到会以为必须填，反而卡住。
+        //   所以默认收起来，写清楚「不填也能用」。
+        final LinearLayout visionBox = UiKit.column(ctx);
+        visionBox.setVisibility(View.GONE);
+        final EditText visionBase = UiKit.input(ctx,
+                "识图 API 接口地址，如 https://…/v1", false);
+        final EditText visionKey = UiKit.input(ctx,
+                "识图 API Key（不回显，留空=不改）", true);
+        final EditText visionModel = UiKit.input(ctx,
+                "识图模型名，要带 vision 字样，如 glm-4v", false);
+        final TextView visionResult = UiKit.text(ctx, "", 12, Theme.DIM);
+
+        visionBox.addView(UiKit.caption(ctx,
+                "识图模型和聊天模型可以不是同一家、同一个。\n"
+                + "填了它，机器人就能看懂群友发的图；不填就只看得懂文字。"));
+        visionBox.addView(visionBase);
+        visionBox.addView(visionKey);
+        visionBox.addView(visionModel);
+
+        final Button visionTest = UiKit.button(ctx,
+                "测试识图（真的发一张图看它认不认得）", false);
+        visionTest.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                final String b = visionBase.getText().toString().trim();
+                final String k = visionKey.getText().toString().trim();
+                final String m = visionModel.getText().toString().trim();
+                if (b.isEmpty() || m.isEmpty()) {
+                    host.toast("识图 API 的地址和模型名都要填");
+                    return;
+                }
+                visionResult.setTextColor(Theme.DIM);
+                visionResult.setText("正在让服务器发一张测试图过去…");
+                UiKit.setEnabledDeep(visionTest, false);
+                pool.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            final Map<String, Object> r = client().testVision(
+                                    it.name, b, k, m);
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(visionTest, true);
+                                    String vc = Json.str(r, "vision_capable", "");
+                                    boolean canSee = "true".equals(vc);
+                                    boolean unknown = vc.isEmpty() || "null".equals(vc);
+                                    visionResult.setTextColor(
+                                            canSee ? Theme.GOOD
+                                                   : (unknown ? Theme.DIM : Theme.WARN));
+                                    visionResult.setText(Json.str(r, "message", "测完了。"));
+                                }
+                            });
+                        } catch (final Deployer.DeployException e) {
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(visionTest, true);
+                                    visionResult.setTextColor(Theme.WARN);
+                                    visionResult.setText("测试失败：" + e.getMessage());
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        });
+        visionBox.addView(visionTest);
+        visionBox.addView(visionResult);
+
+        final Button visionBtn = UiKit.button(ctx,
+                "③ 识图 API（可选：让机器人看懂图片）", false);
+        visionBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean show = visionBox.getVisibility() != View.VISIBLE;
+                visionBox.setVisibility(show ? View.VISIBLE : View.GONE);
+                visionBtn.setText(show ? "收起识图设置"
+                        : "③ 识图 API（可选：让机器人看懂图片）");
+            }
+        });
+        panel.addView(visionBtn);
+        panel.addView(visionBox);
+
         Button modelsBtn = UiKit.button(ctx, "获取可用模型（从服务商拉当前列表）", false);
         modelsBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
@@ -818,6 +901,21 @@ public final class RobotsView {
                                     ? "API Key 已设置（要换就填新的，留空=不改）"
                                     : "API Key（必填）");
 
+                            // 识图 API：已配过就回填，并自动展开那块 ——
+                            // 配过的人多半是来改它的，藏在折叠里会让他找不到。
+                            String vBase = Json.str(cfg, "vision_base", "");
+                            String vModel = Json.str(cfg, "vision_model", "");
+                            visionBase.setText(vBase);
+                            visionModel.setText(vModel);
+                            boolean vKeySet = Json.bool(cfg, "vision_key_set", false);
+                            visionKey.setHint(vKeySet
+                                    ? "识图 API Key 已设置（要换就填新的，留空=不改）"
+                                    : "识图 API Key");
+                            if (!vBase.isEmpty() || !vModel.isEmpty() || vKeySet) {
+                                visionBox.setVisibility(View.VISIBLE);
+                                visionBtn.setText("收起识图设置");
+                            }
+
                             // ★ 消息通道自检：这是「机器人一个字都不回」的判据。
                             //
                             // 没配对时用户看到的现象和「API 填错」一模一样（都是
@@ -854,9 +952,23 @@ public final class RobotsView {
                 final String ak = apiKey.getText().toString().trim();
                 final String am = apiModel.getText().toString().trim();
                 final String pe = persona.getText().toString().trim();
+                final String vb = visionBase.getText().toString().trim();
+                final String vk = visionKey.getText().toString().trim();
+                final String vm = visionModel.getText().toString().trim();
                 if (g.isEmpty() && f.isEmpty() && ab.isEmpty() && ak.isEmpty()
-                        && am.isEmpty() && pe.isEmpty()) {
+                        && am.isEmpty() && pe.isEmpty()
+                        && vb.isEmpty() && vk.isEmpty() && vm.isEmpty()) {
                     host.toast("什么都没填。");
+                    return;
+                }
+                // 识图三样要么全空（不动它），要么填全 —— 本地先拦一道，
+                // 免得白等一次往返才被告知填了一半。
+                // 只填一半的话机器人会「收得到图但识不了」，而且界面上
+                // 看不出哪里不对，所以这里必须拦住。
+                if (!(vb.isEmpty() && vk.isEmpty() && vm.isEmpty())
+                        && (vb.isEmpty() || vm.isEmpty())) {
+                    host.toast("识图 API 要填全：接口地址和模型名都要填"
+                            + "（Key 留空=沿用已保存的）");
                     return;
                 }
                 note.setText("正在写入…");

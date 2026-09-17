@@ -226,6 +226,23 @@ public final class ManagerClient {
                                     String apiBase, String apiKey, String apiModel,
                                     String persona, String lockPassword)
             throws Deployer.DeployException {
+        return applyConfig(name, groups, friends, apiBase, apiKey, apiModel,
+                persona, lockPassword, "", "", "");
+    }
+
+    /**
+     * 写入配置，含可选的「识图 API」。
+     *
+     * vision* 三样都留空 = 完全不动多模态配置（老用户升级不受影响）；
+     * 只填一半服务器会报错 —— 写半套的结果是机器人收得到图但识不了，
+     * 用户完全看不出哪里不对。
+     */
+    public List<String> applyConfig(String name, String groups, String friends,
+                                    String apiBase, String apiKey, String apiModel,
+                                    String persona, String lockPassword,
+                                    String visionBase, String visionKey,
+                                    String visionModel)
+            throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
         b.put("groups", groups == null ? "" : groups);
@@ -234,6 +251,9 @@ public final class ManagerClient {
         b.put("api_key", apiKey == null ? "" : apiKey);
         b.put("api_model", apiModel == null ? "" : apiModel);
         b.put("persona", persona == null ? "" : persona);
+        b.put("vision_base", visionBase == null ? "" : visionBase);
+        b.put("vision_key", visionKey == null ? "" : visionKey);
+        b.put("vision_model", visionModel == null ? "" : visionModel);
         if (lockPassword != null && !lockPassword.isEmpty()) {
             b.put("lock_password", lockPassword);
         }
@@ -243,6 +263,24 @@ public final class ManagerClient {
             out.add(String.valueOf(o));
         }
         return out;
+    }
+
+    /**
+     * 测「识图 API 能不能真的看图」。
+     *
+     * 和 testApi 的区别很重要：testApi 只证明「地址通、Key 对」，
+     * 而很多网关会接受带图片的请求然后完全忽略图片 —— 那样机器人
+     * 收到图只会瞎猜。这个方法在服务器上造一张随机纯色图问它什么颜色，
+     * 答对了才算真的能识图。
+     */
+    public Map<String, Object> testVision(String name, String base, String key,
+                                          String model) throws Deployer.DeployException {
+        Map<String, Object> b = new HashMap<String, Object>();
+        b.put("name", name);
+        b.put("api_base", base == null ? "" : base);
+        b.put("api_key", key == null ? "" : key);
+        b.put("api_model", model == null ? "" : model);
+        return request("POST", "/instance/vision/test", Json.write(b));
     }
 
     /**

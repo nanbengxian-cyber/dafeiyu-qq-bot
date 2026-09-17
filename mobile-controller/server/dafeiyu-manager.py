@@ -1190,9 +1190,38 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
     fids = normalize_ids(friends, "私聊 QQ 号")
 
     api_any = bool(api_base or api_key or api_model)
-    if api_any and not (api_base and api_key and api_model):
-        raise ManagerError("主聊天 API 要填全：接口地址、API Key、模型名缺一不可。")
     if api_any:
+        # ★ 「Key 留空 = 不改」必须真的成立。
+        #
+        # App 的输入框一直写着「API Key（不回显，留空=不改）」—— 因为 Key
+        # 出于安全不回显，用户想只改模型名时 Key 框必然是空的。
+        # 但这里原来要求三样填全，于是用户**只改人格或只改模型名都做不到**，
+        # 必须回官网把 Key 重新复制一遍。实测确认过：
+        #   apply_config(base="…", key="", model="…") → 报「要填全」。
+        # 那是把「安全上不回显」的代价转嫁给了用户，属于设计缺陷。
+        #
+        # 现在：给了任意一项就按「留空=沿用已保存的值」补齐，再校验。
+        # 这样既保住了「不能写半套」的底线（补不齐照样报错），
+        # 又让「只改模型名」这种最常见的操作真正可行。
+        _sb, _sk, _sm = _main_api_of(name)
+        if not api_base:
+            api_base = _sb
+        if not api_key:
+            api_key = _sk
+        if not api_model:
+            api_model = _sm
+        if not (api_base and api_key and api_model):
+            # 补不齐说明实例上本来就没配过，或者用户只填了半套。
+            # 分两种话说清楚，别让「第一次配」的人以为是自己填错了。
+            if not (_sb or _sk or _sm):
+                raise ManagerError("主聊天 API 要填全：接口地址、API Key、"
+                                   "模型名缺一不可。")
+            raise ManagerError("主聊天 API 还差一些：%s。"
+                               "（Key 留空表示沿用已保存的，但实例上还没存过 Key。）"
+                               % "、".join([n for n, v in
+                                            (("接口地址", api_base),
+                                             ("API Key", api_key),
+                                             ("模型名", api_model)) if not v]))
         if not (api_base.startswith("http://") or api_base.startswith("https://")):
             raise ManagerError("接口地址要以 http:// 或 https:// 开头。")
         if " " in api_base:
@@ -1204,14 +1233,32 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
 
     has_persona = bool(persona and persona.strip())
 
-    # 识图 API：要么全不填（不动它），要么三样都填。
+    # 识图 API：要么全不填（不动它），要么填全。
     # 只填一半就报错，而不是「凑合写一半」—— 写一半的结果是机器人
     # 收得到图但识不了，用户完全看不出哪里不对。
+    #
+    # 「Key 留空 = 沿用已保存的」和主聊天 API 同理（见上面的说明）：
+    # 识图 Key 也不回显，用户想只换模型名时 Key 框必然是空的。
+    # 但地址和模型名**不能**沿用 —— 用户想换成另一家的识图 API 时，
+    # 沿用旧地址会配出一个「新模型名 + 旧地址」的坏组合，
+    # 报错信息还会指向模型名，把人带偏。
     vision_any = bool(vision_base or vision_key or vision_model)
-    if vision_any and not (vision_base and vision_key and vision_model):
-        raise ManagerError("识图 API 要填全：接口地址、API Key、模型名缺一不可。"
-                           "（不用识图的话，这三样都留空就行。）")
     if vision_any:
+        _vb, _vk, _vm = _vision_api_of(name)
+        if not vision_key:
+            vision_key = _vk
+        if not (vision_base and vision_key and vision_model):
+            if not (_vb or _vk or _vm):
+                raise ManagerError("识图 API 要填全：接口地址、API Key、"
+                                   "模型名缺一不可。（不用识图的话，"
+                                   "这三样都留空就行。）")
+            raise ManagerError("识图 API 还差一些：%s。"
+                               "（识图 Key 留空表示沿用已保存的，"
+                               "但实例上还没存过。）"
+                               % "、".join([n for n, v in
+                                            (("接口地址", vision_base),
+                                             ("API Key", vision_key),
+                                             ("模型名", vision_model)) if not v]))
         if not (vision_base.startswith("http://")
                 or vision_base.startswith("https://")):
             raise ManagerError("识图接口地址要以 http:// 或 https:// 开头。")
@@ -1655,6 +1702,29 @@ API_PROBE_TIMEOUT = 12
 # 判成「对方返回的不是 JSON，可能不是 OpenAI 兼容接口」。
 # 这个 bug 只在「模型列表特别长」的服务商上出现，本地测小列表根本发现不了。
 MAX_API_BODY = 8 * 1024 * 1024
+
+
+def _vision_api_of(name):
+    """从实例配置里读回「识图 API」的三要素。没配过就返回空串。
+
+    和 _main_api_of 一样不抛异常 —— 调用方要能区分「没配过」和「读失败」。
+    """
+    path = astrbot_cfg_path(name)
+    if not os.path.exists(path):
+        return "", "", ""
+    cfg = read_json_maybe_bom(path)
+    base, key = "", ""
+    for s in (cfg.get("provider_sources") or []):
+        if s.get("id") == "dafeiyu-vision_source":
+            base = s.get("api_base") or ""
+            ks = s.get("key") or []
+            if ks:
+                key = ks[0] or ""
+    model = ""
+    for p in (cfg.get("provider") or []):
+        if p.get("id") == "dafeiyu-vision":
+            model = p.get("model") or ""
+    return base, key, model
 
 
 def _main_api_of(name, strict=False):
