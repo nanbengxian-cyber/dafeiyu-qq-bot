@@ -180,6 +180,50 @@ public final class ManagerClient {
         return token;
     }
 
+    /**
+     * 测主聊天 API 通不通（**在服务器上**测）。
+     *
+     * 为什么不在手机上调这个 API：真正要用它的是服务器上的 AstrBot。
+     * 手机能连通而服务器连不上（境外 API、服务器没网、DNS 不同）很常见，
+     * 在手机上测会给出「通的」这个错误结论，用户就再也查不出机器人为什么不回话。
+     *
+     * 返回原始结果（reachable / auth_ok / model_ok / models / message），
+     * 由界面决定怎么展示。
+     */
+    public Map<String, Object> testApi(String name, String apiBase, String apiKey,
+                                       String apiModel) throws Deployer.DeployException {
+        Map<String, Object> b = new HashMap<String, Object>();
+        b.put("name", name);
+        b.put("api_base", apiBase == null ? "" : apiBase);
+        b.put("api_key", apiKey == null ? "" : apiKey);
+        b.put("api_model", apiModel == null ? "" : apiModel);
+        return request("POST", "/instance/api/test", Json.write(b));
+    }
+
+    /**
+     * 拉取这个 API 支持的模型名列表。
+     *
+     * base/key 可以传空 —— 那时用实例里已保存的。也支持「还没保存就先看看
+     * 有哪些模型」：用户常常是「先拿到模型名才敢保存」。
+     */
+    public List<String> listModels(String name, String apiBase, String apiKey)
+            throws Deployer.DeployException {
+        StringBuilder q = new StringBuilder("/instance/api/models?name=");
+        q.append(enc(name));
+        if (apiBase != null && !apiBase.isEmpty()) {
+            q.append("&base=").append(enc(apiBase));
+        }
+        if (apiKey != null && !apiKey.isEmpty()) {
+            q.append("&key=").append(enc(apiKey));
+        }
+        Map<String, Object> r = request("GET", q.toString(), null);
+        List<String> out = new ArrayList<String>();
+        for (Object o : Json.arr(r, "models")) {
+            out.add(String.valueOf(o));
+        }
+        return out;
+    }
+
     /** 读实例的 WebUI token（App 拿它去登 NapCat 网页）。 */
     public String webuiToken(String name) throws Deployer.DeployException {
         Map<String, Object> r = detail(name);

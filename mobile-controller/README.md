@@ -26,9 +26,58 @@ An Android console app, v1: **open login** — you bring your own server and Nap
     私聊条目按官方格式写成 `<平台id>:FriendMessage:<QQ号>`）；
   - 主聊天 API：接口地址 + API Key + 模型名，**用你自己的** ——
     App 不带任何 Key，你不填机器人就没法回答；
+  - **「测试连接」**：点一下就在**服务器上**真发一次请求，当场告诉你通不通 ——
+    分三层报结果（地址通不通 / Key 对不对 / 模型名对不对），
+    因为这三样要改的地方完全不同。**故意不在手机上测**：真正要用这个 API 的
+    是服务器上的 AstrBot，手机能连通而服务器连不上是常见情况，
+    在手机上测会给出「通的」这个错误结论。测试用 `max_tokens=1`，成本可忽略；
+  - **「获取可用模型」**：拿你填的地址和 Key 去问服务商要**当前**的模型列表，
+    弹窗让你点选。模型名是这套东西里烂得最快的部分（DeepSeek 的
+    `deepseek-chat` 已于 2026-07-24 停用、通义千问和豆包几个月换一茬），
+    所以内置的模型名只当示例，**真正的答案是让用户点这个按钮**；
+  - **「不知道 API 去哪申请？」**：展开后有 8 家服务商的官方申请地址 +
+    可直接填的接口地址 + 模型名示例，点「用这家」自动填好接口地址、
+    点「去申请」直接开浏览器。收录的每个 base_url 都实测过
+    （用无效 Key 打 `/models` 返回 401/403 才算数），有坑的地方如实写出来
+    （智谱结尾是 `/v4` 不是 `/v1`、火山方舟要填接入点 ID、
+    OpenRouter 在国内服务器上可能连不上）；
   - API Key 不进命令行、只在 SFTP 传的 600 文件里出现、读完即删；
     App 侧**不保存、不回显**（和 SSH 密码同一待遇）；
   - 写完重新读一遍配置做**回读校验**，对不上就报错；改前自动备份，改完重启 AstrBot 生效。
+
+**内置网页登录页（经管理服务代理）**
+
+实例的 NapCat WebUI 只监听**服务器**的 `127.0.0.1:实例端口`，手机连不上，
+必须经管理服务的 `/proxy/<实例名>/` 转发。但 NapCat 的网页是 React 应用，
+它引用资源用的是**绝对路径**（`src="/webui/assets/index-xxx.js"`），
+于是 WebView 会去请求 `http://127.0.0.1:<隧道端口>/webui/...` —— 管理服务上
+这条路径是 404，结果 HTML 出来了、JS 和 CSS 全 404，**页面白屏或一直转圈**。
+
+解法要**两层**，只做一层会静默坏掉登录：
+
+1. **HTTP 层**（`shouldInterceptRequest`）处理浏览器自己解析的资源
+   （HTML 里的 `src`/`href`，GET、无 body），改写成带 `/proxy/<实例名>/` 前缀；
+2. **JS 层**（注入脚本）处理页面 JS 自己发的 API 调用。NapCat 用 axios
+   （`baseURL="/api"`）和 `fetch("/api"+e)`，登录是
+   `POST /api/auth/login` 带 JSON body `{hash, totpCode}` ——
+   **WebView 的 `shouldInterceptRequest` 拿不到 POST body**
+   （安卓公开 API 限制），硬拦会让登录变成空 body：
+   页面能显示、但一登录就失败，看起来一切正常。
+   所以注入一小段脚本包住 `XMLHttpRequest` / `fetch` / `EventSource`，
+   只换 URL、body 原样交给真正的请求。
+
+注入方式是**把脚本插进 HTML 的 `<head>` 之后**（不是
+`onPageStarted` + `evaluateJavascript` —— 那是异步的，可能在页面脚本之后才执行，
+而页面脚本一执行就把原始引用拿走了）。实测注入真实 NapCat 页面：
+脚本位置 44 < 页面脚本位置 1736。
+
+改写规则和脚本生成都在 `WebProxyPath`（不碰 `android.*`），以便单测钉死 ——
+这段错了的表现是「网页连不上」或「能打开但登录失败」，
+从现象几乎不可能反推出是路径前缀的问题。
+
+实测（`/proxy/api01/webui/`）：页面引用的资源**未改写全部 404、改写后全部 200**；
+注入脚本另用真 JS 引擎（node 假浏览器环境）实测登录 POST 地址被改写且 body 保留
+（`test/run-shim-test.sh`）。
 
 **QQ 号防呆**：登录页填的 QQ 号会与服务器上**真正登录**的号比对，不一致就红字提醒 ——
 登录错号从二维码上根本看不出来。
@@ -63,10 +112,19 @@ KEYSTORE=$PWD/release.jks KS_PASS=yourpass bash build.sh
 bash test/run-tests.sh    # 纯 JVM，秒级，不需要模拟器
 ```
 
-覆盖（264 项）：NapCat WebUI 协议（登录换凭据、凭据过期自动重登、密码登录分支、快速登录回退）、
+覆盖（464 项 JVM 单测 + 11 项真 JS 引擎测试）：NapCat WebUI 协议（登录换凭据、
+凭据过期自动重登、密码登录分支、快速登录回退）、
 远程部署脚本生成与脱敏、配置旋钮解析与行级写回、TOTP 的 RFC 6238 测试向量、JSON 解析，
-以及聊天范围 / 主聊天 API 的写入 —— 最后一项会**真的用 python3 跑一遍生成的脚本**
-改一份临时 `cmd_config.json`，并带变异验证（把落盘内容改坏，回读校验必须报错）。
+聊天范围 / 主聊天 API 的写入 —— 最后一项会**真的用 python3 跑一遍生成的脚本**
+改一份临时 `cmd_config.json`，并带变异验证（把落盘内容改坏，回读校验必须报错），
+以及网页代理的路径改写规则、注入脚本、API 申请引导的数据完整性。
+
+`test/run-tests.sh` 跑完 JVM 单测后会接着跑 `test/run-shim-test.sh` ——
+后者用 node 造一个假浏览器环境，**实际执行**注入脚本，断言登录 POST
+的地址被改写且 body 完整保留。Java 单测只能验证「脚本字符串长什么样」，
+证明不了它真的能工作，而这段脚本坏了的表现是「页面能打开但一登录就失败」，
+所以必须实测。
+
 Activity/View 类刻意不进测试面（见 run-tests.sh 里的反向检查）。
 
 ## 私有定制版 / Private preset build
@@ -86,8 +144,23 @@ bash build-preset.sh --host <服务器> --ssh-port <端口> \
 因此本项目的规定是：
 
 - **公开仓库只放源码**，不放任何 APK 产物；
-- 定制版 APK 一律**私下发放**（直接发文件给信得过的人），不走 GitHub Release；
+- 定制版 APK 一律**私下发放**，走**私有仓库**（见下）或直接发文件，
+  **绝不发公开 Release**；
 - 公开版（`build.sh`，无预设）只作源码可复现的构建产物，同样不必上传。
+
+**私发渠道（私有仓库，永久 Private）：**
+
+```
+https://github.com/nanbengxian-cyber/dafeiyu-controller-apk/releases/latest
+```
+
+手机浏览器打开 → 登录 GitHub → 点 `dafeiyu-controller-mine.apk` 下载 → 安装。
+**不需要 Tailscale、不需要和服务器同网络** —— 这一点很重要：
+本方案的设计目标就是「手机不需要装任何东西」（见 docs/90），
+所以不该把 Tailscale 内网地址当成交付路径（实测用户手机根本没开 Tailscale）。
+
+匿名访问该仓库与 asset 均返回 404（已实测），确认私有。
+Release 里另附 `SHA256SUMS.txt` 供核对。
 
 > 背景：早期版本曾把 APK 发到公开 Release（`mobile-v1.0.0/1.0.1/1.0.2`）。
 > 事后核查过这三个包**不含**任何服务器地址、账号、私钥或口令，

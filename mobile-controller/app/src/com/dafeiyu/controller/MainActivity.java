@@ -84,9 +84,13 @@ public final class MainActivity extends Activity {
                         android.widget.Toast.LENGTH_SHORT).show();
             }
 
-            public void openWebLogin(String base) {
+            public void openWebLogin(String base, int tunnelPort, String instance,
+                                     String managerToken) {
                 Intent it = new Intent(MainActivity.this, WebLoginActivity.class);
                 it.putExtra("base", base);
+                it.putExtra(WebLoginActivity.EXTRA_TUNNEL_PORT, tunnelPort);
+                it.putExtra(WebLoginActivity.EXTRA_INSTANCE, instance);
+                it.putExtra(WebLoginActivity.EXTRA_MANAGER_TOKEN, managerToken);
                 startActivity(it);
             }
         }, store);

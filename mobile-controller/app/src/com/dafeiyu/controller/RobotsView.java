@@ -273,7 +273,7 @@ public final class RobotsView {
         final EditText friends = UiKit.input(ctx, "私聊 QQ 号，多个用逗号隔开", false);
         final EditText apiBase = UiKit.input(ctx, "主聊天 API 接口地址，如 https://…/v1", false);
         final EditText apiKey = UiKit.input(ctx, "API Key（不回显，留空=不改）", true);
-        final EditText apiModel = UiKit.input(ctx, "模型名，如 deepseek-chat", false);
+        final EditText apiModel = UiKit.input(ctx, "模型名，如 deepseek-flash", false);
         final EditText persona = UiKit.input(ctx, "人格提示词（它是谁、怎么说话）", false);
 
         panel.addView(UiKit.caption(ctx, "① 聊天范围"));
@@ -283,6 +283,121 @@ public final class RobotsView {
         panel.addView(apiBase);
         panel.addView(apiKey);
         panel.addView(apiModel);
+
+        // ── 不知道去哪申请 API？展开引导 ────────────────────────────────
+        //
+        // 这是整条流程里唯一一个必须在**别的网站**完成的步骤，新手最容易卡死。
+        // 默认折叠，不打扰已经会的人；点开才有内容，也不会把面板撑得太长。
+        final LinearLayout guideBox = UiKit.column(ctx);
+        guideBox.setVisibility(View.GONE);
+        final Button guideBtn = UiKit.button(ctx, "不知道 API 去哪申请？点这里", false);
+        guideBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean show = guideBox.getVisibility() != View.VISIBLE;
+                guideBox.setVisibility(show ? View.VISIBLE : View.GONE);
+                guideBtn.setText(show ? "收起申请说明" : "不知道 API 去哪申请？点这里");
+                if (show && guideBox.getChildCount() == 0) {
+                    buildGuide(guideBox, apiBase, apiKey, apiModel);
+                }
+            }
+        });
+        panel.addView(guideBtn);
+        panel.addView(guideBox);
+
+        // ── 测连通 + 拉模型列表 ────────────────────────────────────────
+        final TextView apiResult = UiKit.text(ctx, "", 12, Theme.DIM);
+        Button testBtn = UiKit.button(ctx, "测试连接（在服务器上测）", false);
+        testBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                String b = apiBase.getText().toString().trim();
+                String k = apiKey.getText().toString().trim();
+                if (b.isEmpty()) {
+                    host.toast("先填接口地址");
+                    return;
+                }
+                apiResult.setTextColor(Theme.DIM);
+                apiResult.setText("正在从服务器上测试…");
+                UiKit.setEnabledDeep(testBtn, false);
+                pool.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            final Map<String, Object> r = client().testApi(it.name, b, k,
+                                    apiModel.getText().toString().trim());
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(testBtn, true);
+                                    boolean okAll = Json.bool(r, "reachable", false)
+                                            && Json.bool(r, "auth_ok", false);
+                                    apiResult.setTextColor(okAll ? Theme.GOOD : Theme.WARN);
+                                    apiResult.setText(Json.str(r, "message", "测完了。"));
+                                    // 顺手把拉到的模型列表塞进模型框的选择器里
+                                    List<String> models = new ArrayList<String>();
+                                    for (Object o : Json.arr(r, "models")) {
+                                        models.add(String.valueOf(o));
+                                    }
+                                    if (!models.isEmpty()) {
+                                        showModelPicker(apiModel, models);
+                                    }
+                                }
+                            });
+                        } catch (final Deployer.DeployException e) {
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(testBtn, true);
+                                    apiResult.setTextColor(Theme.WARN);
+                                    apiResult.setText("测试失败：" + e.getMessage());
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        });
+        panel.addView(testBtn);
+
+        Button modelsBtn = UiKit.button(ctx, "获取可用模型（从服务商拉当前列表）", false);
+        modelsBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                String b = apiBase.getText().toString().trim();
+                String k = apiKey.getText().toString().trim();
+                apiResult.setTextColor(Theme.DIM);
+                apiResult.setText("正在获取模型列表…");
+                UiKit.setEnabledDeep(modelsBtn, false);
+                pool.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            final List<String> models = client().listModels(it.name, b, k);
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(modelsBtn, true);
+                                    if (models.isEmpty()) {
+                                        apiResult.setTextColor(Theme.WARN);
+                                        apiResult.setText("没取到模型列表。"
+                                                + "这家可能没提供该接口 —— 请照它官网文档手填模型名。");
+                                        return;
+                                    }
+                                    apiResult.setTextColor(Theme.GOOD);
+                                    apiResult.setText("取到 " + models.size()
+                                            + " 个模型，点下面选一个。");
+                                    showModelPicker(apiModel, models);
+                                }
+                            });
+                        } catch (final Deployer.DeployException e) {
+                            ui.post(new Runnable() {
+                                public void run() {
+                                    UiKit.setEnabledDeep(modelsBtn, true);
+                                    apiResult.setTextColor(Theme.WARN);
+                                    apiResult.setText("获取失败：" + e.getMessage());
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        });
+        panel.addView(modelsBtn);
+        panel.addView(apiResult);
+
         panel.addView(UiKit.caption(ctx, "③ 人格提示词"));
         panel.addView(persona);
 
@@ -469,5 +584,115 @@ public final class RobotsView {
                 }
             }
         });
+    }
+
+    // ------------------------------------------------------------ API 申请引导
+
+    /**
+     * 搭「去哪申请 API」的引导内容。
+     *
+     * 点「用这家」= 直接把它那套（接口地址 + 模型名示例）填好；
+     * 点「去申请」= 打开它的官网页面。用户只需要复制一个 Key 回来粘上，
+     * 「不知道填什么」这件事就没了。
+     */
+    private void buildGuide(final LinearLayout box, final EditText apiBase,
+                            final EditText apiKey, final EditText apiModel) {
+        box.addView(UiKit.text(ctx, ApiGuide.intro(), 12, Theme.DIM));
+
+        for (final ApiGuide.Provider p : ApiGuide.providers()) {
+            LinearLayout card = UiKit.column(ctx);
+            android.graphics.drawable.GradientDrawable bg =
+                    new android.graphics.drawable.GradientDrawable();
+            bg.setColor(Theme.INPUT);
+            bg.setCornerRadius(Theme.dp(ctx, 8));
+            card.setBackground(bg);
+            int pad = Theme.dp(ctx, 8);
+            card.setPadding(pad, pad, pad, pad);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = Theme.dp(ctx, 8);
+            card.setLayoutParams(lp);
+
+            TextView title = UiKit.text(ctx, p.name, 14, Theme.TEXT);
+            title.setTypeface(title.getTypeface(), Typeface.BOLD);
+            card.addView(title);
+            card.addView(UiKit.text(ctx, p.note, 12, Theme.DIM));
+            card.addView(UiKit.text(ctx, "接口地址：" + p.baseUrl, 11, Theme.DIM));
+            card.addView(UiKit.text(ctx, "模型名示例：" + joinList(p.models), 11, Theme.DIM));
+            if (!p.warn.isEmpty()) {
+                card.addView(UiKit.text(ctx, p.warn, 11, Theme.WARN));
+            }
+
+            LinearLayout btns = UiKit.row(ctx);
+            Button use = UiKit.button(ctx, "用这家", true);
+            LinearLayout.LayoutParams w1 = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            w1.rightMargin = Theme.dp(ctx, 4);
+            use.setLayoutParams(w1);
+            use.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    apiBase.setText(p.baseUrl);
+                    if (apiModel.getText().toString().trim().isEmpty()) {
+                        apiModel.setText(p.firstModel());
+                    }
+                    host.toast("已填好接口地址。去官网申请 Key，复制回来粘到 API Key 那栏。");
+                }
+            });
+            btns.addView(use);
+
+            Button apply = UiKit.button(ctx, "去申请", false);
+            LinearLayout.LayoutParams w2 = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            w2.leftMargin = Theme.dp(ctx, 4);
+            apply.setLayoutParams(w2);
+            apply.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    openUrl(p.keyUrl);
+                }
+            });
+            btns.addView(apply);
+            card.addView(btns);
+            box.addView(card);
+        }
+
+        box.addView(UiKit.text(ctx, ApiGuide.securityNote(), 11, Theme.DIM));
+    }
+
+    /** 把模型列表做成可点的选择器（用户不用手打模型名）。 */
+    private void showModelPicker(final EditText apiModel, final List<String> models) {
+        final String[] arr = models.toArray(new String[0]);
+        new android.app.AlertDialog.Builder(ctx)
+                .setTitle("选一个模型（共 " + arr.length + " 个）")
+                .setItems(arr, new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        apiModel.setText(arr[which]);
+                        host.toast("已选：" + arr[which] + "。记得点「保存到服务器」。");
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void openUrl(String url) {
+        try {
+            android.content.Intent it = new android.content.Intent(
+                    android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url));
+            it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(it);
+        } catch (Exception e) {
+            // 没有浏览器等情况：把地址说出来让他自己复制，别静默失败
+            host.toast("打不开浏览器，请手动访问：" + url);
+        }
+    }
+
+    private static String joinList(List<String> xs) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < xs.size(); i++) {
+            if (i > 0) {
+                sb.append("、");
+            }
+            sb.append(xs.get(i));
+        }
+        return sb.toString();
     }
 }

@@ -839,6 +839,368 @@ def read_config(name):
 
 
 # ---------------------------------------------------------------------------
+# 主聊天 API：连通性自检 + 拉模型列表
+# ---------------------------------------------------------------------------
+#
+# 为什么这些探测必须在**服务器上**做，而不是在手机上：
+#   真正要用这个 API 的是服务器上的 AstrBot。手机能连通、服务器连不上
+#   （或服务器在海外、被墙、DNS 不同）是很常见的情况 ——
+#   在手机上测会给出「通的」这个错误结论，用户就再也查不出为什么机器人不回话。
+#
+# 为什么要有「拉模型列表」：用户不知道该填什么模型名（这是新手最常卡住的一步）。
+#   能列出来就直接给他选，不用他去别处抄。
+
+API_PROBE_TIMEOUT = 12
+
+# 响应体上限。★ 别调小：实测 OpenRouter 的 /models 有 **737KB**，
+# 早先设 200000 会把它从中间截断，json.loads 报
+# 「Unterminated string starting at ...」—— 于是把一个**完全正常**的接口
+# 判成「对方返回的不是 JSON，可能不是 OpenAI 兼容接口」。
+# 这个 bug 只在「模型列表特别长」的服务商上出现，本地测小列表根本发现不了。
+MAX_API_BODY = 8 * 1024 * 1024
+
+
+def _main_api_of(name):
+    """从实例配置里读回主 API 的三要素：接口地址 / Key / 模型名。"""
+    path = astrbot_cfg_path(name)
+    if not os.path.exists(path):
+        raise ManagerError("这个机器人还没启动过，先点「启动」再测接口。")
+    cfg = read_json_maybe_bom(path)
+    base, key = "", ""
+    for s in (cfg.get("provider_sources") or []):
+        if s.get("id") == "dafeiyu-main_source":
+            base = s.get("api_base") or ""
+            ks = s.get("key") or []
+            if ks:
+                key = ks[0] or ""
+    model = ""
+    for p in (cfg.get("provider") or []):
+        if p.get("id") == "dafeiyu-main":
+            model = p.get("model") or ""
+    return base, key, model
+
+
+def _dns_ok(host):
+    """域名能不能解析出来。"""
+    try:
+        socket.gethostbyname(host)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _host_of(base):
+    try:
+        return urllib.parse.urlsplit(base).hostname or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _reference_reachable():
+    """服务器到底有没有网？用一个中立地址判断。
+
+    ★ 这个函数是**踩过坑才加的**：实测把一个域名打错（api.deepsek.com），
+    报错是「[Errno 101] Network is unreachable」—— 和「服务器没网」一模一样。
+    照字面翻译就会告诉用户「检查服务器网络」，于是他跑去折腾服务器，
+    而真正的问题只是他少打了一个 e。域名写错时会解析到某个不相干的 IP
+    （实测 deepsek.com → 31.13.82.33，一个 Facebook 的地址段），
+    连过去自然是 unreachable。
+
+    所以：连不上时先确认「别人能不能连通」。能连通 → 问题在这个地址；
+    连不通 → 才是服务器网络的问题。只在失败路径上多花这一次探测。
+    """
+    for ref in ("https://api.deepseek.com/v1/models", "https://www.baidu.com/"):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(ref, headers={"User-Agent": "dafeiyu-probe"}),
+                timeout=6)
+            return True
+        except urllib.error.HTTPError:
+            return True          # 有 HTTP 响应就说明网络通（401/403 也算）
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _api_error_hint(e, base=""):
+    """把底层网络异常翻译成**用户能照着做**的话。
+
+    原始报错（如 <urlopen error [Errno 101] Network is unreachable>）
+    对用户毫无意义，而且会把「地址写错」和「服务器网络不通」混成一句 ——
+    前者要改一个字母，后者要运维，指错方向会让用户白折腾很久。
+    """
+    s = str(e)
+    low = s.lower()
+    host = _host_of(base)
+
+    if "name or service not known" in low or "nodename nor servname" in low \
+            or "getaddrinfo" in low or "name resolution" in low \
+            or "no address associated" in low:
+        return ("域名解析不了 —— 接口地址写错了（多打或少打了字母）。"
+                "请回到官网复制，注意结尾要带 /v1。")
+
+    # 连不上：先分清是「这个地址的问题」还是「服务器没网」。
+    if ("unreachable" in low or "timed out" in low or "timeout" in low
+            or "connection refused" in low or "connection reset" in low
+            or "network is down" in low):
+        if host and not _dns_ok(host):
+            return ("域名解析不了 —— 接口地址写错了（多打或少打了字母）。"
+                    "请回到官网复制，注意结尾要带 /v1。")
+        if _reference_reachable():
+            # 服务器有网，那就是这个地址的问题
+            return ("服务器能上网，但这个地址连不上 —— 多半是地址写错了。"
+                    "请逐字对照官网复制（常见的错：少一个字母、"
+                    "把 /v1 漏掉、结尾多了斜杠）。")
+        return ("服务器本身连不上外网（换别的网站也一样不通）。"
+                "这是服务器的网络问题，不是配置问题 —— "
+                "如果这台服务器在境外而 API 在国内、或反过来，"
+                "都可能出现这种情况。")
+
+    if "certificate" in low or "ssl" in low or "tls" in low:
+        return "HTTPS 证书校验失败 —— 这个地址的证书有问题，别用它。"
+    return "连不上：%s" % s
+
+
+def _api_request(url, key, payload=None):
+    """向 API 发一次请求。返回 (状态码, 响应体文本)。异常原样抛出给调用方翻译。"""
+    data = None
+    headers = {"Authorization": "Bearer %s" % key, "Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers,
+                                 method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=API_PROBE_TIMEOUT) as resp:
+            return resp.getcode(), resp.read(MAX_API_BODY).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx 也是有效信息（Key 不对、地址不对），别当异常吞掉
+        try:
+            body = e.read(65536).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        return e.code, body
+
+
+def _join_api(base, path):
+    b = (base or "").strip().rstrip("/")
+    if not b:
+        raise ManagerError("还没填接口地址。")
+    if not (b.startswith("http://") or b.startswith("https://")):
+        raise ManagerError("接口地址要以 http:// 或 https:// 开头。")
+    return b + path
+
+
+def list_api_models(name, base="", key=""):
+    """拉取这个 API 支持的模型列表。
+
+    base/key 传空则用实例里已保存的 —— 这样「还没保存就想先看看有哪些模型」
+    也能用（先测通再保存，比「保存了才发现模型名错」友好得多）。
+
+    ★ 注意：**不能拿这个接口的成败来判断 Key 对不对**。
+    实测 OpenRouter 的 /models 用无效 Key 也返回 200（它不鉴权），
+    但 /chat/completions 用同样的无效 Key 返回 401。
+    所以「拉得到模型列表」只证明**地址通**，不证明 Key 可用 ——
+    真正验 Key 要用 probe_api 里那次真实聊天调用。
+    """
+    saved_base, saved_key, _ = _main_api_of(name)
+    use_base = (base or "").strip() or saved_base
+    use_key = (key or "").strip() or saved_key
+    if not use_base:
+        raise ManagerError("还没填接口地址。")
+    if not use_key:
+        raise ManagerError("还没填 API Key。")
+
+    url = _join_api(use_base, "/models")
+    try:
+        code, body = _api_request(url, use_key)
+    except ManagerError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise ManagerError(_api_error_hint(e, use_base))
+
+    if code in (401, 403):
+        raise ManagerError("能连上这个地址，但 API Key 不对（对方返回 %d）。"
+                           "检查 Key 有没有复制全、有没有多余空格。" % code)
+    if code == 404:
+        raise ManagerError("能连上，但这个地址没有 /models 接口（404）。"
+                           "多半是地址写得不完整 —— 检查结尾是不是少了 /v1。")
+    if code == 429:
+        raise ManagerError("能连上，但被限流了（429）。等一会儿再试，或检查额度。")
+    if code >= 500:
+        raise ManagerError("对方服务器出错（%d），不是你的配置问题，稍后再试。" % code)
+    if code != 200:
+        raise ManagerError("对方返回了 %d，没能取到模型列表。" % code)
+
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        raise ManagerError("能连上，但对方返回的不是 JSON —— 这个地址可能不是 "
+                           "OpenAI 兼容接口。")
+
+    ids = []
+    for m in (obj.get("data") or []):
+        if isinstance(m, dict) and m.get("id"):
+            ids.append(str(m["id"]))
+        elif isinstance(m, str):
+            ids.append(m)
+    if not ids:
+        # 有些网关 /models 返回空列表但实际可用 —— 不当失败，只是没得选。
+        return []
+    return sorted(set(ids))
+
+
+def _chat_probe(base, key, model):
+    """发一次**最小**的真实聊天请求 —— 这是唯一能证明「配置可用」的测试。
+
+    为什么非要发聊天请求、不能只看 /models：
+      ① 实测 OpenRouter 的 /models 对**任何** Key 都返回 200（不鉴权），
+         只看它就会把坏 Key 判成好的 —— 用户看到「通了 ✓」，
+         然后发现机器人根本不回话，比不做检测还糟；
+      ② 地址通、Key 对，也可能因为**模型名不存在**而失败，
+         这正是新手最常犯的错；
+      ③ 用 max_tokens=1 让成本可以忽略。
+
+    返回 (ok, 说明文字)。ok=False 时说明文字已经是给人看的话。
+    """
+    url = _join_api(base, "/chat/completions")
+    payload = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 1, "stream": False}
+    try:
+        code, body = _api_request(url, key, payload)
+    except ManagerError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        return False, _api_error_hint(e, base)
+
+    if code == 200:
+        return True, ""
+    if code in (401, 403):
+        return False, ("Key 不对（对方返回 %d）。检查有没有复制全、"
+                       "有没有多余空格。" % code)
+    if code == 404:
+        # 404 有两种可能：地址不对，或模型名不对 —— 看对方怎么说。
+        low = body.lower()
+        if "model" in low:
+            return False, ("接口地址是对的，但对方不认识「%s」这个模型名。"
+                           "点「获取可用模型」从列表里挑一个。" % model)
+        return False, ("这个地址没有聊天接口（404）—— 地址多半写得不完整，"
+                       "检查结尾是不是少了 /v1。")
+    if code == 400:
+        low = body.lower()
+        if "model" in low:
+            return False, ("接口和 Key 都通，但模型名「%s」不对。"
+                           "点「获取可用模型」从列表里挑一个。" % model)
+        # 400 也可能是 Key 格式问题（有些网关对格式不合法直接 400）
+        return False, "对方说请求不合法（400）：%s" % body[:200]
+    if code == 402:
+        return False, "账户余额不足或未开通（402）—— 去官网充值/开通后再试。"
+    if code == 429:
+        return False, "被限流了（429）。稍等再试，或检查额度是否用完。"
+    if code >= 500:
+        return False, "对方服务器出错（%d），不是你的配置问题，稍后再试。" % code
+    return False, "对方返回 %d：%s" % (code, body[:200])
+
+
+def probe_api(name, base="", key="", model=""):
+    """测主聊天 API 到底通不通。返回一份给人看的结论。
+
+    结论分三层，分开说 —— 混成一句「失败」用户就不知道下一步做什么：
+      reachable : 服务器能不能连上这个地址（网络层）
+      auth_ok   : Key 对不对（认证层）
+      model_ok  : 模型名在不在对方的列表里（配置层）
+    """
+    saved_base, saved_key, saved_model = _main_api_of(name)
+    use_base = (base or "").strip() or saved_base
+    use_key = (key or "").strip() or saved_key
+    use_model = (model or "").strip() or saved_model
+
+    out = {
+        "reachable": False,
+        "auth_ok": False,
+        "model_ok": None,        # None = 没测（没给模型名 / 拉不到列表）
+        "models": [],
+        "model_count": 0,
+        "message": "",
+        "api_base": use_base,
+    }
+
+    if not use_base:
+        out["message"] = "还没填接口地址。"
+        return out
+    if not use_key:
+        out["message"] = "还没填 API Key。"
+        return out
+
+    # ① 先拉模型列表。
+    #    它的作用是「地址通不通」+「有哪些模型可选」，**不是**验 Key ——
+    #    实测 OpenRouter 的 /models 对任何 Key 都返回 200（不鉴权），
+    #    所以不能拿它的成功来宣布「Key 没问题」（那会是假绿灯）。
+    models = []
+    try:
+        models = list_api_models(name, use_base, use_key)
+        out["reachable"] = True
+        out["models"] = models
+        out["model_count"] = len(models)
+    except ManagerError as e:
+        msg = str(e)
+        out["reachable"] = ("能连上" in msg)
+        out["message"] = msg
+        # 地址都不通/地址错 → 不用再发聊天请求了，省一次往返和一次可能的费用。
+        if not out["reachable"]:
+            return out
+        # 能连上但 /models 说 Key 不对 → 以它为准（这类服务商确实会鉴权）。
+        if "API Key 不对" in msg:
+            out["message"] = msg
+            return out
+        # 其它情况（没有 /models 接口等）继续往下用聊天请求做终判。
+    except Exception as e:  # noqa: BLE001
+        out["message"] = _api_error_hint(e, use_base)
+        return out
+
+    # ② 真实聊天请求 —— 唯一能证明「这套配置真的能用」的测试。
+    #
+    #    这一步不能省：/models 可能不鉴权（假绿灯），而且就算地址和 Key 都对，
+    #    模型名写错照样跑不起来 —— 那正是新手最常犯的错。
+    #    max_tokens=1 把成本压到几乎为零。
+    if not use_model:
+        # 没有模型名就没法发聊天请求。此时只报「地址通、Key 待验证」，
+        # 不能说「通了 ✓」—— 那是没根据的。
+        out["auth_ok"] = False
+        out["model_ok"] = None
+        if models:
+            out["message"] = ("接口地址能连上。还没填模型名 —— "
+                              "从下面的列表里挑一个，然后再测一次。")
+        else:
+            out["message"] = ("接口地址能连上。还没填模型名，"
+                              "而且对方没给模型列表 —— 请照官网文档填一个再测。")
+        return out
+
+    try:
+        ok, why = _chat_probe(use_base, use_key, use_model)
+    except ManagerError as e:
+        out["message"] = str(e)
+        return out
+
+    if ok:
+        out["auth_ok"] = True
+        out["model_ok"] = True
+        out["message"] = "通了 ✓ 接口、Key、模型名都对，机器人可以用了。"
+        return out
+
+    # 失败：分清是 Key 的问题还是模型名的问题 —— 用户要改的地方不一样。
+    out["auth_ok"] = ("Key 不对" not in why)
+    out["model_ok"] = False if ("模型" in why) else None
+    if models and use_model not in models:
+        # 顺手核对一下列表：如果列表里确实没有这个名字，几乎可以确定是名字错了。
+        out["message"] = ("接口和 Key 都对，但「%s」不在对方的模型列表里。"
+                          "从下面挑一个正确的（这是最常见的错误）。" % use_model)
+    else:
+        out["message"] = why
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 实例的 WebUI 访问信息（给 App 建 SSH 隧道用）
 # ---------------------------------------------------------------------------
 
@@ -1008,6 +1370,14 @@ def make_server(port, token):
                 q = urllib.parse.parse_qs(self.path.split("?", 1)[1]
                                           if "?" in self.path else "")
                 self._handle(lambda: read_config((q.get("name") or [""])[0]))
+            elif path == "/instance/api/models":
+                # 也要排在通用的 /instance/<名字> 之前（同 config 那个坑）。
+                q = urllib.parse.parse_qs(self.path.split("?", 1)[1]
+                                          if "?" in self.path else "")
+                self._handle(lambda: {"models": list_api_models(
+                    (q.get("name") or [""])[0],
+                    (q.get("base") or [""])[0],
+                    (q.get("key") or [""])[0])})
             elif path.startswith("/instance/"):
                 name = path[len("/instance/"):].split("/")[0]
                 self._handle(lambda: {"meta": load_meta(name),
@@ -1044,6 +1414,12 @@ def make_server(port, token):
                     body["name"], body.get("groups", ""), body.get("friends", ""),
                     body.get("api_base", ""), body.get("api_key", ""),
                     body.get("api_model", ""), body.get("persona", "")))
+            elif path == "/instance/api/test":
+                # 测主聊天 API：**在服务器上**发请求，因为真正要用它的是
+                # 服务器上的 AstrBot（手机通不代表服务器通）。
+                self._handle(lambda: probe_api(
+                    body["name"], body.get("api_base", ""),
+                    body.get("api_key", ""), body.get("api_model", "")))
             else:
                 json_response(self, 404, {"error": "没有这个接口。"})
 

@@ -19,7 +19,7 @@ SRC=app/src/com/dafeiyu/controller
 PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
 $SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
 $SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
-$SRC/ProxyTransport.java"
+$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
@@ -51,6 +51,11 @@ javac -encoding UTF-8 -nowarn -d "$OUT" -cp "app/src:$JSCH" \
   $PURE test/tests/*.java
 
 java -cp "$OUT:$JSCH" tests.Main
+
+# 注入脚本要用**真 JS 引擎**跑一遍 —— 单测只能验证脚本字符串长什么样，
+# 证明不了它真的能工作。这段脚本坏了的表现是「页面能打开但一登录就失败」，
+# 看起来一切正常，所以必须实测。
+bash test/run-shim-test.sh
 
 # 产物脱敏自检（有产物才跑 —— 纯测试时 build/ 可能是空的）
 if [ -f build/dafeiyu-controller.apk ]; then

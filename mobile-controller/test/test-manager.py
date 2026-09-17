@@ -811,6 +811,227 @@ def test_proxy_path_safety():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_api_probe_error_hints():
+    """API 探测的错误提示：必须把「地址写错」和「服务器没网」分开。
+
+    ★ 这一组是**真机实测发现的 bug** 的回归测试。
+    实测把 api.deepseek.com 打成 api.deepsek.com，底层报
+    「[Errno 101] Network is unreachable」—— 照字面翻译就是
+    「服务器出不去，检查服务器网络」，把用户指去折腾服务器，
+    而真正的问题只是少打了一个字母。域名写错时会解析到某个不相干的 IP
+    （deepsek.com → 31.13.82.33，一个 Facebook 地址段），连过去自然 unreachable。
+    """
+    print("\n【API 探测：错误提示要指对方向】")
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+
+        # ① 域名解析不了 → 必须说「地址写错了」，不能说服务器没网
+        msg = m._api_error_hint(
+            Exception("<urlopen error [Errno -2] Name or service not known>"),
+            "https://api.deepsek.com/v1")
+        ok("解析失败 → 提示地址写错" in msg or "域名解析不了" in msg,
+           "域名解析不了时说「地址写错」：%s" % msg[:40])
+        ok("服务器" not in msg.split("——")[0],
+           "解析失败时不提服务器网络")
+
+        # ② 网络不可达 + 服务器**有网** → 必须说「地址写错了」
+        m._dns_ok = lambda h: True
+        m._reference_reachable = lambda: True
+        msg = m._api_error_hint(
+            Exception("<urlopen error [Errno 101] Network is unreachable>"),
+            "https://api.deepsek.com/v1")
+        ok("地址写错" in msg,
+           "★ 服务器有网而地址连不上 → 指出是地址写错（真机 bug 的回归）")
+        ok("服务器的网络问题" not in msg,
+           "★ 不再甩锅给「服务器的网络问题」")
+
+        # ③ 服务器**确实没网** → 这时才该说服务器网络
+        m._reference_reachable = lambda: False
+        msg = m._api_error_hint(
+            Exception("<urlopen error [Errno 101] Network is unreachable>"),
+            "https://api.deepseek.com/v1")
+        ok("服务器的网络问题" in msg,
+           "服务器真没网时才说服务器网络")
+
+        # ④ 域名解析不出来时也走「地址写错」分支（不依赖参考探测）
+        m._dns_ok = lambda h: False
+        m._reference_reachable = lambda: True
+        msg = m._api_error_hint(Exception("connection refused"),
+                                "https://api.deepsek.com/v1")
+        ok("地址写错" in msg or "解析不了" in msg,
+           "域名解析不了时指出地址写错")
+
+        # ⑤ 证书问题单独说
+        msg = m._api_error_hint(Exception("certificate verify failed"),
+                                "https://x/v1")
+        ok("证书" in msg, "证书问题单独提示")
+
+        # ⑥ _host_of 能取出主机名（解析失败判断依赖它）
+        eq(m._host_of("https://api.deepseek.com/v1"), "api.deepseek.com",
+           "_host_of 取出主机名")
+        eq(m._host_of(""), "", "_host_of 空串返回空")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_api_probe_no_false_green():
+    """★ 最重要的一组：不能给出**假绿灯**。
+
+    真机实测：OpenRouter 的 /models 用**无效 Key** 也返回 200（它不鉴权），
+    但 /chat/completions 用同样的无效 Key 返回 401。
+    早先的实现拿 /models 的成功当作「Key 没问题」，于是对一个坏 Key 报
+    「通了 ✓」—— 用户看到绿灯，然后发现机器人根本不回话。
+    这比不做检测更糟：他会以为是别的地方坏了，查很久。
+
+    所以：只有真实聊天请求成功才算通。
+    """
+    print("\n【API 探测：绝不能假绿灯】")
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        m.create_instance("t1")
+        # 造一份配置，让 _main_api_of 能读出来
+        os.makedirs(os.path.dirname(m.astrbot_cfg_path("t1")), exist_ok=True)
+        with open(m.astrbot_cfg_path("t1"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "provider_sources": [{"id": "dafeiyu-main_source",
+                                      "api_base": "https://openrouter.ai/api/v1",
+                                      "key": ["sk-bad"]}],
+                "provider": [{"id": "dafeiyu-main", "model": "openai/gpt-4o-mini"}],
+            }, fh)
+
+        # 模拟 OpenRouter 那种服务商：/models 不鉴权（200），chat 才鉴权（401）
+        def fake_request(url, key, payload=None):
+            if url.endswith("/models"):
+                return 200, json.dumps({"data": [{"id": "openai/gpt-4o-mini"},
+                                                 {"id": "anthropic/claude-3"}]})
+            return 401, '{"error":{"message":"Missing Authentication header"}}'
+        m._api_request = fake_request
+
+        r = m.probe_api("t1", "", "", "")
+        eq(r["reachable"], True, "地址可达（/models 通了）")
+        eq(r["auth_ok"], False,
+           "★ 坏 Key 必须 auth_ok=False（/models 通不算数，要真聊天请求）")
+        ok("Key 不对" in r["message"], "★ 明确说 Key 不对，而不是「通了 ✓」")
+        ok("通了 ✓" not in r["message"], "★ 不给假绿灯")
+
+        # 好的 Key（chat 返回 200）→ 这时才该报通
+        def fake_ok(url, key, payload=None):
+            if url.endswith("/models"):
+                return 200, json.dumps({"data": [{"id": "openai/gpt-4o-mini"}]})
+            return 200, '{"choices":[{"message":{"content":"hi"}}]}'
+        m._api_request = fake_ok
+        r = m.probe_api("t1", "", "", "")
+        eq(r["auth_ok"], True, "真聊天请求成功才算 Key 可用")
+        eq(r["model_ok"], True, "模型名核对通过")
+        ok("通了 ✓" in r["message"], "全对时明确报通")
+
+        # 模型名写错（chat 返回 404/400 且提到 model）→ 要指出是模型名的问题
+        def fake_badmodel(url, key, payload=None):
+            if url.endswith("/models"):
+                return 200, json.dumps({"data": [{"id": "openai/gpt-4o-mini"}]})
+            return 400, '{"error":{"message":"model not found: bogus-model"}}'
+        m._api_request = fake_badmodel
+        r = m.probe_api("t1", "https://openrouter.ai/api/v1", "sk-good",
+                        "bogus-model")
+        eq(r["model_ok"], False, "★ 模型名错时 model_ok=False")
+        ok("模型" in r["message"], "★ 指出是模型名的问题（最常见的错误）")
+        ok("挑一个" in r["message"] or "列表" in r["message"],
+           "★ 告诉用户从列表里挑（可执行）")
+
+        # 没有模型名时不能说「通了」—— 没法验证，就是没法验证。
+        # 注意：传空会**回落到配置里已保存的模型名**（和 base/key 同一套约定），
+        # 所以这里要造一个「配置里也没模型名」的实例，才是真正的「没填」。
+        m._api_request = fake_ok
+        with open(m.astrbot_cfg_path("t1"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "provider_sources": [{"id": "dafeiyu-main_source",
+                                      "api_base": "https://openrouter.ai/api/v1",
+                                      "key": ["sk-good"]}],
+                "provider": [{"id": "dafeiyu-main", "model": ""}],
+            }, fh)
+        r = m.probe_api("t1", "https://openrouter.ai/api/v1", "sk-good", "")
+        eq(r["auth_ok"], False, "★ 没填模型名时不能宣称 Key 已验证")
+        ok("通了 ✓" not in r["message"], "★ 没模型名时不给绿灯")
+        ok("模型名" in r["message"], "提示去填模型名")
+        eq(r["model_ok"], None, "没模型名时 model_ok 是 None（没测，不是失败）")
+
+        # 地址不通 → 不必再发聊天请求（省一次往返和一次可能的费用）
+        calls = []
+
+        def counting_request(url, key, payload=None):
+            calls.append(url)
+            raise OSError("Network is unreachable")
+        m._api_request = counting_request
+        m._dns_ok = lambda h: False
+        r = m.probe_api("t1", "https://api.deepsek.com/v1", "sk-x", "m")
+        eq(len(calls), 1, "★ 地址不通时只发一次请求（不浪费一次聊天调用）")
+        eq(r["reachable"], False, "地址不通时 reachable=False")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_api_probe_big_model_list():
+    """★ 大模型列表不能被截断（真机 bug）。
+
+    OpenRouter 的 /models 实测有 **737KB**。早先把响应体截到 200000 字节，
+    json.loads 报「Unterminated string starting at ...」，
+    于是把一个**完全正常**的接口判成「对方返回的不是 JSON，
+    可能不是 OpenAI 兼容接口」—— 用户会以为这家不能用，转头换一家。
+
+    这个 bug 只在「模型列表特别长」的服务商上出现，
+    用一个小列表在本地测永远发现不了，所以必须专门造一个大的。
+    """
+    print("\n【API 探测：大模型列表不能被截断】")
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        m.create_instance("t1")
+        os.makedirs(os.path.dirname(m.astrbot_cfg_path("t1")), exist_ok=True)
+        with open(m.astrbot_cfg_path("t1"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "provider_sources": [{"id": "dafeiyu-main_source",
+                                      "api_base": "https://openrouter.ai/api/v1",
+                                      "key": ["sk-x"]}],
+                "provider": [{"id": "dafeiyu-main", "model": "m"}],
+            }, fh)
+
+        # 上限必须远大于 737KB —— 写死一个具体数字，防止有人又调小
+        ok(m.MAX_API_BODY >= 1024 * 1024,
+           "★ 响应体上限 >= 1MB（实测 OpenRouter 是 737KB）")
+
+        # 造一个 ~700KB 的模型列表，走**真实的解析路径**（不 stub _api_request，
+        # 而是 stub 到 socket 层，确保测的是真的 json.loads）
+        big = {"data": [{"id": "vendor%d/model-%d" % (i, i),
+                         "description": "x" * 200} for i in range(3000)]}
+        body = json.dumps(big)
+        ok(len(body) > 600000, "造出的响应体 > 600KB（实际 %d）" % len(body))
+
+        class FakeResp:
+            def __init__(self, data):
+                self._d = data
+            def getcode(self):
+                return 200
+            def read(self, n=None):
+                return self._d if n is None else self._d[:n]
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        m.urllib.request.urlopen = lambda req, timeout=None: FakeResp(
+            body.encode("utf-8"))
+        got = m.list_api_models("t1", "https://openrouter.ai/api/v1", "sk-x")
+        eq(len(got), 3000, "★ 大列表完整解析（截断的话这里会抛异常/数量不对）")
+        ok("vendor0/model-0" in got, "列表内容正确")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     print("=" * 62)
     print("dafeiyu-manager 单元测试")
@@ -836,6 +1057,10 @@ def main():
         test_missing_config_tells_two_people_apart,
         test_no_log_wait_is_capped,
         test_apply_config_fits_app_timeout,
+        # API 探测（「API 是否连通」这条反馈）—— 含真机实测发现的 3 个 bug 的回归
+        test_api_probe_error_hints,
+        test_api_probe_no_false_green,
+        test_api_probe_big_model_list,
     ]
     for t in tests:
         try:

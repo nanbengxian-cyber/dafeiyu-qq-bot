@@ -37,7 +37,13 @@ public final class LoginView {
     public interface Host {
         void toast(String msg);
 
-        void openWebLogin(String base);
+        /**
+         * 打开内置网页登录页。
+         *
+         * tunnelPort/instance/managerToken 三者都有值时，网页会经管理服务代理
+         * 访问实例的 WebUI（手机连不到服务器本机的实例端口）；否则直连 base。
+         */
+        void openWebLogin(String base, int tunnelPort, String instance, String managerToken);
     }
 
     private static final long POLL_MS = 2500L;
@@ -202,12 +208,24 @@ public final class LoginView {
         });
         webBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
+                if (RoutingTransport.viaServer()) {
+                    // 经服务器模式：把隧道端口 + 实例名 + 管理口令交给网页，
+                    // 让它把每个子请求都代理过去。
+                    //
+                    // 这里不能直接把地址给 WebView：实例的 WebUI 只监听服务器的
+                    // 127.0.0.1，手机连不上；而且 NapCat 网页用绝对路径引资源，
+                    // 少了代理前缀就全是 404（症状是「网页老是连不上」）。
+                    host.openWebLogin("http://127.0.0.1",
+                            Session.tunnel().port(), RoutingTransport.activeInstance(),
+                            Session.client().token());
+                    return;
+                }
                 String base = client.base().isEmpty() ? store.webuiBase() : client.base();
                 if (base.isEmpty()) {
                     host.toast("先填上面的 WebUI 地址");
                     return;
                 }
-                host.openWebLogin(base);
+                host.openWebLogin(base, 0, "", "");
             }
         });
         restartBtn.setOnClickListener(new View.OnClickListener() {
