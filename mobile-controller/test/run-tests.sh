@@ -19,7 +19,7 @@ SRC=app/src/com/dafeiyu/controller
 PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
 $SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
 $SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
-$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java"
+$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }

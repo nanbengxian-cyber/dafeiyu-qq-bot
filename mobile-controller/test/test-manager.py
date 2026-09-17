@@ -811,6 +811,266 @@ def test_proxy_path_safety():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_proxy_decompresses_gzip():
+    """代理必须解压 gzip，绝不能把压缩字节当明文回吐。
+
+    ★ 这是真机反馈「WebUI 打不开 / 白屏」的根因之一的回归测试。
+    NapCat（Node/express）只要看到 Accept-Encoding: gzip 就压，而安卓的
+    HttpURLConnection / OkHttp **默认就发 gzip**。原实现把压缩字节原样回吐、
+    却只转发 Content-Type、丢掉 Content-Encoding —— WebView 拿到的是
+    「标着 text/html 的 gzip 二进制」，页面直接白屏。
+
+    实测（2026-09-17，经真实 SSH 隧道）：
+      /webui/assets/index-*.js 明文 314245 字节，gzip 后 109606 字节；
+      经代理返回的头里没有 Content-Encoding，body 头两字节是 1f8b。
+    """
+    print("\n【代理：gzip 解压】")
+    import gzip as _gz
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+
+        plain = ("<html><body>" + "中文内容" * 200 + "</body></html>").encode("utf-8")
+        packed = _gz.compress(plain)
+        ok(len(packed) < len(plain), "测试数据确实是压缩过的（%d < %d）"
+           % (len(packed), len(plain)))
+        ok(packed[:2] == b"\x1f\x8b", "压缩数据带 gzip 魔数 1f8b")
+
+        eq(m._decompress(packed, "gzip"), plain, "★ gzip 被正确解压回明文")
+        eq(m._decompress(plain, "identity"), plain, "identity 原样返回")
+        eq(m._decompress(plain, None), plain, "没有 Content-Encoding 时原样返回")
+        eq(m._decompress(packed, "GZIP"), plain, "大小写不敏感（GZIP 也认）")
+        # 裸 deflate（无 zlib 头）也要能解 —— 有些实现就是这么发的
+        import zlib as _zl
+        co = _zl.compressobj(9, _zl.DEFLATED, -_zl.MAX_WBITS)
+        raw_deflate = co.compress(plain) + co.flush()
+        eq(m._decompress(raw_deflate, "deflate"), plain, "裸 deflate 也能解")
+        # 坏数据不能把响应吞掉：解不开就原样返回，让上游去报错
+        eq(m._decompress(b"\x1f\x8b\x08garbage", "gzip"), b"\x1f\x8b\x08garbage",
+           "★ 解压失败时原样返回，不抛异常、不吞响应")
+
+        # 转发时必须主动丢掉 accept-encoding 并声明 identity ——
+        # 否则 NapCat 还是会压，就又有「压缩字节 + 明文声明」的错配。
+        src = open(SRC, encoding="utf-8").read()
+        seg = src[src.find("def proxy_webui("):src.find("def json_response(")]
+        ok('"accept-encoding"' in seg,
+           "★ 转发时丢掉 accept-encoding（不让 NapCat 压缩）")
+        ok('hdrs["Accept-Encoding"] = "identity"' in seg,
+           "★ 转发时明确要 identity")
+        ok("_decompress(" in seg, "★ 回吐前调用了 _decompress（兜底）")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_responses_declare_connection_close():
+    """每个响应都必须带 Connection: close。
+
+    ★ 这是真机反馈「连不上 WebUI: unexpected end of stream on
+    com.android.okhttp.Address@9ce3d659」的根因的回归测试。
+
+    BaseHTTPRequestHandler 默认 protocol_version=HTTP/1.0 且**不发
+    Connection 头**，发完就关。按 RFC 这确实等于关闭，但 OkHttp 2.x
+    （安卓 HttpURLConnection 底下就是它）只在**看到 Connection: close
+    这个响应头**时才把连接标成不可复用（HttpEngine.java:750）。
+
+    没有这个头 → 连接被放进连接池 → 下次从池里捞出一条服务器早已关闭的
+    连接 → 读响应读到 EOF → `unexpected end of stream on ...Address@…`。
+
+    实测复现（2026-09-17，OkHttp 2.7.5，经真实 SSH 隧道）：
+      修复前：共享 client + 8 线程 → ok=81  fail=79
+      变异回退后：                    ok=160 fail=160（正是用户报的那句）
+      修复后：                        ok=320 fail=0
+    只在复用连接时出现 —— 单发一条看不出来，所以必须有这条回归测试。
+    """
+    print("\n【HTTP：Connection: close】")
+    src = open(SRC, encoding="utf-8").read()
+    ok("def end_headers(self):" in src,
+       "★ 重写了 end_headers（唯一的响应头出口，覆盖所有路径）")
+    seg = src[src.find("def end_headers(self):"):src.find("def log_message(")]
+    ok('self.send_header("Connection", "close")' in seg,
+       "★ end_headers 里补了 Connection: close")
+    ok("_headers_buffer" in seg,
+       "★ 先查已有的头，避免重复发 Connection")
+
+    # 真起一个服务，把所有响应路径都打一遍 —— 光看源码不够，
+    # 要证明 send_error（401/404/400）这些**错误路径**也带上了这个头。
+    import http.client
+    import socket
+    import threading
+    import time as _t
+    root = tempfile.mkdtemp()
+    srv = None
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        tok = m.load_or_create_token()
+        srv = m.make_server(0, tok)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        _t.sleep(0.3)
+
+        def head(path, with_token=True, method="GET", body=None):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            h = {}
+            if with_token:
+                h["X-Dafeiyu-Token"] = tok
+            if body is not None:
+                h["Content-Type"] = "application/json"
+            c.request(method, path, body=body, headers=h)
+            r = c.getresponse()
+            r.read()
+            conn = r.getheader("Connection")
+            c.close()
+            return r.status, conn
+
+        cases = [
+            ("/health", True, "GET", None, "正常 JSON 接口"),
+            ("/instances", True, "GET", None, "列表接口"),
+            ("/nope", True, "GET", None, "404 路径"),
+            ("/health", False, "GET", None, "★ 401 未授权（错误路径）"),
+            ("/instance/config?name=x", True, "GET", None, "config 接口"),
+            ("/instance/start", True, "POST", b'{"name":"x"}', "POST 接口"),
+        ]
+        for path, wt, meth, body, label in cases:
+            try:
+                code, conn = head(path, wt, meth, body)
+                ok(conn is not None and conn.lower() == "close",
+                   "%s → Connection: close（实际 %r，HTTP %s）"
+                   % (label, conn, code))
+            except Exception as e:  # noqa: BLE001
+                ok(False, "%s 请求失败：%s: %s" % (label, type(e).__name__, e))
+
+        # 服务器发完必须真的关连接，不能留着 —— 否则 OkHttp 池里那条
+        # 连接还是会被复用，问题照旧。
+        s = socket.create_connection(("127.0.0.1", port), 5)
+        s.settimeout(5)
+        s.sendall(("GET /health HTTP/1.1\r\nHost: x\r\nX-Dafeiyu-Token: %s\r\n\r\n"
+                   % tok).encode())
+        _t.sleep(0.3)
+        s.recv(65536)
+        try:
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            _t.sleep(0.3)
+            r2 = s.recv(65536)
+            ok(not r2, "★ 服务器发完就关连接（第二次 recv 得到 EOF，不是新响应）")
+        except (ConnectionError, OSError):
+            ok(True, "★ 服务器发完就关连接（第二次写入被拒）")
+        finally:
+            s.close()
+    finally:
+        if srv is not None:
+            srv.shutdown()
+            srv.server_close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_private_lock():
+    """私密机器人：密码锁必须真的挡得住「看」和「改」。
+
+    需求原话：「还有没有可以设为私密的机器人配置，可以用密码来解锁」。
+
+    ★ 这组测试的重点不是「有没有锁」，而是**每个出口都过了闸**。
+    加个 /instance/unlock 接口很容易，但原来通用的 /instance/<名字> 路由
+    本来就把 config 和 webui_token 一起返回 —— 不堵住它，锁就形同虚设。
+    所以这里逐个出口验证。
+    """
+    print("\n【私密机器人：密码锁】")
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        m.create_instance("p1")
+
+        # ① 默认不锁
+        meta = m.load_meta("p1")
+        eq(m.lock_state(meta), {"locked": False}, "默认不锁")
+
+        # ② 设锁：密码不能明文落盘
+        m.set_instance_lock("p1", True, "hunter2", "")
+        meta = m.load_meta("p1")
+        ok(m.lock_state(meta)["locked"], "设锁后状态为 locked")
+        raw = open(os.path.join(m.instance_dir("p1"), "instance.json"),
+                   encoding="utf-8").read()
+        ok("hunter2" not in raw, "★ 密码不明文落盘")
+        ok("hash" in raw and "salt" in raw, "存的是盐 + 派生值")
+        lock = meta["lock"]
+        ok(lock.get("iterations") == m.PBKDF2_ITERATIONS,
+           "记录了迭代次数（%s）" % lock.get("iterations"))
+        ok(m.PBKDF2_ITERATIONS >= 100000,
+           "★ 迭代次数够高（%d，抗暴力破解）" % m.PBKDF2_ITERATIONS)
+
+        # ③ 盐必须每次不同 —— 否则两个用户设同样的密码会得到同样的哈希，
+        #    撞库一下就全暴露了
+        m.create_instance("p2")
+        m.set_instance_lock("p2", True, "hunter2", "")
+        ok(m.load_meta("p1")["lock"]["salt"] != m.load_meta("p2")["lock"]["salt"],
+           "★ 相同密码的盐不同（防撞库）")
+        ok(m.load_meta("p1")["lock"]["hash"] != m.load_meta("p2")["lock"]["hash"],
+           "★ 相同密码的派生值不同")
+
+        # ④ 密码校验
+        ok(m._check_lock_password("hunter2", meta), "正确密码通过")
+        ok(not m._check_lock_password("hunter3", meta), "错误密码不通过")
+        ok(not m._check_lock_password("", meta), "空密码不通过")
+        ok(not m._check_lock_password("HUNTER2", meta), "大小写敏感")
+        # 元数据坏掉时必须 fail-closed（宁可锁着，也不能因为读不到就放行）
+        broken = {"lock": {"enabled": True, "salt": "", "hash": ""}}
+        ok(not m._check_lock_password("hunter2", broken),
+           "★ 元数据损坏时 fail-closed（不放行）")
+
+        # ⑤ ★ 关键：通用详情路由不能泄露配置和 WebUI token
+        d = m.instance_detail("p1")
+        ok(d["locked"], "详情报告 locked=True")
+        ok(d["config"] is None, "★ 锁着时 config 为 None（不泄露配置）")
+        eq(d["webui_token"], "", "★ 锁着时 webui_token 为空（不泄露登录凭据）")
+        ok("lock" in d and "salt" not in json.dumps(d),
+           "★ 详情里不含盐/哈希")
+
+        # ⑥ 解锁：密码对才给配置，错就报错
+        raises(lambda: m.unlock_instance("p1", "wrong"),
+               "密码不对", "★ 密码错时不返回任何配置")
+        r = m.unlock_instance("p1", "hunter2")
+        ok(r["unlocked"], "密码对时解锁成功")
+        ok("config" in r, "解锁后给出配置")
+        ok("api_key" not in json.dumps(r.get("config") or {}),
+           "★ 解锁后仍然不回显 API Key")
+
+        # ⑦ ★ 锁只挡「看」不挡「改」= 没锁。改配置必须验密码。
+        raises(lambda: m.apply_config("p1", "123456", "", "", "", "", ""),
+               "私密", "★ 没密码改不了配置")
+        raises(lambda: m.apply_config("p1", "123456", "", "", "", "", "", "bad"),
+               "密码不对", "★ 密码错改不了配置")
+
+        # ⑧ 改密码要验旧密码
+        raises(lambda: m.set_instance_lock("p1", True, "newpass", "wrong"),
+               "旧密码不对", "★ 改密码要验旧密码")
+        m.set_instance_lock("p1", True, "newpass", "hunter2")
+        ok(m._check_lock_password("newpass", m.load_meta("p1")), "改密码成功")
+        ok(not m._check_lock_password("hunter2", m.load_meta("p1")), "旧密码失效")
+
+        # ⑨ 取消锁
+        m.set_instance_lock("p1", False, "", "newpass")
+        ok(not m.lock_state(m.load_meta("p1"))["locked"], "能取消私密")
+        d2 = m.instance_detail("p1")
+        ok(not d2["locked"], "取消后详情不锁")
+        ok("lock" not in m.load_meta("p1"), "取消后元数据里不留锁信息")
+
+        # ⑩ 密码长度校验
+        raises(lambda: m.set_instance_lock("p2", True, "1", "hunter2"),
+               "至少 4 位", "★ 太短的密码被拒（防被猜到）")
+        raises(lambda: m.set_instance_lock("p2", True, "x" * 200, "hunter2"),
+               "太长", "超长密码被拒")
+
+        # ⑪ 列表接口不能泄露盐/哈希
+        lst = json.dumps([dict(x, lock=m.lock_state(x)) for x in m.all_instances()])
+        ok("salt" not in lst and "hash" not in lst,
+           "★ 列表里不含盐/哈希")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_api_probe_error_hints():
     """API 探测的错误提示：必须把「地址写错」和「服务器没网」分开。
 
@@ -1048,6 +1308,11 @@ def main():
         test_auth_token,
         test_webui_token_isolation,
         test_proxy_path_safety,
+        # 真机反馈「WebUI 连不上 / 白屏」两个根因的回归
+        test_proxy_decompresses_gzip,
+        test_responses_declare_connection_close,
+        # 私密机器人（密码解锁）
+        test_private_lock,
         test_route_ordering,
         test_apply_config_verifies_after_restart,
         test_main_provider_is_first_in_list,

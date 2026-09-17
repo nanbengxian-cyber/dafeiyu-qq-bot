@@ -124,6 +124,29 @@ public final class TunnelManagerTest {
         T.eq("缺字段时名字仍可用", "x", b.name);
         T.eq("缺端口时为 0（不崩）", 0, b.webuiPort);
         T.isFalse("缺字段不算运行中", b.running());
+        // 老服务器没有 lock 字段 → 当成不锁，不能崩
+        T.isFalse("★ 没有 lock 字段时按「不锁」处理（兼容老服务器）", b.locked);
+
+        // ── 私密锁的解析（对应「可以设为私密的机器人配置」这条反馈）────
+        Map<String, Object> lm = new HashMap<String, Object>();
+        lm.put("name", "secret1");
+        Map<String, Object> lk = new HashMap<String, Object>();
+        lk.put("locked", true);
+        lm.put("lock", lk);
+        ManagerClient.Instance locked = ManagerClient.Instance.from(lm);
+        T.isTrue("★ locked=true 被正确解析（界面才能画锁图标）", locked.locked);
+        T.eq("锁着的实例名字仍可读", "secret1", locked.name);
+
+        lk.put("locked", false);
+        T.isFalse("★ locked=false 解析为不锁",
+                ManagerClient.Instance.from(lm).locked);
+
+        // lock 存在但不是对象 / 为 null 时都不能崩
+        lm.put("lock", null);
+        T.isFalse("lock=null 时按不锁处理", ManagerClient.Instance.from(lm).locked);
+        lm.put("lock", "垃圾数据");
+        T.isFalse("★ lock 是垃圾数据时不崩、按不锁处理",
+                ManagerClient.Instance.from(lm).locked);
     }
 
     // ---------------------------------------------------------------- 端到端

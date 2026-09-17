@@ -39,6 +39,19 @@ public final class ManagerClient {
 
     private Map<String, Object> request(String method, String path, String body)
             throws Deployer.DeployException {
+        return request(method, path, body, "");
+    }
+
+    /**
+     * 发请求。unlockPassword 非空时放进 X-Dafeiyu-Unlock 头。
+     *
+     * ★ 为什么不放查询串：服务器（BaseHTTPRequestHandler）会把**整条请求行**
+     * 写进系统日志，?password=xxx 就明文留在 journald 里了。
+     * 走请求头只记录路径，密码不会落进日志。
+     */
+    private Map<String, Object> request(String method, String path, String body,
+                                        String unlockPassword)
+            throws Deployer.DeployException {
         HttpURLConnection c = null;
         try {
             URL u = new URL(base + path);
@@ -49,6 +62,9 @@ public final class ManagerClient {
             c.setReadTimeout(120000);
             c.setRequestProperty("Authorization", "Bearer " + token);
             c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            if (unlockPassword != null && !unlockPassword.isEmpty()) {
+                c.setRequestProperty("X-Dafeiyu-Unlock", unlockPassword);
+            }
             if (body != null) {
                 c.setDoOutput(true);
                 byte[] raw = body.getBytes("UTF-8");
@@ -125,6 +141,18 @@ public final class ManagerClient {
         return request("GET", "/instance/" + enc(name), null);
     }
 
+    /**
+     * 单实例详情（私密实例带解锁密码）。
+     *
+     * ★ 服务器**只认密码**，不认「App 说自己解锁过了」——
+     * 所以每次读配置都要把密码带上，不能只靠解锁那一次的调用。
+     */
+    public Map<String, Object> detail(String name, String unlockPassword)
+            throws Deployer.DeployException {
+        return request("GET", "/instance/" + enc(name), null,
+                unlockPassword == null ? "" : unlockPassword);
+    }
+
     public Instance create(String name) throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
@@ -159,6 +187,20 @@ public final class ManagerClient {
     public List<String> applyConfig(String name, String groups, String friends,
                                     String apiBase, String apiKey, String apiModel,
                                     String persona) throws Deployer.DeployException {
+        return applyConfig(name, groups, friends, apiBase, apiKey, apiModel,
+                persona, "");
+    }
+
+    /**
+     * 写入三配置（私密实例要带解锁密码）。
+     *
+     * lockPassword 是给「设了私密的机器人」用的：服务器那边没密码就不让改，
+     * 免得锁只挡住了「看」却没挡住「改」。
+     */
+    public List<String> applyConfig(String name, String groups, String friends,
+                                    String apiBase, String apiKey, String apiModel,
+                                    String persona, String lockPassword)
+            throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
         b.put("groups", groups == null ? "" : groups);
@@ -167,12 +209,41 @@ public final class ManagerClient {
         b.put("api_key", apiKey == null ? "" : apiKey);
         b.put("api_model", apiModel == null ? "" : apiModel);
         b.put("persona", persona == null ? "" : persona);
+        if (lockPassword != null && !lockPassword.isEmpty()) {
+            b.put("lock_password", lockPassword);
+        }
         Map<String, Object> r = request("POST", "/instance/config", Json.write(b));
         List<String> out = new ArrayList<String>();
         for (Object o : Json.arr(r, "changed")) {
             out.add(String.valueOf(o));
         }
         return out;
+    }
+
+    /**
+     * 设为私密 / 取消私密 / 改密码。
+     *
+     * 已经锁着的实例要改，必须给 oldPassword —— 否则任何拿到管理口令的人
+     * 都能把别人的锁直接改掉，等于没锁。
+     */
+    public Map<String, Object> setLock(String name, boolean enabled, String password,
+                                       String oldPassword)
+            throws Deployer.DeployException {
+        Map<String, Object> b = new HashMap<String, Object>();
+        b.put("name", name);
+        b.put("enabled", enabled);
+        b.put("password", password == null ? "" : password);
+        b.put("old_password", oldPassword == null ? "" : oldPassword);
+        return request("POST", "/instance/lock", Json.write(b));
+    }
+
+    /** 凭密码解锁，拿回配置。密码不对会抛异常。 */
+    public Map<String, Object> unlock(String name, String password)
+            throws Deployer.DeployException {
+        Map<String, Object> b = new HashMap<String, Object>();
+        b.put("name", name);
+        b.put("password", password == null ? "" : password);
+        return request("POST", "/instance/unlock", Json.write(b));
     }
 
     /** 管理口令。RoutingTransport 构造代理时需要它。 */
@@ -304,28 +375,33 @@ public final class ManagerClient {
         public final int panelPort;
         public final String napcat;   // 容器实际状态
         public final String astrbot;
+        /** 是否设成了私密（要看/要改都得先输密码）。 */
+        public final boolean locked;
 
         private Instance(String name, int webuiPort, int onebotPort, int panelPort,
-                         String napcat, String astrbot) {
+                         String napcat, String astrbot, boolean locked) {
             this.name = name;
             this.webuiPort = webuiPort;
             this.onebotPort = onebotPort;
             this.panelPort = panelPort;
             this.napcat = napcat;
             this.astrbot = astrbot;
+            this.locked = locked;
         }
 
         public static Instance from(Object node) {
             Map<String, Object> m = node instanceof Map
                     ? castMap(node) : new HashMap<String, Object>();
             Map<String, Object> cs = Json.obj(m, "containers");
+            Map<String, Object> lk = Json.obj(m, "lock");
             return new Instance(
                     Json.str(m, "name", ""),
                     (int) numOr(Json.lng(m, "webui_port"), 0),
                     (int) numOr(Json.lng(m, "onebot_port"), 0),
                     (int) numOr(Json.lng(m, "panel_port"), 0),
                     cs == null ? "absent" : Json.str(cs, "napcat", "absent"),
-                    cs == null ? "absent" : Json.str(cs, "astrbot", "absent"));
+                    cs == null ? "absent" : Json.str(cs, "astrbot", "absent"),
+                    lk != null && Json.bool(lk, "locked", false));
         }
 
         @SuppressWarnings("unchecked")

@@ -288,5 +288,36 @@ public final class WebProxyPathTest {
         // byName 找不到时返回 null，不能抛异常
         T.isNull("byName 找不到返回 null", ApiGuide.byName("不存在的服务商"));
         T.isNull("byName(null) 返回 null", ApiGuide.byName(null));
+
+        // ── 教程（用户：「加，并且加上对应的教程」）─────────────────────
+        //
+        // 光给网址不够：新手到了官网还是不知道点哪。教程必须写到
+        // 「哪一步、点什么、复制什么」这个颗粒度，并提前说出坑。
+        T.group("API 申请教程（修「新手不知道在哪里获取」）");
+
+        String tut = ApiGuide.tutorial("DeepSeek 深度求索");
+        T.contains("★ 教程含申请地址（不用自己去搜）", tut,
+                "https://platform.deepseek.com/api_keys");
+        T.contains("★ 教程含接口地址（可直接填）", tut,
+                "https://api.deepseek.com/v1");
+        T.contains("★ 提醒要实名（没实名建不了 Key）", tut, "实名");
+        T.contains("★ 提醒要充值并给了大概金额", tut, "¥10");
+        T.contains("★ 提醒 Key 只显示一次（最容易踩的坑）", tut, "只显示一次");
+        T.contains("★ 提醒 Key 以 sk- 开头（用户好认）", tut, "sk-");
+        T.contains("★ 告诉用户填完之后点测试连接", tut, "测试连接");
+        T.contains("★ 让用户用「获取可用模型」而不是死记模型名", tut, "获取可用模型");
+        T.isTrue("★ 教程分了步骤（不是一大段话）", tut.contains("第 1 步")
+                && tut.contains("第 6 步"));
+
+        // 每家都能生成教程，且都带上自己的地址（不能张冠李戴）
+        for (ApiGuide.Provider p : ps) {
+            String t = ApiGuide.tutorial(p.name);
+            T.contains("[" + p.name + "] 教程含自己的申请地址", t, p.keyUrl);
+            T.contains("[" + p.name + "] 教程含自己的接口地址", t, p.baseUrl);
+        }
+        // 认不出的名字要退回通用教程，不能抛异常
+        T.contains("★ 未知服务商退回通用教程", ApiGuide.tutorial("不存在"), "第 1 步");
+        T.contains("★ tutorial(null) 不抛异常", ApiGuide.tutorial(null), "第 1 步");
+        T.contains("★ 通用教程也含关键提醒", ApiGuide.genericTutorial(), "只显示一次");
     }
 }

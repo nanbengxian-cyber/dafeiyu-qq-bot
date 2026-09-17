@@ -28,6 +28,7 @@ dafeiyu-manager —— 手机 App 的服务器端管理服务。
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import urllib.parse
@@ -41,6 +42,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 # ---------------------------------------------------------------------------
 # 常量：目录布局
@@ -100,6 +102,161 @@ def instance_dir(name):
     if not NAME_RE.match(name or ""):
         raise ManagerError("实例名只能用 小写字母/数字/短横线，且不超过 31 个字符。")
     return os.path.join(INSTANCES_DIR, name)
+
+
+# ---------------------------------------------------------------------------
+# 私密机器人：把配置锁起来，要看/要改先输密码
+# ---------------------------------------------------------------------------
+#
+# 需求原话：「还有没有可以设为私密的机器人配置，可以用密码来解锁」。
+#
+# 场景：一台服务器上开了好几个机器人，其中某个是「自己的号」，
+# 配置里含 API Key 和私聊对象，不想让旁边的人拿手机点开就看到。
+#
+# ── 密码怎么存 ──────────────────────────────────────────────────────
+# 只存 **PBKDF2-HMAC-SHA256** 的派生值 + 随机盐，**绝不存明文、也不可逆**。
+# 参数取 200000 次迭代（Python 3.8 的 hashlib 支持），单次校验约几十毫秒 ——
+# 够快不影响体验，又让离线暴力破解很贵。
+#
+# 为什么不用 sha256(salt+password) 这种「一把梭」：那玩意儿 GPU 每秒能算
+# 几十亿次，用户多半会设 6 位数字，几秒就撞开了。PBKDF2 的迭代次数就是
+# 专门用来把这种暴力破解拖慢到不可行的。
+#
+# ── 关于「锁」的诚实说明 ────────────────────────────────────────────
+# 这个锁是**防「顺手点开看到」**，不是防「拿到服务器 root 的人」——
+# 有 root 就能直接读配置文件，任何 App 层的锁都拦不住。这一点必须对用户
+# 说清楚，否则他会误以为「设了密码就绝对安全」，把重要 Key 放进来。
+PBKDF2_ITERATIONS = 200000
+LOCK_SALT_BYTES = 16
+
+
+def _hash_lock_password(password, salt_hex=None):
+    """把密码派生成 (salt_hex, hash_hex)。密码永不明文落盘。"""
+    if not password:
+        raise ManagerError("密码不能为空。")
+    if salt_hex:
+        salt = bytes.fromhex(salt_hex)
+    else:
+        salt = secrets.token_bytes(LOCK_SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt,
+                             PBKDF2_ITERATIONS)
+    return salt.hex(), dk.hex()
+
+
+def _check_lock_password(password, meta):
+    """校验密码。用 compare_digest 做定时安全比较，避免逐字节时序泄露。"""
+    lock = meta.get("lock") or {}
+    if not lock.get("enabled"):
+        return True
+    salt_hex = lock.get("salt") or ""
+    want = lock.get("hash") or ""
+    if not salt_hex or not want:
+        # 元数据坏了：宁可锁着，也不要「因为读不到密码就放行」
+        return False
+    try:
+        _, got = _hash_lock_password(password or "", salt_hex)
+    except ManagerError:
+        return False
+    return secrets.compare_digest(got, want)
+
+
+def set_instance_lock(name, enabled, password, old_password):
+    """开启/关闭/改密码。返回更新后的 meta。
+
+    改密码时要验旧密码 —— 否则任何拿到管理口令的人都能直接改掉别人的锁。
+    """
+    meta = load_meta(name)
+    lock = meta.get("lock") or {}
+    already = bool(lock.get("enabled"))
+
+    # 已经锁着的话，任何改动都要先过旧密码
+    if already and not _check_lock_password(old_password, meta):
+        raise ManagerError("旧密码不对，改不了。")
+
+    if not enabled:
+        meta.pop("lock", None)
+        save_meta(name, meta)
+        return meta
+
+    if not password:
+        # 已经锁着、又没给新密码 = 只是想保持原样（比如只改了别的配置）
+        if already:
+            return meta
+        raise ManagerError("要设成私密，得先设一个密码。")
+    if len(password) < 4:
+        raise ManagerError("密码至少 4 位，太短容易被猜到。")
+    if len(password) > 128:
+        raise ManagerError("密码太长了（最多 128 位）。")
+
+    salt_hex, hash_hex = _hash_lock_password(password)
+    meta["lock"] = {
+        "enabled": True,
+        "salt": salt_hex,
+        "hash": hash_hex,
+        "iterations": PBKDF2_ITERATIONS,
+        "set_at": int(time.time()),
+    }
+    save_meta(name, meta)
+    return meta
+
+
+def unlock_instance(name, password):
+    """校验密码；对就返回配置，不对就报错。
+
+    注意：密码正确时**也不返回** api_key —— Key 永远不回显，
+    只说「有没有配」。这样即便密码被人瞟到，Key 也不会跟着泄露。
+    """
+    meta = load_meta(name)
+    if not (meta.get("lock") or {}).get("enabled"):
+        return {"unlocked": True, "locked": False,
+                "config": read_config(name)}
+    if not _check_lock_password(password, meta):
+        # 不要区分「没设过密码」和「密码错」，也别回显任何配置内容
+        raise ManagerError("密码不对。")
+    return {"unlocked": True, "locked": True, "config": read_config(name)}
+
+
+def lock_state(meta):
+    """给列表用的锁状态（**绝不含盐和哈希**）。"""
+    lock = meta.get("lock") or {}
+    if not lock.get("enabled"):
+        return {"locked": False}
+    return {"locked": True, "set_at": lock.get("set_at") or 0}
+
+
+def instance_detail(name, password=""):
+    """单个实例的详情。★ 锁着的实例**不吐配置、不吐 WebUI token**。
+
+    这是私密功能的关键一环：光加个 /instance/unlock 接口没用 ——
+    原来的通用路由 /instance/<名字> 本来就把 config 和 webui_token 一起
+    返回了，锁着也照样能拿到，等于没锁。所有出口都必须过这道闸。
+
+    password：解锁后 App 读配置时会带上它。**没有密码就一直锁着** ——
+    不能因为「App 说自己解锁过了」就放行，服务器只认密码。
+    """
+    meta = load_meta(name)
+    ls = lock_state(meta)
+    if ls["locked"] and not _check_lock_password(password, meta):
+        # 只给「这个实例存在、它是锁着的、它在不在跑」，
+        # 够 App 画出列表和锁图标，但一个字都不泄露。
+        return {"meta": {"name": meta.get("name"),
+                         "created_at": meta.get("created_at"),
+                         "status": meta.get("status"),
+                         "webui_port": meta.get("webui_port"),
+                         "onebot_port": meta.get("onebot_port"),
+                         "panel_port": meta.get("panel_port")},
+                "lock": ls,
+                "locked": True,
+                "containers": container_state(name),
+                "config": None,
+                "webui_token": ""}
+    return {"meta": meta,
+            "lock": ls,
+            "locked": False,
+            "containers": container_state(name),
+            "config": read_config(name),
+            "webui_token": webui_token(name)}
+
 
 
 def load_meta(name):
@@ -529,11 +686,16 @@ def write_persona_db(name, persona_id, prompt):
         conn.close()
 
 
-def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
+def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
+                 lock_password=""):
     """把三配置写进实例的 AstrBot。
 
     写之前先备份原文件；写之后**回读校验**（生产机的教训：写完不读回，
     写坏了也不知道）。
+
+    lock_password：私密实例要改配置必须先给密码。**没有它就能改**的话，
+    锁只挡住了「看」却没挡住「改」—— 别人可以直接把配置覆盖掉，
+    等于没锁。
     """
     # 检查顺序有讲究，按「最可能出错 + 最便宜」排：
     #   ① 先校验用户填的内容 —— 输错 QQ 号是最常见的情况，且不用碰磁盘；
@@ -560,6 +722,13 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona):
         raise ManagerError("没填任何要改的内容。")
 
     load_meta(name)  # 实例不存在 → 在这里就报清楚
+
+    # 私密实例：改配置也要密码（否则锁只挡看不挡改）
+    _meta_now = load_meta(name)
+    if (not lock_password) and (_meta_now.get("lock") or {}).get("enabled"):
+        raise ManagerError("这个机器人设了私密，要先解锁（输密码）才能改配置。")
+    if lock_password and not _check_lock_password(lock_password, _meta_now):
+        raise ManagerError("密码不对。")
 
     path = astrbot_cfg_path(name)
 
@@ -1235,6 +1404,38 @@ def webui_token(name):
 PROXY_TIMEOUT = 30
 
 
+def _decompress(raw, encoding):
+    """按 Content-Encoding 解压响应体。
+
+    为什么必须在这里解、而不是把 Content-Encoding 透传给 App：
+    NapCat（Node/express）只要看到 Accept-Encoding: gzip 就压，而**安卓的
+    HttpURLConnection 和 OkHttp 默认就发 gzip**。原来的代码把压缩后的字节
+    原样回吐、却只转发 Content-Type、丢掉 Content-Encoding —— 结果 WebView
+    拿到的是「标着 text/html 的 gzip 二进制」，页面直接白屏。
+
+    实测（2026-09-17，经真实 SSH 隧道）：
+      /webui/assets/index-*.js 未压缩 314245 字节，gzip 后 109606 字节；
+      经代理返回的头里没有 Content-Encoding，body 头两字节是 1f8b。
+    这里统一解压，App 侧就永远只看到明文，不必依赖任何一方「记得协商」。
+    """
+    enc = (encoding or "").strip().lower()
+    if not enc or enc == "identity":
+        return raw
+    try:
+        if enc == "gzip":
+            return gzip.decompress(raw)
+        if enc == "deflate":
+            # 有些实现发的是裸 deflate（没有 zlib 头），两种都试。
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+    except (OSError, zlib.error, EOFError):
+        # 解压失败就原样返回：宁可让上游去报错，也别在这里把响应吞掉。
+        return raw
+    return raw
+
+
 def proxy_webui(name, method, path, headers, body):
     """把请求转发到该实例的 NapCat WebUI，原样返回响应。"""
     meta = load_meta(name)
@@ -1243,22 +1444,31 @@ def proxy_webui(name, method, path, headers, body):
     hdrs = {}
     for k, v in headers.items():
         lk = k.lower()
-        # 丢掉会干扰转发的头（Host/长度/连接）和我们自己的管理鉴权头
-        if lk in ("host", "content-length", "connection", "x-dafeiyu-token"):
+        # 丢掉会干扰转发的头（Host/长度/连接/编码）和我们自己的管理鉴权头。
+        # accept-encoding 必须丢：我们**不转发压缩**，一律拿明文再回给 App，
+        # 否则就会出现「压缩字节 + 明文声明」的错配（见 _decompress）。
+        if lk in ("host", "content-length", "connection", "x-dafeiyu-token",
+                  "accept-encoding"):
             continue
         hdrs[k] = v
     hdrs.setdefault("Content-Type", "application/json")
+    # 明确只要明文；即便上游不理会，下面 _decompress 也会兜住。
+    hdrs["Accept-Encoding"] = "identity"
 
     req = urllib.request.Request(url, data=body if body else None,
                                  headers=hdrs, method=method)
     try:
         with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT) as resp:
-            return resp.getcode(), resp.read(), resp.headers.get(
-                "Content-Type", "application/json")
+            raw = resp.read()
+            return (resp.getcode(),
+                    _decompress(raw, resp.headers.get("Content-Encoding")),
+                    resp.headers.get("Content-Type", "application/json"))
     except urllib.error.HTTPError as e:
         # NapCat 用 4xx 表达业务错误（未授权等），原样透传，别吞成 500，
         # 否则 App 没法按自己的逻辑（比如自动重登）处理。
-        return e.code, e.read(), e.headers.get("Content-Type", "application/json")
+        raw = e.read()
+        return (e.code, _decompress(raw, e.headers.get("Content-Encoding")),
+                e.headers.get("Content-Type", "application/json"))
     except urllib.error.URLError as e:
         raise ManagerError("连不上这个实例的 WebUI（可能容器还没起来）：%s" % e.reason)
 
@@ -1282,9 +1492,57 @@ def make_server(port, token):
     class Handler(BaseHTTPRequestHandler):
         server_version = "dafeiyu-manager/1"
 
+        def end_headers(self):
+            """每个响应都显式声明 Connection: close。
+
+            ── 这是「连不上 WebUI：unexpected end of stream on
+            com.android.okhttp.Address@xxxx」的真正病根 ──────────────────
+            BaseHTTPRequestHandler 默认 protocol_version 是 HTTP/1.0，
+            并且**不发 Connection 头**，发完就关连接。按 RFC，HTTP/1.0 无
+            Connection 头确实等于「关闭」，但 OkHttp 2.x（安卓
+            HttpURLConnection 底下就是它）只在**看到 Connection: close 这
+            个响应头**时才把连接标成不可复用：
+
+                HttpEngine.java:750
+                if ("close".equalsIgnoreCase(networkResponse.request()
+                        .header("Connection"))
+                    || "close".equalsIgnoreCase(networkResponse
+                        .header("Connection"))) {
+                  streamAllocation.noNewStreams();
+                }
+
+            没有这个头 → 连接被放进连接池 → 下次请求从池里捞出一条**服务器
+            早已关闭**的连接 → 写请求后读响应读到 EOF → 抛
+            `unexpected end of stream on com.squareup.okhttp.Address@…`。
+
+            实测复现（2026-09-17，经真实 SSH 隧道，OkHttp 2.7.5）：
+              单线程复用同一个 client：ok=15  fail=15（约一半失败）
+              8 线程共享 client：      ok=81  fail=79
+              每个请求新建 client：    ok=160 fail=0   ← 不复用就没问题
+              共享 client + retry=true：ok=160 fail=0  ← 重试把它盖住了
+            也就是说这个 bug **只在高频/复用连接时出现**，单发一条看不出
+            来 —— 这正是它难查的原因。WebUI 一开就几十个请求（HTML + JS +
+            字体 + 轮询），必踩。
+
+            放在 end_headers 这个唯一出口，是为了把 json_response、_proxy、
+            send_error 三条路全覆盖住，避免「修了主路漏了错误路」。
+            """
+            buf = getattr(self, "_headers_buffer", None) or []
+            if not any(b"Connection:" in b for b in buf):
+                self.send_header("Connection", "close")
+            BaseHTTPRequestHandler.end_headers(self)
+
         def log_message(self, fmt, *args):
-            # 不把请求内容写进日志（可能含 token）
-            sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
+            # 不把请求内容写进日志（可能含 token）。
+            #
+            # ★ 另外要把查询串里的敏感参数抹掉：BaseHTTPRequestHandler 的
+            # log_request 会把**整条请求行**（含 ?password=… / ?key=…）传进来，
+            # 直接写就明文留在 journald 里了。这里统一打码，
+            # 属于「就算以后有人不小心把密码放进 URL 也不会泄露」的兜底。
+            msg = fmt % args
+            msg = re.sub(r"(password|key|token|secret)=[^&\s\"]*",
+                         r"\1=***", msg, flags=re.IGNORECASE)
+            sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
 
         def _auth(self):
             """校验管理口令。
@@ -1361,8 +1619,10 @@ def make_server(port, token):
             if path == "/health":
                 self._handle(lambda: {"ok": True, "version": 1})
             elif path == "/instances":
-                self._handle(lambda: {"instances": [dict(
-                    m, containers=container_state(m["name"])) for m in all_instances()]})
+                self._handle(lambda: {"instances": [
+                    dict(m, containers=container_state(m["name"]),
+                         lock=lock_state(m))
+                    for m in all_instances()]})
             elif path == "/instance/config":
                 # 注意顺序：这条必须排在通用的 /instance/<名字> 之前。
                 # 否则 "config" 会被当成实例名，报「没有这个实例：config」——
@@ -1370,6 +1630,13 @@ def make_server(port, token):
                 q = urllib.parse.parse_qs(self.path.split("?", 1)[1]
                                           if "?" in self.path else "")
                 self._handle(lambda: read_config((q.get("name") or [""])[0]))
+            elif path == "/instance/unlock":
+                # ★ 这里**故意只支持 POST**（见 do_POST）。
+                # 原来这里有个 GET 版本，把密码放在查询串里 ——
+                # 那是错的：BaseHTTPRequestHandler 会把整条请求行写进
+                # journald，密码就明文留在系统日志里了。删掉，不留后门。
+                json_response(self, 405, {"error": "请用 POST（密码不能放在网址里，"
+                                                   "会被记进系统日志）。"})
             elif path == "/instance/api/models":
                 # 也要排在通用的 /instance/<名字> 之前（同 config 那个坑）。
                 q = urllib.parse.parse_qs(self.path.split("?", 1)[1]
@@ -1380,10 +1647,12 @@ def make_server(port, token):
                     (q.get("key") or [""])[0])})
             elif path.startswith("/instance/"):
                 name = path[len("/instance/"):].split("/")[0]
-                self._handle(lambda: {"meta": load_meta(name),
-                                      "containers": container_state(name),
-                                      "config": read_config(name),
-                                      "webui_token": webui_token(name)})
+                # ★ 密码走请求头，不走查询串。
+                # 原因：BaseHTTPRequestHandler 会把**整条请求行**（含 ?password=xxx）
+                # 写进 stderr，也就是 journald —— 密码会明文留在系统日志里。
+                # 走头就只记录路径，不会留下密码。
+                self._handle(lambda: instance_detail(
+                    name, self.headers.get("X-Dafeiyu-Unlock") or ""))
             else:
                 json_response(self, 404, {"error": "没有这个接口。"})
 
@@ -1413,7 +1682,16 @@ def make_server(port, token):
                 self._handle(lambda: apply_config(
                     body["name"], body.get("groups", ""), body.get("friends", ""),
                     body.get("api_base", ""), body.get("api_key", ""),
-                    body.get("api_model", ""), body.get("persona", "")))
+                    body.get("api_model", ""), body.get("persona", ""),
+                    body.get("lock_password", "")))
+            elif path == "/instance/lock":
+                # 设为私密 / 取消私密 / 改密码
+                self._handle(lambda: {"lock": lock_state(set_instance_lock(
+                    body["name"], bool(body.get("enabled", True)),
+                    body.get("password", ""), body.get("old_password", "")))})
+            elif path == "/instance/unlock":
+                self._handle(lambda: unlock_instance(
+                    body["name"], body.get("password", "")))
             elif path == "/instance/api/test":
                 # 测主聊天 API：**在服务器上**发请求，因为真正要用它的是
                 # 服务器上的 AstrBot（手机通不代表服务器通）。

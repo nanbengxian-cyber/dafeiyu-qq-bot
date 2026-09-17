@@ -58,11 +58,21 @@ public final class RobotsView {
     private LinearLayout listBox;
     private TextView statusLine;
     private EditText nameInput;
+    private EditText searchInput;
     private Button createBtn;
     private Button refreshBtn;
 
+    /** 最近一次从服务器拉到的完整列表（搜索过滤在它上面做，不再发请求）。 */
+    private List<ManagerClient.Instance> lastItems = new ArrayList<ManagerClient.Instance>();
+
     /** 当前展开编辑的实例名（null = 都在折叠态）。 */
     private String expanded;
+
+    /** 已经解锁的私密实例（本次会话内有效，退出 App 就忘）。
+     *
+     *  只放密码在内存里、不落盘 —— 落盘就等于把锁的钥匙放在锁旁边。
+     *  换页/刷新都还在，杀掉 App 就没了，这是刻意的。 */
+    private final Map<String, String> unlockedPasswords = new java.util.HashMap<String, String>();
 
     public RobotsView(Context ctx, Host host) {
         this.ctx = ctx;
@@ -90,11 +100,55 @@ public final class RobotsView {
         in1.addView(createBtn);
         page.addView(c1);
 
+        // ---- 新手第一步：API 去哪申请 ----------------------------------------
+        //
+        // ★ 为什么要把这个提到最上面（用户反馈「还没有各大官网的API获取地址，
+        //   那新手不知道在哪里获取怎么办？」）：
+        //
+        // 原来引导只藏在「某个机器人的展开配置」里。问题是 ——
+        // **新手还没有机器人**，他根本没机会展开任何配置，也就永远看不到
+        // 这份引导。功能「存在」但「不可达」，等于不存在。
+        //
+        // 而且「API 从哪来」是整条流程里唯一必须在**别的网站**完成的步骤，
+        // 恰恰是最该放在最显眼位置的一步。所以提到首屏、独立成卡、
+        // 默认就能看见（不用点开）。
+        page.addView(buildApiCard());
+
         // ---- 列表 ----
         LinearLayout c2 = UiKit.card(ctx, "我的机器人");
         LinearLayout in2 = UiKit.inner(c2);
         refreshBtn = UiKit.button(ctx, "刷新列表", false);
         in2.addView(refreshBtn);
+
+        // ── 按名字搜索 ──────────────────────────────────────────────────
+        //
+        // 需求原话：「机器人列表那里，是公开的，不是说不好，是不能定向搜索
+        // 机器人名字」。机器人一多，列表就是一大坨，找一个得从头看到尾。
+        //
+        // 做法是**本地过滤**，不是发请求去搜：
+        //   * 列表本来就已经全在手里了（一次 /instances 全拿到），
+        //     再往服务器跑一趟纯属浪费 —— 而且要等网络，打字时卡顿明显；
+        //   * 本地过滤是即时的，边打边筛。
+        // 只有机器人数量大到一次拉不完时才需要服务端搜索，那个量级还很远。
+        searchInput = UiKit.input(ctx, "搜索机器人名字（输几个字就筛出来）", false);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.topMargin = Theme.dp(ctx, 6);
+        searchInput.setLayoutParams(slp);
+        in2.addView(searchInput);
+        searchInput.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            public void afterTextChanged(android.text.Editable e) {
+                // 只重画列表，不再请求服务器 —— 打字不该触发网络。
+                renderFiltered();
+            }
+        });
+
         listBox = UiKit.column(ctx);
         in2.addView(listBox);
         page.addView(c2);
@@ -168,6 +222,25 @@ public final class RobotsView {
     }
 
     private void renderList(List<ManagerClient.Instance> items) {
+        lastItems = items;
+        renderFiltered();
+    }
+
+    /**
+     * 按搜索框内容过滤后重画列表。
+     *
+     * 抽出来是因为它有两个调用点：拉到新数据时、搜索框打字时。
+     * 两处必须是同一套逻辑 —— 否则「刷新之后搜索结果变了样」这种
+     * 不一致会很难查。
+     */
+    private void renderFiltered() {
+        List<ManagerClient.Instance> items = lastItems;
+        // 搜索框的监听器是在 listBox 之前挂上的，理论上首次构造时不会触发，
+        // 但一旦哪天 UiKit.input 改成预置文本就会立刻 NPE。
+        // 这里挡一下：宁可少画一次，也不要在用户面前崩。
+        if (listBox == null || statusLine == null) {
+            return;
+        }
         listBox.removeAllViews();
         if (items.isEmpty()) {
             statusLine.setText("还没有机器人 —— 在上面起个名字，点「新建」。");
@@ -188,8 +261,28 @@ public final class RobotsView {
                 RoutingTransport.setActiveInstance("");
             }
         }
-        statusLine.setText("共 " + items.size() + " 个机器人。点「登录这个 QQ」去扫码。");
+
+        String q = searchInput == null ? ""
+                : searchInput.getText().toString().trim();
+        // 过滤逻辑在 RobotFilter 里（那样才能进单测）。
+        // 这里只是把结果套回界面。
+        List<String> names = new ArrayList<String>();
         for (ManagerClient.Instance it : items) {
+            names.add(it.name);
+        }
+        List<ManagerClient.Instance> shown = new ArrayList<ManagerClient.Instance>();
+        for (Integer idx : RobotFilter.match(names, q)) {
+            shown.add(items.get(idx));
+        }
+
+        if (shown.isEmpty()) {
+            // ★ 空结果必须说清楚「是搜不到，不是没有机器人」——
+            // 否则用户会以为机器人被删了，转头去重新建一个。
+            statusLine.setText(RobotFilter.statusText(q, 0, items.size()));
+            return;
+        }
+        statusLine.setText(RobotFilter.statusText(q, shown.size(), items.size()));
+        for (ManagerClient.Instance it : shown) {
             listBox.addView(rowFor(it));
         }
     }
@@ -201,54 +294,133 @@ public final class RobotsView {
         lp.topMargin = Theme.dp(ctx, 8);
         box.setLayoutParams(lp);
 
-        // 标题行：名字 + 状态
+        // 标题行：名字 + 状态 + 锁
         LinearLayout head = UiKit.row(ctx);
         TextView name = UiKit.text(ctx, it.name, 15, Theme.TEXT);
         name.setTypeface(name.getTypeface(), Typeface.BOLD);
         head.addView(name);
+        if (it.locked) {
+            // 锁图标：一眼看出哪个是私密的。
+            // 用文字「🔒 私密」而不是只画个锁，是因为用户不一定认识图标含义，
+            // 而「私密」两个字直接说明了它的性质。
+            TextView lk = UiKit.text(ctx, "　🔒 私密", 12, Theme.WARN);
+            head.addView(lk);
+        }
         TextView st = UiKit.text(ctx, "　" + it.stateText(), 12,
                 it.running() ? 0xFF3FB950 : Theme.DIM);
         head.addView(st);
         box.addView(head);
 
-        // 操作按钮
-        LinearLayout btns = UiKit.row(ctx);
-        btns.addView(smallBtn("展开配置", new View.OnClickListener() {
-            public void onClick(View v) {
-                expanded = expanded != null && expanded.equals(it.name) ? null : it.name;
-                reload();
-            }
-        }));
-        // 「登录这个 QQ」：把这个实例设成当前操作的实例，然后跳到登录页。
-        // 登录页的请求会经管理服务代理到这个实例的 NapCat 上 ——
-        // 用户不需要知道端口，也不需要填 WebUI 地址。
-        btns.addView(smallBtn("登录这个 QQ", new View.OnClickListener() {
-            public void onClick(View v) {
-                RoutingTransport.setActiveInstance(it.name);
-                host.toast("已选中「" + it.name + "」，去「登录 QQ」页扫码");
-                host.gotoLoginTab();
-            }
-        }));
-        if (!it.running()) {
-            btns.addView(smallBtn("启动", new View.OnClickListener() {
+        // 私密机器人还没解锁时，**配置面板直接不给展开** ——
+        // 光靠「展开后不显示内容」不够：用户会以为面板坏了。
+        // 这里换成一句明确的「锁着，点解锁」，并给解锁按钮。
+        if (it.locked && !unlockedPasswords.containsKey(it.name)) {
+            LinearLayout lockedBox = UiKit.column(ctx);
+            lockedBox.addView(UiKit.text(ctx,
+                    "这个机器人设了私密，配置要输密码才能看和改。",
+                    12, Theme.DIM));
+            Button un = UiKit.button(ctx, "输入密码解锁", true);
+            un.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
-                    act("start", it.name);
+                    askPassword(it, null);
                 }
-            }));
+            });
+            lockedBox.addView(un);
+            box.addView(lockedBox);
         } else {
-            btns.addView(smallBtn("停止", new View.OnClickListener() {
+            // 操作按钮
+            LinearLayout btns = UiKit.row(ctx);
+            btns.addView(smallBtn("展开配置", new View.OnClickListener() {
                 public void onClick(View v) {
-                    act("stop", it.name);
+                    expanded = expanded != null && expanded.equals(it.name)
+                            ? null : it.name;
+                    reload();
                 }
             }));
-        }
-        box.addView(btns);
+            // 「登录这个 QQ」：把这个实例设成当前操作的实例，然后跳到登录页。
+            // 登录页的请求会经管理服务代理到这个实例的 NapCat 上 ——
+            // 用户不需要知道端口，也不需要填 WebUI 地址。
+            btns.addView(smallBtn("登录这个 QQ", new View.OnClickListener() {
+                public void onClick(View v) {
+                    RoutingTransport.setActiveInstance(it.name);
+                    host.toast("已选中「" + it.name + "」，去「登录 QQ」页扫码");
+                    host.gotoLoginTab();
+                }
+            }));
+            if (!it.running()) {
+                btns.addView(smallBtn("启动", new View.OnClickListener() {
+                    public void onClick(View v) {
+                        act("start", it.name);
+                    }
+                }));
+            } else {
+                btns.addView(smallBtn("停止", new View.OnClickListener() {
+                    public void onClick(View v) {
+                        act("stop", it.name);
+                    }
+                }));
+            }
+            box.addView(btns);
 
-        // 展开：三配置
-        if (expanded != null && expanded.equals(it.name)) {
-            box.addView(configPanel(it));
+            // 展开：三配置
+            if (expanded != null && expanded.equals(it.name)) {
+                box.addView(configPanel(it));
+            }
         }
         return box;
+    }
+
+    /**
+     * 弹密码框解锁。
+     *
+     * 解锁成功后把密码**只存在内存里**（unlockedPasswords），
+     * 这样用户点「保存」时能带上它，不用反复输。
+     * 不落盘：落盘就等于把钥匙挂在锁上。
+     *
+     * onDone 不为 null 时，解锁成功后回调它（比如「保存配置」前先解锁）。
+     */
+    private void askPassword(final ManagerClient.Instance it, final Runnable onDone) {
+        final EditText pw = UiKit.input(ctx, "密码", true);
+        new android.app.AlertDialog.Builder(ctx)
+                .setTitle("解锁「" + it.name + "」")
+                .setView(pw)
+                .setPositiveButton("解锁", new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        final String p = pw.getText().toString();
+                        if (p.isEmpty()) {
+                            host.toast("密码不能为空");
+                            return;
+                        }
+                        host.toast("正在验证…");
+                        pool.execute(new Runnable() {
+                            public void run() {
+                                try {
+                                    client().unlock(it.name, p);
+                                    ui.post(new Runnable() {
+                                        public void run() {
+                                            unlockedPasswords.put(it.name, p);
+                                            host.toast("解锁成功");
+                                            if (onDone != null) {
+                                                onDone.run();
+                                            }
+                                            reload();
+                                        }
+                                    });
+                                } catch (final Deployer.DeployException e) {
+                                    ui.post(new Runnable() {
+                                        public void run() {
+                                            // 密码错就明确说密码错 —— 不要笼统报「失败」，
+                                            // 否则用户会怀疑是网络或 App 坏了。
+                                            host.toast(e.getMessage());
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private Button smallBtn(String text, View.OnClickListener l) {
@@ -259,6 +431,154 @@ public final class RobotsView {
         b.setLayoutParams(lp);
         b.setOnClickListener(l);
         return b;
+    }
+
+    // ------------------------------------------------------------ 新手第一步：API
+
+    /**
+     * 首屏的「API 去哪申请」卡。**默认展开**，不用点开就能看到。
+     *
+     * 用户原话：「还没有各大官网的API获取地址，那新手不知道在哪里获取怎么办？
+     * 加，并且加上对应的教程」。
+     *
+     * 之前的问题不是「没有内容」，而是「内容不可达」—— 藏在某个机器人的
+     * 展开面板里，而新手连机器人都还没有。所以这里：
+     *   ① 提到首屏第一张卡，独立于任何机器人；
+     *   ② 默认就展开（不折叠），第一眼就能看见；
+     *   ③ 带上「怎么注册、去哪复制 Key、粘到哪」的分步教程，
+     *      不只是丢一堆网址让人自己猜。
+     */
+    private View buildApiCard() {
+        LinearLayout card = UiKit.card(ctx, "第一步：搞一个 API（新手必看）");
+        LinearLayout in = UiKit.inner(card);
+
+        // 用大白话讲清楚「API 是什么、为什么非得有它」——
+        // 不说清楚，新手会以为这是可选项而跳过，然后卡在机器人不说话上。
+        in.addView(UiKit.text(ctx, ApiGuide.intro(), 12, Theme.DIM));
+
+        // 分步教程：每一步都写清楚「在哪个页面、点哪个按钮、看到什么」。
+        // 泛泛说「去官网申请」对新手等于没说。
+        in.addView(UiKit.caption(ctx, "手把手（以最推荐的 DeepSeek 为例）"));
+        in.addView(UiKit.text(ctx, ApiGuide.tutorial("DeepSeek 深度求索"),
+                12, Theme.DIM));
+
+        // 直达申请页的按钮 —— 单独给一个最推荐的，免得新手在 8 家里挑花眼
+        ApiGuide.Provider first = ApiGuide.providers().isEmpty()
+                ? null : ApiGuide.providers().get(0);
+        if (first != null) {
+            Button go = UiKit.button(ctx,
+                    "① 去 DeepSeek 官网申请 Key（点这里打开）", true);
+            final String url = first.keyUrl;
+            go.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    openUrl(url);
+                }
+            });
+            in.addView(go);
+        }
+
+        // 全部服务商：折叠起来，需要的人自己展开。
+        // 默认只展示「怎么申请」的通用教程 + 最推荐那家，
+        // 避免一屏塞 8 家的信息把新手淹掉。
+        final LinearLayout allBox = UiKit.column(ctx);
+        allBox.setVisibility(View.GONE);
+        final Button allBtn = UiKit.button(ctx,
+                "② 看全部 " + ApiGuide.providers().size() + " 家服务商（含官网地址）", false);
+        allBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean show = allBox.getVisibility() != View.VISIBLE;
+                allBox.setVisibility(show ? View.VISIBLE : View.GONE);
+                allBtn.setText(show
+                        ? "收起服务商列表"
+                        : "② 看全部 " + ApiGuide.providers().size()
+                          + " 家服务商（含官网地址）");
+                if (show && allBox.getChildCount() == 0) {
+                    buildProviderList(allBox, null, null, null);
+                }
+            }
+        });
+        in.addView(allBtn);
+        in.addView(allBox);
+
+        // 安全提醒必须跟着教程一起给 —— 别让人糊里糊涂就把 Key 交出去
+        in.addView(UiKit.text(ctx, ApiGuide.securityNote(), 11, Theme.DIM));
+
+        in.addView(UiKit.text(ctx,
+                "拿到 Key 之后：回到「我的机器人」→ 展开配置 → 把 Key 粘进"
+                + "「API Key」那栏 → 点「保存到服务器」。"
+                + "填完记得点「测试连接」，通不通当场就知道。", 12, Theme.GOOD));
+        return card;
+    }
+
+    /**
+     * 列出所有服务商，每家带「用这家」（填地址+模型）和「去申请」（开官网）。
+     *
+     * apiBase/apiKey/apiModel 为 null 时只显示信息、不放「用这家」按钮 ——
+     * 首屏那张卡不属于任何机器人，没地方填。
+     */
+    private void buildProviderList(final LinearLayout box, final EditText apiBase,
+                                   final EditText apiKey, final EditText apiModel) {
+        for (final ApiGuide.Provider p : ApiGuide.providers()) {
+            LinearLayout card = UiKit.column(ctx);
+            android.graphics.drawable.GradientDrawable bg =
+                    new android.graphics.drawable.GradientDrawable();
+            bg.setColor(Theme.INPUT);
+            bg.setCornerRadius(Theme.dp(ctx, 8));
+            card.setBackground(bg);
+            int pad = Theme.dp(ctx, 8);
+            card.setPadding(pad, pad, pad, pad);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = Theme.dp(ctx, 8);
+            card.setLayoutParams(lp);
+
+            TextView title = UiKit.text(ctx, p.name, 14, Theme.TEXT);
+            title.setTypeface(title.getTypeface(), Typeface.BOLD);
+            card.addView(title);
+            card.addView(UiKit.text(ctx, p.note, 12, Theme.DIM));
+            // 申请地址用可长按复制的方式给全 —— 用户要的就是这个网址
+            card.addView(UiKit.text(ctx, "申请地址：" + p.keyUrl, 11, Theme.GOOD));
+            card.addView(UiKit.text(ctx, "接口地址：" + p.baseUrl, 11, Theme.DIM));
+            card.addView(UiKit.text(ctx, "模型名示例：" + joinList(p.models), 11, Theme.DIM));
+            if (!p.warn.isEmpty()) {
+                card.addView(UiKit.text(ctx, p.warn, 11, Theme.WARN));
+            }
+
+            LinearLayout btns = UiKit.row(ctx);
+            if (apiBase != null) {
+                Button use = UiKit.button(ctx, "用这家", true);
+                LinearLayout.LayoutParams w1 = new LinearLayout.LayoutParams(
+                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                w1.rightMargin = Theme.dp(ctx, 4);
+                use.setLayoutParams(w1);
+                use.setOnClickListener(new View.OnClickListener() {
+                    public void onClick(View v) {
+                        apiBase.setText(p.baseUrl);
+                        if (apiModel != null
+                                && apiModel.getText().toString().trim().isEmpty()) {
+                            apiModel.setText(p.firstModel());
+                        }
+                        host.toast("已填好接口地址。去官网申请 Key，"
+                                + "复制回来粘到 API Key 那栏。");
+                    }
+                });
+                btns.addView(use);
+            }
+
+            Button apply = UiKit.button(ctx, "去申请", apiBase == null);
+            LinearLayout.LayoutParams w2 = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            w2.leftMargin = Theme.dp(ctx, 4);
+            apply.setLayoutParams(w2);
+            apply.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    openUrl(p.keyUrl);
+                }
+            });
+            btns.addView(apply);
+            card.addView(btns);
+            box.addView(card);
+        }
     }
 
     // ------------------------------------------------------------ 三配置面板
@@ -411,7 +731,10 @@ public final class RobotsView {
         pool.execute(new Runnable() {
             public void run() {
                 try {
-                    final Map<String, Object> d = client().detail(it.name);
+                    // 私密实例要带上解锁密码，否则服务器返回 config=null
+                    String lockPw = unlockedPasswords.containsKey(it.name)
+                            ? unlockedPasswords.get(it.name) : "";
+                    final Map<String, Object> d = client().detail(it.name, lockPw);
                     final Map<String, Object> cfg = Json.obj(d, "config");
                     ui.post(new Runnable() {
                         public void run() {
@@ -475,8 +798,12 @@ public final class RobotsView {
                 pool.execute(new Runnable() {
                     public void run() {
                         try {
+                            // 私密实例要带上解锁密码，否则服务器会拒绝写入
+                            // （锁只挡看不挡改 = 没锁）。
+                            String lockPw = unlockedPasswords.containsKey(it.name)
+                                    ? unlockedPasswords.get(it.name) : "";
                             final List<String> changed = client().applyConfig(
-                                    it.name, g, f, ab, ak, am, pe);
+                                    it.name, g, f, ab, ak, am, pe, lockPw);
                             ui.post(new Runnable() {
                                 public void run() {
                                     apiKey.setText("");
@@ -498,7 +825,97 @@ public final class RobotsView {
                 });
             }
         });
+
+        // ── 私密设置 ────────────────────────────────────────────────────
+        //
+        // 需求原话：「还有没有可以设为私密的机器人配置，可以用密码来解锁」。
+        // 放在面板最底部：这是「配置好之后」才考虑的选项，不该挡在前面。
+        panel.addView(UiKit.caption(ctx, "④ 私密（可选）"));
+        final Button lockBtn = UiKit.button(ctx,
+                it.locked ? "🔒 已设为私密（点这里改密码/取消）" : "设为私密（用密码锁起来）",
+                false);
+        lockBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                showLockDialog(it);
+            }
+        });
+        panel.addView(lockBtn);
+        panel.addView(UiKit.text(ctx,
+                "锁上之后，看配置和改配置都要先输密码。\n"
+                + "说明：这个锁是防「别人拿你手机顺手点开看到」，"
+                + "不是防拿到服务器 root 的人 —— 有 root 就能直接读配置文件。"
+                + "所以别把它当保险箱用。", 11, Theme.DIM));
         return panel;
+    }
+
+    /**
+     * 设私密 / 改密码 / 取消私密。
+     *
+     * 三种情况合成一个对话框，是因为用户的心智模型就是「管理这个锁」，
+     * 分成三个入口反而要他自己判断该点哪个。
+     */
+    private void showLockDialog(final ManagerClient.Instance it) {
+        LinearLayout box = UiKit.column(ctx);
+        final EditText oldPw = UiKit.input(ctx, "当前密码（还没设过就留空）", true);
+        final EditText newPw = UiKit.input(ctx,
+                it.locked ? "新密码（留空=只取消私密）" : "设一个密码（至少 4 位）", true);
+        if (it.locked) {
+            box.addView(UiKit.text(ctx, "已经锁着了。改密码要输当前密码。", 12, Theme.DIM));
+            box.addView(oldPw);
+        }
+        box.addView(newPw);
+        box.addView(UiKit.text(ctx,
+                "· 点「保存」= 设成私密 / 改密码\n"
+                + "· 想取消私密：新密码留空，只填当前密码，点「取消私密」", 11, Theme.DIM));
+
+        new android.app.AlertDialog.Builder(ctx)
+                .setTitle(it.locked ? "管理「" + it.name + "」的锁" : "把「" + it.name + "」设为私密")
+                .setView(box)
+                .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        doSetLock(it, true, newPw.getText().toString(),
+                                oldPw.getText().toString());
+                    }
+                })
+                .setNeutralButton("取消私密", new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        doSetLock(it, false, "", oldPw.getText().toString());
+                    }
+                })
+                .setNegativeButton("返回", null)
+                .show();
+    }
+
+    private void doSetLock(final ManagerClient.Instance it, final boolean enabled,
+                           final String password, final String oldPassword) {
+        host.toast("正在处理…");
+        pool.execute(new Runnable() {
+            public void run() {
+                try {
+                    client().setLock(it.name, enabled, password, oldPassword);
+                    ui.post(new Runnable() {
+                        public void run() {
+                            // 锁状态变了，内存里那个解锁密码也要跟着更新/清掉 ——
+                            // 否则会出现「已经取消了私密，本地还记着旧密码」，
+                            // 或者「改了密码，本地还是旧的」导致保存失败。
+                            if (enabled && !password.isEmpty()) {
+                                unlockedPasswords.put(it.name, password);
+                            } else if (!enabled) {
+                                unlockedPasswords.remove(it.name);
+                            }
+                            host.toast(enabled ? "已设为私密" : "已取消私密");
+                            reload();
+                        }
+                    });
+                } catch (final Deployer.DeployException e) {
+                    ui.post(new Runnable() {
+                        public void run() {
+                            host.toast(e.getMessage());
+                        }
+                    });
+                }
+            }
+        });
     }
 
     private static String join(List<Object> arr) {
@@ -598,63 +1015,10 @@ public final class RobotsView {
     private void buildGuide(final LinearLayout box, final EditText apiBase,
                             final EditText apiKey, final EditText apiModel) {
         box.addView(UiKit.text(ctx, ApiGuide.intro(), 12, Theme.DIM));
-
-        for (final ApiGuide.Provider p : ApiGuide.providers()) {
-            LinearLayout card = UiKit.column(ctx);
-            android.graphics.drawable.GradientDrawable bg =
-                    new android.graphics.drawable.GradientDrawable();
-            bg.setColor(Theme.INPUT);
-            bg.setCornerRadius(Theme.dp(ctx, 8));
-            card.setBackground(bg);
-            int pad = Theme.dp(ctx, 8);
-            card.setPadding(pad, pad, pad, pad);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = Theme.dp(ctx, 8);
-            card.setLayoutParams(lp);
-
-            TextView title = UiKit.text(ctx, p.name, 14, Theme.TEXT);
-            title.setTypeface(title.getTypeface(), Typeface.BOLD);
-            card.addView(title);
-            card.addView(UiKit.text(ctx, p.note, 12, Theme.DIM));
-            card.addView(UiKit.text(ctx, "接口地址：" + p.baseUrl, 11, Theme.DIM));
-            card.addView(UiKit.text(ctx, "模型名示例：" + joinList(p.models), 11, Theme.DIM));
-            if (!p.warn.isEmpty()) {
-                card.addView(UiKit.text(ctx, p.warn, 11, Theme.WARN));
-            }
-
-            LinearLayout btns = UiKit.row(ctx);
-            Button use = UiKit.button(ctx, "用这家", true);
-            LinearLayout.LayoutParams w1 = new LinearLayout.LayoutParams(
-                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            w1.rightMargin = Theme.dp(ctx, 4);
-            use.setLayoutParams(w1);
-            use.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    apiBase.setText(p.baseUrl);
-                    if (apiModel.getText().toString().trim().isEmpty()) {
-                        apiModel.setText(p.firstModel());
-                    }
-                    host.toast("已填好接口地址。去官网申请 Key，复制回来粘到 API Key 那栏。");
-                }
-            });
-            btns.addView(use);
-
-            Button apply = UiKit.button(ctx, "去申请", false);
-            LinearLayout.LayoutParams w2 = new LinearLayout.LayoutParams(
-                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            w2.leftMargin = Theme.dp(ctx, 4);
-            apply.setLayoutParams(w2);
-            apply.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    openUrl(p.keyUrl);
-                }
-            });
-            btns.addView(apply);
-            card.addView(btns);
-            box.addView(card);
-        }
-
+        box.addView(UiKit.caption(ctx, "手把手（以最推荐的 DeepSeek 为例）"));
+        box.addView(UiKit.text(ctx, ApiGuide.tutorial("DeepSeek 深度求索"),
+                12, Theme.DIM));
+        buildProviderList(box, apiBase, apiKey, apiModel);
         box.addView(UiKit.text(ctx, ApiGuide.securityNote(), 11, Theme.DIM));
     }
 
