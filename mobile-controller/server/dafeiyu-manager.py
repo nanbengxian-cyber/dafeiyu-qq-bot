@@ -39,6 +39,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -1163,8 +1164,9 @@ def write_persona_db(name, persona_id, prompt):
 
 
 def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
-                 lock_password=""):
-    """把三配置写进实例的 AstrBot。
+                 lock_password="", vision_base="", vision_key="",
+                 vision_model=""):
+    """把配置写进实例的 AstrBot。
 
     写之前先备份原文件；写之后**回读校验**（生产机的教训：写完不读回，
     写坏了也不知道）。
@@ -1172,6 +1174,13 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
     lock_password：私密实例要改配置必须先给密码。**没有它就能改**的话，
     锁只挡住了「看」却没挡住「改」—— 别人可以直接把配置覆盖掉，
     等于没锁。
+
+    vision_* 是**可选**的「识图 API」。为什么要单独一套、而不是让用户
+    把主 API 换成识图的：
+      * 主聊天 API 用一个便宜、快的文本模型，识图用一个单独的视觉模型，
+        是生产机一直在用的做法（省钱且效果好）；
+      * 用户升级前已经在用文本 API 了，不该逼他换掉。
+    所以：不填 vision_* 就完全不动多模态配置，保持原样。
     """
     # 检查顺序有讲究，按「最可能出错 + 最便宜」排：
     #   ① 先校验用户填的内容 —— 输错 QQ 号是最常见的情况，且不用碰磁盘；
@@ -1194,7 +1203,33 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
             raise ManagerError("模型名里不能有空格或换行。")
 
     has_persona = bool(persona and persona.strip())
-    if not (gids or fids or api_any or has_persona):
+
+    # 识图 API：要么全不填（不动它），要么三样都填。
+    # 只填一半就报错，而不是「凑合写一半」—— 写一半的结果是机器人
+    # 收得到图但识不了，用户完全看不出哪里不对。
+    vision_any = bool(vision_base or vision_key or vision_model)
+    if vision_any and not (vision_base and vision_key and vision_model):
+        raise ManagerError("识图 API 要填全：接口地址、API Key、模型名缺一不可。"
+                           "（不用识图的话，这三样都留空就行。）")
+    if vision_any:
+        if not (vision_base.startswith("http://")
+                or vision_base.startswith("https://")):
+            raise ManagerError("识图接口地址要以 http:// 或 https:// 开头。")
+        if " " in vision_base:
+            raise ManagerError("识图接口地址里不能有空格。")
+        if "\n" in vision_key or "\r" in vision_key:
+            raise ManagerError("识图 API Key 里不能有换行。")
+        if " " in vision_model or "\n" in vision_model or "\r" in vision_model:
+            raise ManagerError("识图模型名里不能有空格或换行。")
+        if vision_model == api_model and vision_base == api_base:
+            # 同一个模型既当主聊天又当识图 —— 只有它真能识图时才成立。
+            # 这里拦一下：真能识图的话，把主 API 的模型换成它就行，
+            # 不必配两遍；不能识图的话，配了也是白配。
+            raise ManagerError("识图模型和主聊天模型是同一个，这样配没有意义。"
+                               "如果这个模型本身就能识图，直接把它填在"
+                               "「主聊天 API」那里就行。")
+
+    if not (gids or fids or api_any or has_persona or vision_any):
         raise ManagerError("没填任何要改的内容。")
 
     load_meta(name)  # 实例不存在 → 在这里就报清楚
@@ -1329,6 +1364,55 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         cfg.setdefault("provider_settings", {})["default_provider_id"] = pid
         changed.append("主聊天 API（%s）" % api_model)
 
+    # ②' 识图 API（可选，用户填了才动）
+    #
+    # 为什么要写成**另一个** provider，而不是替换主 provider：
+    # AstrBot 的选法是（astr_main_agent.py:_select_image_chat_provider）——
+    #   主 provider 的 modalities 里有 "image" 就用它；
+    #   没有的话，去 fallback 列表里找第一个支持 image 的；
+    #   都找不到就打日志 "no image-capable fallback provider is available"
+    #   然后**照旧用主 provider**（图被丢掉，模型只能瞎猜）。
+    # 我们之前在所有实例上都看到过这条日志 —— 那正是「发图给机器人，
+    # 它答得驴唇不对马嘴」的原因。
+    #
+    # 所以正确做法是：主 provider 保持纯文本，另加一个带 image 的
+    # provider 排在后面当 fallback。这样文本走便宜的模型、图片才走视觉模型，
+    # 和生产机的配置思路一致。
+    if vision_any:
+        vsrc_id = "dafeiyu-vision_source"
+        vpid = "dafeiyu-vision"
+        vsrc = {
+            "id": vsrc_id,
+            "provider": "openai",
+            "type": "openai_chat_completion",
+            "provider_type": "chat_completion",
+            "key": [vision_key],
+            "api_base": vision_base,
+            "timeout": 120,
+            "proxy": "",
+            "custom_headers": {},
+            "enable": True,
+        }
+        vprov = {
+            "id": vpid,
+            "provider_source_id": vsrc_id,
+            "enable": True,
+            "model": vision_model,
+            # ★ 关键：必须声明 image，AstrBot 就是靠这个字段决定回退的
+            "modalities": ["text", "image"],
+            "custom_extra_body": {},
+        }
+        cfg["provider_sources"] = [s for s in (cfg.get("provider_sources") or [])
+                                   if s.get("id") != vsrc_id] + [vsrc]
+        # 排在主 provider **后面**（它是 fallback，不是主选）
+        cfg["provider"] = [p for p in (cfg.get("provider") or [])
+                           if p.get("id") != vpid] + [vprov]
+        # 图片描述也指过去 —— 有些流程（引用图片、图片转述）走的是这个键，
+        # 不指的话它还是空的，那条路径照样识别不了图。
+        cfg.setdefault("provider_settings", {})[
+            "default_image_caption_provider_id"] = vpid
+        changed.append("识图 API（%s）" % vision_model)
+
     # ③ 人格提示词
     #
     # 这里**不写 cmd_config.json**。AstrBot 源码里那个 persona 字段标着
@@ -1404,6 +1488,24 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         if not provs2 or provs2[0].get("id") != "dafeiyu-main":
             raise ManagerError("配置没保住：重启后主聊天 API 丢了。"
                                "请等实例完全起来再改。")
+    if vision_any:
+        # 识图 provider 要确认三件事，少一件机器人就还是「看不见图」：
+        #   ① provider 还在；
+        #   ② modalities 里真的有 image（AstrBot 靠它决定要不要回退）；
+        #   ③ 它排在主 provider **后面**（排前面会变成主聊天模型，
+        #      那样文本也走视觉模型，又慢又贵）。
+        vp = [p for p in (back2.get("provider") or [])
+              if p.get("id") == "dafeiyu-vision"]
+        if not vp:
+            raise ManagerError("配置没保住：重启后识图 API 丢了。"
+                               "请等实例完全起来再改。")
+        if "image" not in (vp[0].get("modalities") or []):
+            raise ManagerError("配置没保住：识图 API 少了 image 标记，"
+                               "机器人还是看不到图。请重新保存一次。")
+        ids2 = [p.get("id") for p in (back2.get("provider") or [])]
+        if ids2 and ids2[0] != "dafeiyu-main":
+            raise ManagerError("识图 API 抢到主聊天的位置了（排到了第一个），"
+                               "这样文字也会走识图模型。请重新保存一次。")
     if has_persona:
         got_pid = (((back2.get("agent_runner") or {}).get("config") or {})
                    .get("persona") or {}).get("persona_id") or ""
@@ -1473,6 +1575,15 @@ def read_config(name):
     for p in (cfg.get("provider") or []):
         if p.get("id") == "dafeiyu-main":
             model = p.get("model") or ""
+    # 识图 provider（可能没配）
+    vmodel = ""
+    for p in (cfg.get("provider") or []):
+        if p.get("id") == "dafeiyu-vision":
+            vmodel = p.get("model") or ""
+    vsrc = {}
+    for s in (cfg.get("provider_sources") or []):
+        if s.get("id") == "dafeiyu-vision_source":
+            vsrc = s
     # 人格要从数据库读（cmd_config.json 里的 persona 字段是废弃的，永远是空）
     persona = ""
     # 人格 id 的取法也随版本变：
@@ -1512,6 +1623,10 @@ def read_config(name):
         # Key 不回显：只告诉 App「有没有配」，避免密钥在网络上往返
         "api_key_set": bool(src.get("key")),
         "api_model": model,
+        # 识图 API（没配就是空串）。Key 同样不回显。
+        "vision_base": vsrc.get("api_base") or "",
+        "vision_key_set": bool(vsrc.get("key")),
+        "vision_model": vmodel,
         "persona": persona,
         # provider_ok：第一个 provider 就是主聊天 API 才算配好。
         # 不能看 default_provider_id —— 4.28+ 会删掉那个键。
@@ -1542,11 +1657,23 @@ API_PROBE_TIMEOUT = 12
 MAX_API_BODY = 8 * 1024 * 1024
 
 
-def _main_api_of(name):
-    """从实例配置里读回主 API 的三要素：接口地址 / Key / 模型名。"""
+def _main_api_of(name, strict=False):
+    """从实例配置里读回主 API 的三要素：接口地址 / Key / 模型名。
+
+    strict=False（默认）时，配置还没生成就返回空串 —— 不抛异常。
+    ★ 这是踩出来的：调用方（测接口）经常是**用户还没点启动、但已经在
+      输入框里填好了地址和 Key**，这时它想测的是「我填的这套行不行」，
+      跟实例有没有启动毫无关系。原来这里直接抛「先点启动」，
+      把「测一下我填的对不对」这个正当需求挡死了 ——
+      用户被迫先启动（要等拉镜像、一两分钟）才能验证自己填得对不对，
+      而如果填错了，这一两分钟纯属白等。
+    strict=True 保留给「确实必须有已保存配置」的场景。
+    """
     path = astrbot_cfg_path(name)
     if not os.path.exists(path):
-        raise ManagerError("这个机器人还没启动过，先点「启动」再测接口。")
+        if strict:
+            raise ManagerError("这个机器人还没启动过，先点「启动」再测接口。")
+        return "", "", ""
     cfg = read_json_maybe_bom(path)
     base, key = "", ""
     for s in (cfg.get("provider_sources") or []):
@@ -1692,7 +1819,6 @@ def list_api_models(name, base="", key=""):
         raise ManagerError("还没填接口地址。")
     if not use_key:
         raise ManagerError("还没填 API Key。")
-
     url = _join_api(use_base, "/models")
     try:
         code, body = _api_request(url, use_key)
@@ -1879,6 +2005,276 @@ def probe_api(name, base="", key="", model=""):
                           "从下面挑一个正确的（这是最常见的错误）。" % use_model)
     else:
         out["message"] = why
+    return out
+
+
+def _make_test_png(rgb, size=64):
+    """生成一张纯色 PNG（纯 Python，不依赖 PIL）。
+
+    为什么要自己造图：验证「这个 API 到底能不能看图」，唯一的办法是
+    **给它一张图，看它能不能说出图里是什么**。用固定图片的话，
+    模型可能靠「背答案」蒙对；用纯色+随机颜色，就必须真的看。
+
+    size 默认 64：够模型识别，base64 后只有几百字节，几乎不花 token。
+    """
+    w = h = size
+    r, g, b = rgb
+    raw = b"".join(b"\x00" + bytes([r, g, b]) * w for _ in range(h))
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8bit truecolor
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+# 测试用的颜色。挑「差别极大、模型不可能混淆」的四种。
+#
+# 为什么用颜色而不是文字（OCR）：OCR 要求模型有文字识别能力，
+# 有些能看图的模型（尤其是小模型）认字很弱，会被误判成「不能看图」。
+# 颜色是最基础的视觉能力，能看图就一定能分辨。
+#
+# ★ 每个颜色带一串**同义词**。这是踩出来的：
+#   原来只认「黄」，实测 deepseek-flash 看 (230,210,20) 答的是「金色」——
+#   它明明看见了，却因为用词不同被判成「没看图」（假阴性）。
+#   假阴性的危害和假阳性一样大：用户会去换一个本来没问题的 API。
+#   所以宁可放宽：只要答出的词落在这个颜色的同义词里就算对。
+#
+#   另外把颜色改成**纯正的高饱和色**（255 而非 220/230），
+#   减少「金黄」「深红」这类边界描述。
+_VISION_COLORS = [
+    ((255, 0, 0), ("红", ("红", "red", "大红", "鲜红", "正红", "朱红"))),
+    ((0, 200, 0), ("绿", ("绿", "green", "翠绿", "草绿", "深绿", "青绿"))),
+    ((0, 0, 255), ("蓝", ("蓝", "blue", "深蓝", "天蓝", "宝蓝", "湛蓝"))),
+    ((255, 255, 0), ("黄", ("黄", "yellow", "金黄", "金色", "亮黄", "正黄"))),
+]
+
+# 「我看不到图」这类回答的特征词。模型不能看图时通常会这么说。
+_VISION_REFUSAL_WORDS = (
+    "无法查看", "看不到", "不能查看", "无法查看图片", "无法看到", "没有看到",
+    "cannot see", "can't see", "unable to view", "cannot view", "no image",
+    "don't see", "do not see", "无法识别图片", "不能识别图片", "我没有收到图",
+    "没有图片", "无法处理图片", "不支持图片", "不支持图像",
+)
+
+
+def probe_vision(name, base="", key="", model="", saved=None):
+    """测「多模态（识图）API」能不能真的看图。返回给人看的结论。
+
+    比测聊天 API 多一层，而且这层才是关键：
+      reachable       : 服务器能不能连上这个地址
+      auth_ok         : Key 对不对
+      vision_capable  : **它到底能不能看图** ← 用户真正要的答案
+
+    ★ 为什么必须实测、不能靠「模型名看着像」或「/models 里有它」：
+      很多 OpenAI 兼容网关会把不识图的模型也列出来，甚至**默默接受**
+      带图片的请求、然后完全忽略图片只回文字。用户以为自己配好了识图，
+      实际上机器人一直在瞎猜 —— 这正是要防的呆。
+      唯一可靠的办法：给一张**随机颜色的纯色图**，问它什么颜色。
+      真能看图的必然答对；假装能看的会答错或说看不到。
+    """
+    saved = saved or {}
+    use_base = (base or "").strip() or saved.get("api_base", "")
+    use_key = (key or "").strip() or saved.get("api_key", "")
+    use_model = (model or "").strip() or saved.get("api_model", "")
+
+    out = {
+        "reachable": False,
+        "auth_ok": False,
+        "vision_capable": None,   # None = 没能测出来
+        "models": [],
+        "model_count": 0,
+        "message": "",
+        "api_base": use_base,
+        "tested_color": "",
+        "answered": "",
+    }
+
+    if not use_base:
+        out["message"] = "还没填接口地址。"
+        return out
+    if not use_key:
+        out["message"] = "还没填 API Key。"
+        return out
+    if not use_model:
+        out["message"] = "还没填模型名。识图模型的名字通常带 vision 字样，请照官网文档填。"
+        return out
+
+    # ① 模型列表：只用来判断「地址通不通」和给用户挑名字，不当作能力证明。
+    try:
+        out["models"] = list_api_models(name, use_base, use_key)
+        out["reachable"] = True
+        out["model_count"] = len(out["models"])
+    except ManagerError as e:
+        msg = str(e)
+        out["reachable"] = ("能连上" in msg)
+        if not out["reachable"]:
+            out["message"] = msg
+            return out
+        if "API Key 不对" in msg:
+            out["message"] = msg
+            return out
+    except Exception as e:  # noqa: BLE001
+        out["message"] = _api_error_hint(e, use_base)
+        return out
+
+    # ② 真正的能力测试：随机挑个颜色，造图，问它。
+    rgb, names = secrets.choice(_VISION_COLORS)
+    out["tested_color"] = names[0]  # names = (中文名, 同义词元组)
+    png_b64 = base64.b64encode(_make_test_png(rgb)).decode("ascii")
+
+    payload = {
+        "model": use_model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text",
+                 "text": "这张图是什么颜色？只回答颜色名称，不要别的字。"},
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64," + png_b64}},
+            ],
+        }],
+        # ★ max_tokens 必须给足，否则会把「能识图的模型」误判成「没法判断」。
+        #
+        #   踩过的坑：一开始用 20，结果**每次**都拿到空回复，于是明明能看图的
+        #   模型被判成「测不出来」。原因是现在很多模型（deepseek-flash、
+        #   v4-pro 等都是）属于**推理模型**：先写一段 reasoning_content，
+        #   再写 content。token 预算被「思考」吃光时，正文一个字都没轮到，
+        #   返回 finish_reason=length、content 为空。
+        #
+        #   实测同一个模型同一张图（每档 8 次）：
+        #       max_tokens=300  → 空 6/8   （思考长度 129~530 token，波动很大）
+        #       max_tokens=600  → 空 2/8
+        #       max_tokens=1000 → 空 0/8   ← 采用
+        #   1000 看着大，实际用掉最多 532 token，一次测试成本可以忽略。
+        #   这里**宁可给多**：给少了会误判，而误判的代价是用户去换一个
+        #   本来没问题的 API，白折腾。
+        "max_tokens": 1000,
+        "stream": False,
+    }
+
+    try:
+        code, body = _api_request(_join_api(use_base, "/chat/completions"),
+                                  use_key, payload)
+    except Exception as e:  # noqa: BLE001
+        out["message"] = _api_error_hint(e, use_base)
+        return out
+
+    if code in (401, 403):
+        out["message"] = ("Key 不对（对方返回 %d）。检查有没有复制全、"
+                          "有没有多余空格。" % code)
+        return out
+    if code == 404:
+        # 404 有两种可能：地址不对，或**模型名不对** —— 看对方怎么说。
+        # 不能一律报「地址不完整」：有些网关对不存在的模型回 404，
+        # 那样用户会去改一个本来正确的地址，永远改不好。
+        # （这个判断在 _chat_probe 里是对的，这里原来漏了。）
+        low = body.lower()
+        if "model" in low:
+            out["auth_ok"] = True
+            out["message"] = ("接口地址是对的，但对方不认识「%s」这个模型名。"
+                              "点「获取可用模型」从列表里挑一个。" % use_model)
+            return out
+        out["message"] = ("这个地址没有聊天接口（404）—— 地址多半写得不完整，"
+                          "检查结尾是不是少了 /v1。")
+        return out
+    if code == 402:
+        out["message"] = "账户余额不足或未开通（402）—— 去官网充值/开通后再试。"
+        return out
+    if code == 429:
+        out["message"] = "被限流了（429）。稍等再试，或检查额度是否用完。"
+        return out
+    if code >= 500:
+        out["message"] = "对方服务器出错（%d），不是你的配置问题，稍后再试。" % code
+        return out
+
+    if code != 200:
+        low = body.lower()
+        # 400 且提到图片 → 这就是「这个模型/接口不接受图片」的铁证。
+        # 这是最常见的失败，且信息量最大：用户换一个识图模型就好。
+        if code == 400 and ("image" in low or "图片" in body or "content" in low):
+            out["auth_ok"] = True
+            out["vision_capable"] = False
+            out["message"] = ("接口和 Key 都对，但**它不接受图片** —— "
+                              "这个模型不是识图模型。请换成带 vision 字样的模型。")
+            return out
+        if "model" in low:
+            out["auth_ok"] = True
+            out["message"] = ("接口地址是对的，但对方不认识「%s」这个模型名。"
+                              "点「获取可用模型」从列表里挑一个。" % use_model)
+            return out
+        out["message"] = "对方返回 %d：%s" % (code, body[:200])
+        return out
+
+    # 200：解析它到底说了什么颜色。
+    #
+    # ★ 空回复要**重试**，不能直接下结论。
+    #   实测（deepseek-flash + 纯色图）：即使 max_tokens=300，
+    #   仍有大约 1/3 的次数返回空 content —— 推理模型偶尔会把预算
+    #   全花在思考上。如果不重试，用户点一次「测试」可能被告知
+    #   「没法判断」，再点一次又是好的，体验很糟，还会让他误以为
+    #   自己的 API 有问题。
+    content = ""
+    for attempt in range(3):
+        try:
+            data = json.loads(body)
+            ch = (data.get("choices") or [{}])[0]
+            msg = ch.get("message") or {}
+            content = msg.get("content") or ""
+            finish = ch.get("finish_reason")
+        except (ValueError, AttributeError, IndexError):
+            content, finish = "", None
+        if isinstance(content, list):
+            # 有些网关把 content 也做成数组
+            content = " ".join(str(c.get("text", "")) if isinstance(c, dict)
+                               else str(c) for c in content)
+        content = str(content).strip()
+        if content:
+            break
+        # 空了才重试；最后一次不再试
+        if attempt < 2:
+            try:
+                code2, body2 = _api_request(
+                    _join_api(use_base, "/chat/completions"), use_key, payload)
+                if code2 == 200:
+                    body = body2
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            break
+
+    out["answered"] = content[:80]
+    out["auth_ok"] = True
+
+    low = out["answered"].lower()
+    if any(w in out["answered"] or w in low for w in _VISION_REFUSAL_WORDS):
+        out["vision_capable"] = False
+        out["message"] = ("接口和 Key 都对，但这个模型说它看不到图片 —— "
+                          "它没有识图能力。请换成带 vision 字样的模型。")
+        return out
+
+    # 答对了：只要答案里出现这个颜色的**任一**同义词就算对。
+    # 不能只认一个词 —— 模型可能说「金色」而不是「黄」，那也是在看图。
+    if any(syn in out["answered"] or syn.lower() in low for syn in names[1]):
+        out["vision_capable"] = True
+        out["message"] = ("通了 ✓ 而且**它真的能看图**（测试图是%s色，它答对了）。"
+                          "这个机器人可以用它识图。" % names[0])
+        return out
+
+    # 答了，但答错 —— 这是最阴险的一种：看起来能用，实际在瞎猜。
+    if out["answered"]:
+        out["vision_capable"] = False
+        out["message"] = ("接口和 Key 都对，但它把%s色的图答成了「%s」—— "
+                          "说明它并没有真的看图（可能只是忽略图片后瞎猜）。"
+                          "请换一个真正支持识图的模型。"
+                          % (names[0], out["answered"]))
+        return out
+
+    out["vision_capable"] = None
+    out["message"] = ("接口和 Key 都对，但它返回了空内容，没法判断能不能识图。"
+                      "请再测一次；如果一直这样，换一个模型。")
     return out
 
 
@@ -2271,7 +2667,16 @@ def make_server(port, token):
                     body["name"], body.get("groups", ""), body.get("friends", ""),
                     body.get("api_base", ""), body.get("api_key", ""),
                     body.get("api_model", ""), body.get("persona", ""),
-                    body.get("lock_password", "")))
+                    body.get("lock_password", ""),
+                    # 识图 API：不填就完全不动多模态配置（老用户升级不受影响）
+                    body.get("vision_base", ""), body.get("vision_key", ""),
+                    body.get("vision_model", "")))
+            elif path == "/instance/vision/test":
+                # 测识图 API 能不能**真的看图**（不只是「能不能连上」）。
+                # 不传 base/key/model 就用实例里已保存的。
+                self._handle(lambda: probe_vision(
+                    body["name"], body.get("api_base", ""),
+                    body.get("api_key", ""), body.get("api_model", "")))
             elif path == "/instance/lock":
                 # 设为私密 / 取消私密 / 改密码
                 self._handle(lambda: {"lock": lock_state(set_instance_lock(

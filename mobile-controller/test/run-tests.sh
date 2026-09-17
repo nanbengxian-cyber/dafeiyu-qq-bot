@@ -89,6 +89,22 @@ if ! python3 test/test-pairing.py; then
   exit 1
 fi
 
+# 识图 API 的**能力**探测。「能连上」不等于「能看图」——
+# 很多网关会接受带图片的请求然后完全忽略图片、瞎猜一个答案。
+# 这组测试用假服务器模拟「假装能看」的模型，证明探测不会被骗过去。
+if ! python3 test/test-vision-probe.py; then
+  echo "识图能力探测检查未通过：会把「假装能看图」的模型判成好的。" >&2
+  exit 1
+fi
+
+# 识图 API 的写入。重点是「不填就不动」「只填一半要报错」
+# 「不能抢主聊天的位置」——这几条错了，用户会配出一个看起来成功、
+# 实际文字也走视觉模型（又慢又贵）或图片根本识别不了的机器人。
+if ! python3 test/test-vision-write.py; then
+  echo "识图 API 写入检查未通过。" >&2
+  exit 1
+fi
+
 # 锁着的实例：必须给 pairing（否则私密机器人坏了修不了），
 # 但绝不能借这个字段泄露 token / API key / 白名单。
 if ! python3 test/test-locked-pairing.py; then

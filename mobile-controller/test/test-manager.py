@@ -240,7 +240,12 @@ def test_apply_config_writes_and_verifies():
                            "https://api.example.com/v1", "sk-test-key", "test-model",
                            "你是一只测试用的鱼。")
         ok(r.get("verified") is True, "返回 verified=true")
-        eq(len(r.get("changed", [])), 3, "三块都改了（范围/API/人格）")
+        # 4 块：消息通道 + 范围 + API + 人格。
+        # 「消息通道」是后加的（NapCat 和 AstrBot 的配对，见 ensure_pairing）——
+        # 没有它，其余三块配得再对，机器人也一个字都不回。
+        eq(len(r.get("changed", [])), 4, "四块都改了（通道/范围/API/人格）")
+        ok(any("消息通道" in c for c in r.get("changed", [])),
+           "★ changed 里明确提到「消息通道」（用户才知道这是修了不回话）")
 
         back = m.read_json_maybe_bom(os.path.join(d, "cmd_config.json"))
         wl = back["platform_settings"]["id_whitelist"]
