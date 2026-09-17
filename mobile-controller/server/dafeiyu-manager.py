@@ -28,6 +28,7 @@ dafeiyu-manager —— 手机 App 的服务器端管理服务。
 
 import argparse
 import base64
+import calendar
 import gzip
 import hashlib
 import json
@@ -37,6 +38,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -62,6 +64,30 @@ ASTRBOT_IMAGE = os.environ.get("DAFEIYU_ASTRBOT_IMAGE", "soulter/astrbot:latest"
 PORT_BASE = 16000
 PORTS_PER_INSTANCE = 3
 MAX_INSTANCES = 20
+
+# ---------------------------------------------------------------------------
+# 额度限制（2026-09-18 用户要求）
+# ---------------------------------------------------------------------------
+#
+# 用户原话：「增加额度限制限制现在目前只能注册15个机器人，机器人只要超过5天
+# 不说话就会自动删除」。
+#
+# 为什么要有这两个限制：服务器是同一台，每个机器人两个容器（napcat+astrbot）
+# 各吃 200MB 上下。不设上限的话，用户随手建几十个，全机内存和 QQ 风控都会出问题
+# —— 而且出问题时是**所有人一起受影响**，不是那个乱建的人自己。
+#
+# 为什么是「15」而不是 MAX_INSTANCES(20)：20 是端口表能排下的物理上限
+# （PORT_BASE + 20*3 个端口），是**技术**上限；15 是给用户用的**额度**。
+# 留 5 个余量是为了：用户删掉旧的想新建时，不会因为端口表碎片而建不出来。
+MAX_ROBOTS_PER_USER = 15
+
+# 多少天没动静就自动清理。
+#
+# ★ 判据用「最后一次活动时间」，而不是「创建时间」—— 用户要的是
+#   「不说话就删」，一个天天在用的机器人不该因为建得早就被删掉。
+#   活动时间由 touch_activity() 刷新，在聊天/改配置/重启时都会更新。
+IDLE_DAYS = 5
+IDLE_SECONDS = IDLE_DAYS * 24 * 3600
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 
@@ -255,6 +281,10 @@ def instance_detail(name, password=""):
             "locked": False,
             "containers": container_state(name),
             "config": read_config(name),
+            # 「消息通道」状态。App 拿它给用户一句人话：
+            # 没配对就等于「机器人收不到消息」，而用户在界面上完全看不出来 ——
+            # 他会以为是自己 API 填错了，反复改配置也没用。
+            "pairing": pairing_state(name),
             "webui_token": webui_token(name)}
 
 
@@ -353,6 +383,13 @@ def render_compose(name, meta):
       * 每实例独立 bridge 网络，避免跨实例串门。
       * napcat 固定 MAC：QQ 把 MAC 算进设备指纹，随机 MAC 会让每次登录
         都被当成新设备（生产机上踩过这个坑，这里一开始就固定）。
+      * **/app/.config/QQ 必须单独再挂一次**：napcat 镜像自带
+        `VOLUME /app/.config/QQ`，Docker 会给它建一个**匿名卷**并盖在
+        bind mount 之上 —— 只挂 /app/.config 是不够的，QQ 会话实际写进了
+        匿名卷，宿主机目录永远是空的。后果：`docker compose down/up`
+        （或任何容器重建）会配一个新匿名卷，登录态随之丢失，
+        用户每次都得重新扫码。显式把该子目录也 bind 上去才能压住它。
+        这个坑 2026-09-17 在全部 11 个实例上实测复现（宿主机 QQ 文件数=0）。
     """
     mac = meta.get("mac") or ""
     return """services:
@@ -371,6 +408,7 @@ def render_compose(name, meta):
       - ./napcat/config:/app/config
       - ./napcat/persist/qqconfig/.config:/app/.config
       - ./napcat/persist/napcatcfg/config:/app/napcat/config
+      - ./napcat/persist/qqconfig/.config/QQ:/app/.config/QQ
     environment:
       - NAPCAT_UID=1000
       - NAPCAT_GID=1000
@@ -409,6 +447,19 @@ def gen_mac():
 def create_instance(name):
     if os.path.exists(instance_dir(name)):
         raise ManagerError("实例 %s 已经存在了。" % name)
+
+    # 额度闸门：最多 MAX_ROBOTS_PER_USER 个。
+    #
+    # 错误信息要**说清楚现在有几个、上限几个、怎么办** —— 用户看到
+    # 「已达上限」但不知道怎么解决的话，只会反复点「新建」然后以为坏了。
+    existing = [m.get("name") for m in all_instances() if m.get("name")]
+    if len(existing) >= MAX_ROBOTS_PER_USER:
+        raise ManagerError(
+            "机器人数量已达上限：最多只能有 %d 个，你现在已经有 %d 个了。"
+            "请先删掉不用的机器人再新建。"
+            "（提示：超过 %d 天没说过话的机器人会被自动清理。）"
+            % (MAX_ROBOTS_PER_USER, len(existing), IDLE_DAYS))
+
     webui, onebot, panel = alloc_ports()
     for p in (webui, onebot, panel):
         if not port_free(p):
@@ -431,6 +482,14 @@ def create_instance(name):
     with open(os.path.join(d, "docker-compose.yml"), "w", encoding="utf-8") as fh:
         fh.write(render_compose(name, meta))
     os.chmod(os.path.join(d, "docker-compose.yml"), 0o600)
+
+    # ★ 建实例就把 NapCat 的 OneBot 模板放好。
+    #
+    # 必须在**首次扫码登录之前**写好：NapCat 登录时才读这个模板并落盘成
+    # onebot11_<uin>.json（见 ensure_pairing 的说明）。等登录完再补，
+    # 那条连接不会生效，用户会以为「登录了却不回话」。
+    ensure_pairing(name, meta)
+
     return meta
 
 
@@ -443,9 +502,29 @@ def destroy_instance(name):
 
 def start_instance(name):
     meta = load_meta(name)
+    # 启动前先配对：NapCat 的 OneBot 模板必须在它启动**之前**放好
+    # （它登录时才读模板，见 ensure_pairing 的说明）。
+    ensure_pairing(name, meta)
     compose(name, "up", "-d")
     meta["status"] = "running"
     save_meta(name, meta)
+    # ★ 起来之后再配对一次。
+    #
+    # 为什么要两次：**首次**启动这个实例时，cmd_config.json 还不存在
+    # （那是 AstrBot 第一次跑起来自己生成的），所以上面那次写不进 astrbot 侧。
+    # 实测过：新建实例 → start → astrbot 侧仍是未配对。再调一次就好了。
+    #
+    # 先等 cmd_config.json 出现再写：AstrBot 启动早期就会写这个文件，
+    # 而它**退出/启动时会把内存里的配置回写**，写太早会被它覆盖掉。
+    # 等待是有上限的（need_cfg 用的就是 READY_TIMEOUT），
+    # 拿不到就照样往下走 —— 宁可这次没配上，也不能让「启动」这个操作卡住；
+    # apply_config 和 App 自检都还会再补一次。
+    try:
+        wait_astrbot_ready(name, need_cfg=True)
+    except ManagerError:
+        pass
+    ensure_pairing(name, meta)
+    touch_activity(name)
     return meta
 
 
@@ -492,6 +571,393 @@ def write_json_bom(path, data):
         fh.write(text)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# OneBot 配对：让 NapCat 和 AstrBot 真正连上
+# ---------------------------------------------------------------------------
+#
+# ★★ 这是「机器人一个字都不回」的根因修复。★★
+#
+# 现象：用户装好 App、扫码登录成功、三配置也填了，机器人却完全不回话。
+#
+# 根因（2026-09-17 在服务器上逐个实例实测确认）：**两端都不知道对方存在**。
+#   * AstrBot 侧 platform 列表是空的 → 它从来不开反向 WebSocket 端口，
+#     等于没有任何消息通道。翻遍每个实例的历史备份，platform 全是 []。
+#   * NapCat 侧 websocketClients 是空的 → 它从不主动连出去。
+#   电话线两端都没插上：QQ 消息到了 NapCat 就断了，AstrBot 日志里
+#   连一条「收到消息」都没有 —— 所以用户看到的只是「不回话」，
+#   没有任何报错可循。
+#
+# 生产机能正常聊天，正是因为那两处都配了：
+#   * astrbot platform = [{type: aiocqhttp, ws_reverse_port: 6199,
+#                          ws_reverse_token: <32 位 hex>}]
+#   * napcat  websocketClients = [{url: "ws://astrbot:6199/ws",
+#                                  token: <同一个 32 位 hex>}]
+#   两端 token 必须**完全一致**，否则 AstrBot 会拒绝连接。
+#
+# ── 为什么写的是 onebot11.json（不带 QQ 号）而不是 onebot11_<uin>.json ──
+# NapCat 的 ConfigLoader.read()（napcat.mjs:38576）逻辑是：
+#     优先读 onebot11_${uin}.json；不存在 → 读 onebot11.json 当模板，
+#     紧接着 save() 写成 onebot11_${uin}.json。
+# 而 uin 要**登录成功之后**才知道 —— 所以只能在首次登录前把模板放好，
+# 让它登录时自动继承。等登录完再补写，那条连接不会生效。
+#
+# ── 为什么端口固定 6199、多实例也不冲突 ──
+# 每个实例都是**独立的 bridge 网络**（见 render_compose），容器之间按
+# 服务名互通，所以每个实例里的 "astrbot:6199" 都是自己那一对，
+# 不存在端口抢占，也不需要按实例分配端口。
+OB11_WS_PORT = 6199
+OB11_WS_PATH = "/ws"
+OB11_CLIENT_NAME = "astrbot"
+
+# NapCat 自己配置里那些与 OneBot 无关、但缺了会被 schema 校验打回的键。
+# 照抄 NapCat 首次启动生成的文件，避免它报 "读取配置文件时发生错误"。
+_OB11_EXTRA = {
+    "musicSignUrl": "",
+    "enableLocalFile2Url": False,
+    "parseMultMsg": False,
+    "imageDownloadProxy": "",
+    "timeout": {"baseTimeout": 10000, "uploadSpeedKBps": 256,
+                "downloadSpeedKBps": 256, "maxTimeout": 1800000},
+}
+
+
+def napcat_cfg_dir(name):
+    """NapCat 真正读配置的目录（compose 里挂到 /app/napcat/config）。"""
+    return os.path.join(instance_dir(name), "napcat", "persist",
+                        "napcatcfg", "config")
+
+
+def _ob11_network(token):
+    """NapCat 的 network 段：让 napcat 主动连到本实例的 astrbot。"""
+    return {
+        "httpServers": [],
+        "httpSseServers": [],
+        "httpClients": [],
+        "websocketServers": [],
+        "websocketClients": [{
+            "name": OB11_CLIENT_NAME,
+            "enable": True,
+            "url": "ws://astrbot:%d%s" % (OB11_WS_PORT, OB11_WS_PATH),
+            "messagePostFormat": "array",
+            "reportSelfMessage": False,
+            "token": token,
+        }],
+        "plugins": [],
+    }
+
+
+def _write_json_plain(path, data):
+    """NapCat 的配置是**无 BOM** 的 UTF-8（和 AstrBot 正好相反）。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+    # NapCat 在容器里以 uid 1000 跑，文件得让它写得动
+    try:
+        os.chown(path, 1000, 1000)
+    except OSError:
+        pass
+
+
+def _patch_napcat_onebot(path, token):
+    """把 websocketClients 合并进一个 onebot11 配置文件（保留其它键）。"""
+    cur = {}
+    if os.path.exists(path):
+        try:
+            cur = read_json_maybe_bom(path) or {}
+        except (ValueError, OSError):
+            cur = {}
+    for k, v in _OB11_EXTRA.items():
+        cur.setdefault(k, v)
+    cur["network"] = _ob11_network(token)
+    _write_json_plain(path, cur)
+
+
+def ensure_pairing(name, meta=None):
+    """让这个实例的 NapCat 和 AstrBot 配对连上。**幂等**，可反复调用。
+
+    返回 {"token": ..., "napcat": [...改动文件...], "astrbot": bool}。
+
+    调用时机（三个都要，缺一个就有用户会踩坑）：
+      * create_instance —— 放好 NapCat 模板，保证「首次扫码登录」就能连上；
+      * start_instance  —— AstrBot 第一次启动后会生成 cmd_config.json，
+                           这时才能写 platform；
+      * apply_config    —— 已经等到了「AstrBot 完全就绪」，是最可靠的时机，
+                           顺便给存量实例补配（老实例全都没有这两处配置）。
+    """
+    meta = meta or load_meta(name)
+    token = (meta.get("ob11_token") or "").strip()
+    if not re.match(r"^[0-9a-f]{32}$", token):
+        token = secrets.token_hex(16)
+        meta["ob11_token"] = token
+        save_meta(name, meta)
+
+    touched = []
+
+    # ① NapCat 侧：模板 + 已经登录过的那份（有就一起更新）
+    d = napcat_cfg_dir(name)
+    if os.path.isdir(d):
+        _patch_napcat_onebot(os.path.join(d, "onebot11.json"), token)
+        touched.append("onebot11.json")
+        for fn in sorted(os.listdir(d)):
+            if re.match(r"^onebot11_[0-9]+\.json$", fn):
+                _patch_napcat_onebot(os.path.join(d, fn), token)
+                touched.append(fn)
+
+    # ② AstrBot 侧：platform 里加一条 aiocqhttp（反向 WS 服务端）
+    ok_astrbot = False
+    path = astrbot_cfg_path(name)
+    if os.path.exists(path):
+        try:
+            cfg = read_json_maybe_bom(path)
+        except (ValueError, OSError):
+            cfg = None
+        if isinstance(cfg, dict):
+            want = {
+                "id": "default",
+                "type": "aiocqhttp",
+                "enable": True,
+                "ws_reverse_host": "0.0.0.0",
+                "ws_reverse_port": OB11_WS_PORT,
+                "ws_reverse_token": token,
+            }
+            plats = cfg.get("platform") or []
+            # 保留用户可能自己加过的别的平台，只替换同 id 的那条
+            cfg["platform"] = [want] + [p for p in plats
+                                        if isinstance(p, dict)
+                                        and p.get("id") != "default"]
+            write_json_bom(path, cfg)
+            ok_astrbot = True
+
+    return {"token": token, "napcat": touched, "astrbot": ok_astrbot}
+
+
+def pairing_state(name):
+    """只读检查：两端是否都配好、token 是否一致。给 App 做自检用。"""
+    meta = load_meta(name)
+    token = (meta.get("ob11_token") or "").strip()
+
+    napcat_ok = False
+    napcat_token = ""
+    d = napcat_cfg_dir(name)
+    if os.path.isdir(d):
+        cands = [os.path.join(d, "onebot11.json")]
+        cands += [os.path.join(d, f) for f in sorted(os.listdir(d))
+                  if re.match(r"^onebot11_[0-9]+\.json$", f)]
+        for p in cands:
+            try:
+                cur = read_json_maybe_bom(p)
+            except (ValueError, OSError):
+                continue
+            cl = ((cur.get("network") or {}).get("websocketClients") or [])
+            for c in cl:
+                if c.get("enable") and (c.get("url") or "").endswith(
+                        ":%d%s" % (OB11_WS_PORT, OB11_WS_PATH)):
+                    napcat_ok = True
+                    napcat_token = c.get("token") or ""
+                    break
+            if napcat_ok:
+                break
+
+    astrbot_ok = False
+    astrbot_token = ""
+    path = astrbot_cfg_path(name)
+    if os.path.exists(path):
+        try:
+            cfg = read_json_maybe_bom(path)
+        except (ValueError, OSError):
+            cfg = {}
+        for p in (cfg.get("platform") or []):
+            if isinstance(p, dict) and p.get("type") == "aiocqhttp":
+                astrbot_ok = True
+                astrbot_token = p.get("ws_reverse_token") or ""
+                break
+
+    return {
+        "napcat_configured": napcat_ok,
+        "astrbot_configured": astrbot_ok,
+        "tokens_match": bool(napcat_token) and napcat_token == astrbot_token,
+        "paired": napcat_ok and astrbot_ok and napcat_token == astrbot_token,
+    }
+
+
+def repair_channel(name):
+    """一键修复「消息通道」，然后让两端都重新连上。
+
+    给 App 的「机器人不回话？点这里修」按钮用。用户不需要知道
+    platform / websocketClients / token 这些词 —— 他只要知道
+    「不回话就点一下」。
+
+    做三件事：
+      1. ensure_pairing 把两端配置写对（幂等）；
+      2. 热加载 NapCat（不重启，保住 QQ 登录态）；
+      3. 重启 AstrBot 让它重开反向 WS 端口（它只在启动时开）。
+
+    第 3 步必须重启 astrbot：它是**服务端**，只有启动时才 bind 6199。
+    重启 astrbot 不影响 QQ 登录（登录态在 napcat 那边）。
+    """
+    before = pairing_state(name)
+    ensure_pairing(name)
+    _napcat_hot_reload(name)
+    compose(name, "restart", "astrbot", check=False)
+    wait_astrbot_ready(name, need_cfg=True)
+    after = pairing_state(name)
+    touch_activity(name)
+    return {"before": before, "after": after, "repaired": after["paired"]}
+
+
+def touch_activity(name):
+    """记下这个机器人「最后活动时间」。**不抛异常**。
+
+    什么时候算活动：收到消息、改配置、重启、修通道 —— 任何说明
+    「用户还在用它」的动作。自动清理只看这个时间，所以调用点要盖全，
+    否则一个天天在聊的机器人可能因为「没改过配置」被误删。
+    """
+    try:
+        meta = load_meta(name)
+        meta["last_active_at"] = int(time.time())
+        save_meta(name, meta)
+    except (ManagerError, OSError, ValueError):
+        pass
+
+
+def _last_message_time(name):
+    """从 AstrBot 数据库读「最后一次真的收到消息」的时间戳（epoch 秒）。
+
+    为什么不能只看 last_active_at：那个字段是我们自己写的，老实例没有；
+    而「机器人有没有在说话」这件事，AstrBot 自己的库最准 ——
+    platform_stats 里每一行就是「某小时收到了 N 条消息」。
+
+    读不到（库不存在/没表/权限）就返回 None，由调用方回退到
+    last_active_at / created_at。**绝不能让读库失败变成「判定为空闲」** ——
+    那会把用户的机器人误删。
+    """
+    p = os.path.join(instance_dir(name), "astrbot", "data", "data_v4.db")
+    if not os.path.exists(p):
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p, uri=True, timeout=3)
+        try:
+            row = con.execute("select max(timestamp) from platform_stats"
+                              ).fetchone()
+            if row and row[0]:
+                # 库里的时间戳是 **UTC**（AstrBot 容器里 TZ=UTC，
+                # 实测 platform_stats 的 16:20:02 与容器日志同一时刻，
+                # 而宿主机的 napcat 日志那时是 00:20 —— 差 8 小时）。
+                #
+                # ★ 必须用 calendar.timegm，不能用 time.mktime：
+                #   mktime 把 struct 当**本地时间**解释，于是结果随宿主机时区漂移。
+                #   这里踩过真坑：本地（UTC）测试全过，一上服务器（UTC+8）
+                #   算出来的活动时间就偏了 8 小时。timegm 把它当 UTC，
+                #   与宿主机时区无关，两边结果一致。
+                return calendar.timegm(time.strptime(str(row[0])[:19],
+                                                     "%Y-%m-%d %H:%M:%S"))
+        finally:
+            con.close()
+    except (sqlite3.Error, ValueError, OSError):
+        return None
+    return None
+
+
+def last_active_at(name, meta=None):
+    """这个机器人「最后活动时间」，取三个来源里最新的一个。
+
+    优先级：库里真有消息 > 我们记的 last_active_at > 创建时间。
+    """
+    meta = meta or load_meta(name)
+    cands = []
+    mt = _last_message_time(name)
+    if mt:
+        cands.append(mt)
+    if meta.get("last_active_at"):
+        cands.append(int(meta["last_active_at"]))
+    if meta.get("created_at"):
+        cands.append(int(meta["created_at"]))
+    return max(cands) if cands else 0
+
+
+def idle_info(name, meta=None):
+    """算这个机器人闲了多久，给 App 显示「还有几天被清理」。"""
+    meta = meta or load_meta(name)
+    la = last_active_at(name, meta)
+    idle = int(time.time()) - la if la else 0
+    left = IDLE_SECONDS - idle
+    return {
+        "last_active_at": la,
+        "idle_seconds": idle,
+        "idle_days": round(idle / 86400.0, 1),
+        "days_left": max(0, int(left // 86400)),
+        "will_be_removed": idle >= IDLE_SECONDS,
+    }
+
+
+def quota_info():
+    """额度总览：用了几个、还能建几个、哪些快被清理了。给 App 显示。"""
+    metas = [m for m in all_instances() if m.get("name")]
+    items = []
+    for meta in metas:
+        try:
+            it = idle_info(meta["name"], meta)
+        except (ManagerError, OSError, ValueError):
+            it = {"last_active_at": 0, "idle_days": 0.0, "days_left": IDLE_DAYS,
+                  "will_be_removed": False}
+        it["name"] = meta["name"]
+        it["locked"] = bool(lock_state(meta).get("locked"))
+        items.append(it)
+    # 按「最久没动」排前面，用户一眼看到该删谁
+    items.sort(key=lambda x: -x.get("idle_seconds", 0))
+    return {
+        "limit": MAX_ROBOTS_PER_USER,
+        "used": len(metas),
+        "remaining": max(0, MAX_ROBOTS_PER_USER - len(metas)),
+        "idle_days": IDLE_DAYS,
+        "instances": items,
+    }
+
+
+def cleanup_idle(dry_run=False):
+    """删掉「超过 IDLE_DAYS 天没说过话」的机器人。返回删了哪些。
+
+    为什么要自动删：用户明确要求（「机器人只要超过5天不说话就会自动删除」）。
+    动机是资源 —— 每个实例两个容器，闲着的实例白占内存，还会一直挂着
+    QQ 连接（长期不活动本身也更容易触发风控）。
+
+    ★ 安全设计：**只删能确认「确实闲了很久」的实例**。
+      * 读不到库、meta 里也没有任何时间戳（last_active_at 和 created_at
+        都缺）→ **跳过，不删**。宁可留着一个闲实例，也不能误删在用的。
+      * 锁着的实例不删（用户特意设为私密的，说明在意它）。
+      * dry_run=True 只报告不删，给 App 做预览用。
+    """
+    removed, kept = [], []
+    for meta in all_instances():
+        name = meta.get("name")
+        if not name:
+            continue
+        try:
+            if lock_state(meta).get("locked"):
+                kept.append({"name": name, "reason": "私密实例，不自动清理"})
+                continue
+            la = last_active_at(name, meta)
+            if not la:
+                kept.append({"name": name, "reason": "没有可用的活动时间，保守跳过"})
+                continue
+            idle = int(time.time()) - la
+            if idle >= IDLE_SECONDS:
+                if dry_run:
+                    removed.append({"name": name,
+                                    "idle_days": round(idle / 86400.0, 1)})
+                else:
+                    destroy_instance(name)
+                    removed.append({"name": name,
+                                    "idle_days": round(idle / 86400.0, 1)})
+            else:
+                kept.append({"name": name,
+                             "idle_days": round(idle / 86400.0, 1)})
+        except (ManagerError, OSError, ValueError) as e:
+            kept.append({"name": name, "reason": "检查失败，跳过：%s" % str(e)[:60]})
+    return {"removed": removed, "kept": kept, "dry_run": dry_run}
 
 
 def normalize_ids(raw, label):
@@ -767,11 +1233,25 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
                                "请等半分钟再点「保存」。")
         raise ManagerError("这个机器人的聊天服务还没启动完，稍等半分钟再试。")
 
+    # ⓪ 先补上「消息通道」——没有它下面配什么都没用。
+    #
+    # 用户看到的现象是「机器人一个字都不回」，而根因不在这里配的东西里：
+    # AstrBot 的 platform 是空的，它压根没开消息通道（详见 ensure_pairing）。
+    #
+    # ★ 必须在**读 cfg 之前**写：ensure_pairing 会往文件里加 platform 条目，
+    #   而下面白名单要用 platform[0].id 拼私聊键。顺序反了，内存里的 cfg
+    #   还是旧的（platform 为空），拼出来的私聊键就和生产机不一致 ——
+    #   表现是「群里能回、私聊不回」这种极难查的半坏状态。
+    pair = ensure_pairing(name)
+    channel_added = bool(pair["astrbot"] or pair["napcat"])
+
     cfg = read_json_maybe_bom(path)
     backup = path + ".bak.%d" % int(time.time())
     shutil.copy2(path, backup)
 
     changed = []
+    if channel_added:
+        changed.append("消息通道（让 NapCat 和 AstrBot 连上）")
 
     # ① 聊天范围：白名单
     if gids or fids:
@@ -921,6 +1401,29 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
             raise ManagerError("配置没保住：重启后人格又变回 %r 了。"
                                "请等实例完全起来再改。" % (got_pid,))
 
+    # 消息通道必须也回读确认 —— 它是「机器人回不回话」的总开关，
+    # 前面几项都通过、只有它丢了的话，用户看到的是「提示成功但依然不回话」，
+    # 那是最难自查的一种失败。所以单独验一次。
+    st = pairing_state(name)
+    if not st["paired"]:
+        raise ManagerError(
+            "配置写进去了，但「消息通道」没配对成功"
+            "（NapCat 侧=%s / AstrBot 侧=%s / token 一致=%s）。"
+            "机器人会收不到消息。请把这个机器人停掉再启动一次。"
+            % (st["napcat_configured"], st["astrbot_configured"],
+               st["tokens_match"]))
+
+    # NapCat 那侧的配置需要它自己重读才生效。
+    #
+    # 不重启容器：**重启会让 QQ 掉线**（实测 phoenix 重启 napcat 后
+    # isLogin 变 false，用户得重新扫码）。改用 NapCat 自己的配置接口热加载，
+    # 它内部会走 reloadNetwork() 重建适配器（napcat.mjs:80779）。
+    # 接口失败也不报错 —— 下次容器自然重启时会读到新配置，不该因此让用户
+    # 的保存操作显示失败。
+    if pair["napcat"]:
+        _napcat_hot_reload(name)
+
+    touch_activity(name)
     return {"ok": True, "changed": changed, "verified": True,
             "backup": os.path.basename(backup)}
 
@@ -1473,6 +1976,72 @@ def proxy_webui(name, method, path, headers, body):
         raise ManagerError("连不上这个实例的 WebUI（可能容器还没起来）：%s" % e.reason)
 
 
+def _napcat_api(name, path, payload=None):
+    """调 NapCat 自己的 WebUI API（自动完成登录换 Credential）。
+
+    为什么要自动登录：NapCat 的 API 要 `Authorization: Bearer <Credential>`，
+    而 Credential 是用 WebUI token 算出来的、1 小时就过期。管理服务本来就
+    拿着那个 token（webui_token()），所以每次现换一个最省事，不必缓存。
+
+    返回解析后的 JSON；任何一步失败都抛 ManagerError（调用方决定要不要吞）。
+    """
+    tok = webui_token(name)
+    if not tok:
+        raise ManagerError("拿不到这个实例的 WebUI token（容器可能没起来）。")
+
+    body = json.dumps(payload if payload is not None else {}).encode("utf-8")
+    _, raw, _ = proxy_webui(name, "POST", "/api/auth/login", {},
+                            json.dumps({"hash": _napcat_pw_hash(tok)}
+                                       ).encode("utf-8"))
+    try:
+        cred = (json.loads(raw.decode("utf-8")).get("data") or {}).get("Credential") or ""
+    except (ValueError, AttributeError):
+        cred = ""
+    if not cred:
+        raise ManagerError("登录 NapCat 失败（换 Credential 没成功）。")
+
+    _, raw, _ = proxy_webui(name, "POST", path,
+                            {"Authorization": "Bearer " + cred}, body)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, AttributeError):
+        raise ManagerError("NapCat 返回的不是 JSON：%s" % raw[:120])
+
+
+def _napcat_pw_hash(token):
+    """NapCat WebUI 的登录口令 = sha256(token + ".napcat")。
+
+    照抄生产机能登进去的算法（App 侧 NapCatClient.sha256hex 同款）。
+    """
+    return hashlib.sha256((token + ".napcat").encode("utf-8")).hexdigest()
+
+
+def _napcat_hot_reload(name):
+    """让 NapCat 重读 OneBot 配置，**不重启容器**。
+
+    为什么不用 docker restart：实测重启会让 QQ **掉线**（phoenix 重启后
+    isLogin 从 true 变 false，用户得重新扫码）。而 NapCat 的
+    OB11Config/SetConfig 会走内部 reloadNetwork() 重建适配器
+    （napcat.mjs:80779），不碰 QQ 进程。
+
+    把当前**文件里**的配置原样喂给它（我们刚写完文件），它会热加载。
+    失败一律吞掉：这只是一次加速，配置已经在磁盘上，容器下次自然重启
+    也会读到；不该因为热加载失败就让用户的「保存」显示失败。
+    """
+    try:
+        d = napcat_cfg_dir(name)
+        src = os.path.join(d, "onebot11.json")
+        if not os.path.exists(src):
+            return False
+        cur = read_json_maybe_bom(src)
+        # 接口要的是 JSON5 字符串（实测：直接传对象会回 "config is empty"）
+        payload = {"config": json.dumps(cur, ensure_ascii=False)}
+        res = _napcat_api(name, "/api/OB11Config/SetConfig", payload)
+        return bool(res) and res.get("code") == 0
+    except (ManagerError, OSError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # HTTP 服务（只监听 127.0.0.1）
 # ---------------------------------------------------------------------------
@@ -1623,6 +2192,15 @@ def make_server(port, token):
                     dict(m, containers=container_state(m["name"]),
                          lock=lock_state(m))
                     for m in all_instances()]})
+            elif path == "/quota":
+                # 额度与自动清理说明。**GET**：它是纯查询，不删任何东西。
+                # 放在 /instance/<名字> 之前不重要（前缀不同），
+                # 但必须放在 do_GET 里 —— 一开始误加到了 do_POST，
+                # 结果 App 用 GET 拿就是 404「没有这个接口」。
+                self._handle(quota_info)
+            elif path == "/cleanup/preview":
+                # 预览「哪些会被自动清理」，只读。让用户先看一眼再决定。
+                self._handle(lambda: cleanup_idle(dry_run=True))
             elif path == "/instance/config":
                 # 注意顺序：这条必须排在通用的 /instance/<名字> 之前。
                 # 否则 "config" 会被当成实例名，报「没有这个实例：config」——
@@ -1698,6 +2276,13 @@ def make_server(port, token):
                 self._handle(lambda: probe_api(
                     body["name"], body.get("api_base", ""),
                     body.get("api_key", ""), body.get("api_model", "")))
+            elif path == "/instance/repair-channel":
+                # 「机器人不回话」一键修复。详见 repair_channel 的说明。
+                self._handle(lambda: repair_channel(body["name"]))
+            elif path == "/cleanup/run":
+                # 真删。供 App 的「立即清理」按钮和定时任务用（POST，
+                # 因为它会改状态，不该被浏览器预取/爬虫误触发）。
+                self._handle(lambda: cleanup_idle(dry_run=False))
             else:
                 json_response(self, 404, {"error": "没有这个接口。"})
 

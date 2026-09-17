@@ -74,6 +74,31 @@ bash test/run-shim-test.sh
 # 两者症状一样（用户对着「请输入token」发愣），所以必须分开验证。
 bash test/run-weblogin-test.sh
 
+# 消息通道配对（「机器人一个字都不回」的根因修复）：
+# 光有配置逻辑不够，必须证明「两端 token 一致才算配对成功」——
+# 这条判据错了的话，用户看到的是「保存成功但依然不回话」。
+if ! python3 test/test-pairing.py; then
+  echo "消息通道配对检查未通过：机器人会收不到消息（表现是一个字都不回）。" >&2
+  exit 1
+fi
+
+# 额度与闲置清理。★ 重点是「宁可留着也不误删」的那几条：
+# 读不到活动时间必须跳过，锁着的实例必须跳过。
+if ! python3 test/test-quota.py; then
+  echo "额度/闲置清理检查未通过：可能误删用户的机器人，或额度没生效。" >&2
+  exit 1
+fi
+
+# 时区无关性。踩过的真坑：用 time.mktime 解析 UTC 时间戳，
+# 本地(UTC)测试全过，一上服务器(UTC+8)就偏 8 小时。
+# 这里显式在三个时区各跑一遍，任何时区不一致都会失败。
+for tz in UTC Asia/Shanghai America/New_York; do
+  if ! TZ=$tz python3 test/test-tz.py; then
+    echo "时区无关性检查未通过（TZ=$tz）：闲置时间会算错，可能导致误删或漏删。" >&2
+    exit 1
+  fi
+done
+
 # 产物脱敏自检（有产物才跑 —— 纯测试时 build/ 可能是空的）
 if [ -f build/dafeiyu-controller.apk ]; then
   bash test/check-desensitize.sh || exit 1
