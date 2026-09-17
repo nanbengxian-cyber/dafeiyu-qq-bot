@@ -21,12 +21,32 @@ public final class RoutingTransport implements NapCatClient.Transport {
     /** 当前选中的实例名；空表示没选，走直连。 */
     private static volatile String activeInstance = "";
 
+    /**
+     * 当前实例的解锁口令（私密机器人才有），**只活在内存里**，从不落盘。
+     *
+     * 为什么放在这里：用户是在「机器人」页解锁的，而真正要用到这个口令的是
+     * 「登录 QQ」页（它得拿 WebUI token 才能登 NapCat）。两个页面互不持有对方
+     * 的引用，所以挂在共用的路由状态上。切实例时必须一起清掉，不然会把 A 的
+     * 口令带去 B。
+     */
+    private static volatile String activeUnlockPassword = "";
+
     public static void setActiveInstance(String name) {
+        setActiveInstance(name, "");
+    }
+
+    public static void setActiveInstance(String name, String unlockPassword) {
         activeInstance = name == null ? "" : name;
+        activeUnlockPassword = unlockPassword == null ? "" : unlockPassword;
     }
 
     public static String activeInstance() {
         return activeInstance;
+    }
+
+    /** 当前实例的解锁口令；没解锁过就是空串。 */
+    public static String activeUnlockPassword() {
+        return activeUnlockPassword;
     }
 
     /** 是否处于「经服务器」模式。 */

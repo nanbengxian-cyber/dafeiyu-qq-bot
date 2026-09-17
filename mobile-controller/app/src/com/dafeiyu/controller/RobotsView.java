@@ -342,7 +342,11 @@ public final class RobotsView {
             // 用户不需要知道端口，也不需要填 WebUI 地址。
             btns.addView(smallBtn("登录这个 QQ", new View.OnClickListener() {
                 public void onClick(View v) {
-                    RoutingTransport.setActiveInstance(it.name);
+                    // 私密机器人：把刚才解锁用的口令一并交给登录页，
+                    // 否则它拿不到 WebUI token，会误报「还没跑起来」。
+                    String pw = unlockedPasswords.containsKey(it.name)
+                            ? unlockedPasswords.get(it.name) : "";
+                    RoutingTransport.setActiveInstance(it.name, pw);
                     host.toast("已选中「" + it.name + "」，去「登录 QQ」页扫码");
                     host.gotoLoginTab();
                 }

@@ -297,7 +297,20 @@ public final class ManagerClient {
 
     /** 读实例的 WebUI token（App 拿它去登 NapCat 网页）。 */
     public String webuiToken(String name) throws Deployer.DeployException {
-        Map<String, Object> r = detail(name);
+        return webuiToken(name, "");
+    }
+
+    /**
+     * 带解锁口令的版本。
+     *
+     * 私密机器人锁上之后，服务器对**没有口令**的详情请求只回 lock 状态、
+     * 不回 webui_token（免得口令形同虚设）。所以登录私密机器人时必须把
+     * 用户刚输的密码带上，否则这里会拿到空串，界面报「这个机器人还没跑起来，
+     * 先回机器人页点启动」—— 明明跑着，提示却是错的，很难查。
+     */
+    public String webuiToken(String name, String unlockPassword)
+            throws Deployer.DeployException {
+        Map<String, Object> r = detail(name, unlockPassword);
         return Json.str(r, "webui_token", "");
     }
 

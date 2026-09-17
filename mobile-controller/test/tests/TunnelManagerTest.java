@@ -34,6 +34,7 @@ public final class TunnelManagerTest {
         try {
             clientAgainstFakeServer();
             headerSeparation();
+        lockedInstanceToken();
         } catch (Exception e) {
             T.bad("端到端测试", "崩溃 " + e);
         }
@@ -46,12 +47,16 @@ public final class TunnelManagerTest {
         //   以及 `ssh-keyscan | ssh-keygen -lf -` 给出的官方指纹。
         //   两者必须对得上 —— 如果对不上，App 内置的指纹校验会永远失败，
         //   表现是「连不上服务器」，而报错看着像密钥问题，极难查。
+        // 这是一把**临时生成、与任何服务器无关**的 ECDSA 主机密钥，
+        // 期望值由 ssh-keygen -lf 独立算出。用真机的公钥也能测，
+        // 但那就把「我们连的是哪台机器」写进公开仓库了 —— 公钥不算凭据，
+        // 可能被用来识别服务器，没必要留。
         String realBlob =
-                "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBK+4f2F8" +
-                "5XJDMHGrHN0vPGlfZQK5wrveg0huy0DAzVcSDfr3NkDc9cLVIlVNyNWs8CWh" +
-                "12SbYGgCYFgnCjJ7KYA=";
-        T.eq("★ 真实主机密钥算出的指纹与 ssh-keygen 完全一致",
-                "SHA256:Q5JEe2Eqf+SwmVIW/Uis34U1NlQraJi3UERxDK/hmZY",
+                "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBCY0RYAUFtO" +
+                "vAsXOyjV9g9rF/aT/aTJeONvkeHKNW1CYTYw6aydtHNpX1XyogZXX4wxBQsfxRS" +
+                "bRQhwFwDggZA=";
+        T.eq("★ 主机密钥算出的指纹与 ssh-keygen 完全一致",
+                "SHA256:GAwa1KsLxAMsjDbU3opNyL78t7pOoE4qXU1fWJJ5s2M",
                 Tunnel.sha256Fingerprint(realBlob));
 
         String fp = Tunnel.sha256Fingerprint(realBlob);
@@ -227,6 +232,53 @@ public final class TunnelManagerTest {
         });
     }
 
+    /**
+     * 私密机器人的 WebUI token 必须带上解锁口令去取。
+     *
+     * 真机 bug：锁着的实例，服务器对没口令的详情请求只回 lock 状态、
+     * 不回 webui_token。App 没带口令 → 拿到空串 → 报「这个机器人还没跑起来，
+     * 先回机器人页点启动」，而它明明在跑。提示是错的，方向也就找错了。
+     */
+    private static void lockedInstanceToken() throws Exception {
+        // 锁着 + 口令正确：服务器回 token
+        FakeServer ok = new FakeServer(200,
+                "{\"name\":\"secret1\",\"webui_token\":\"TOK123\","
+                        + "\"lock\":{\"locked\":true}}");
+        try {
+            ManagerClient c = new ManagerClient(ok.port(), "mgrtok");
+            T.eq("★ 解锁后能取到 WebUI token", "TOK123", c.webuiToken("secret1", "pw"));
+            T.eq("★ 解锁口令走 X-Dafeiyu-Unlock 头（不进网址、不进日志）",
+                    "pw", ok.lastUnlock);
+            T.eq("路径里不能出现密码", "/instance/secret1", ok.lastPath);
+        } finally {
+            ok.close();
+        }
+
+        // 锁着但没带口令：服务器不回 token（App 得能识别这种「空」）
+        FakeServer locked = new FakeServer(200,
+                "{\"name\":\"secret1\",\"webui_token\":\"\","
+                        + "\"lock\":{\"locked\":true}}");
+        try {
+            ManagerClient c = new ManagerClient(locked.port(), "mgrtok");
+            T.eq("★ 没带口令时 token 为空（界面据此提示要解锁）", "",
+                    c.webuiToken("secret1"));
+            T.eq("没带口令时不该乱发解锁头", "", locked.lastUnlock);
+        } finally {
+            locked.close();
+        }
+
+        // 不锁的实例：老写法（一个参数）仍要能用，别把普通机器人弄坏
+        FakeServer plain = new FakeServer(200,
+                "{\"name\":\"qq1\",\"webui_token\":\"PLAINTOK\"}");
+        try {
+            ManagerClient c = new ManagerClient(plain.port(), "mgrtok");
+            T.eq("★ 不锁的实例照旧能取到 token", "PLAINTOK", c.webuiToken("qq1"));
+            T.eq("普通机器人不会误发解锁头", "", plain.lastUnlock);
+        } finally {
+            plain.close();
+        }
+    }
+
     private static void headerSeparation() throws Exception {
         FakeServer s = new FakeServer(200, "{\"code\":0,\"data\":{}}");
         try {
@@ -248,6 +300,8 @@ public final class TunnelManagerTest {
     static final class FakeServer {
         volatile String lastAuthHeader = "";
         volatile String lastDafeiyuToken = "";
+        /** 解锁口令头（私密机器人的密码就走这个头，不进网址）。 */
+        volatile String lastUnlock = "";
         volatile String lastPath = "";
         private final ServerSocket server;
         private volatile boolean stop;
@@ -294,6 +348,8 @@ public final class TunnelManagerTest {
                     lastAuthHeader = ln.substring(ln.indexOf(':') + 1).trim();
                 } else if (low.startsWith("x-dafeiyu-token:")) {
                     lastDafeiyuToken = ln.substring(ln.indexOf(':') + 1).trim();
+                } else if (low.startsWith("x-dafeiyu-unlock:")) {
+                    lastUnlock = ln.substring(ln.indexOf(':') + 1).trim();
                 } else if (ln.startsWith("GET ") || ln.startsWith("POST ")) {
                     lastPath = ln.split(" ")[1];
                 } else if (low.startsWith("content-length:")) {

@@ -135,19 +135,28 @@ public class NapCatClient {
 
     // ---------------------------------------------------------------- 端点
 
-    /** 当前登录状态。字段宽容解析：旧版 WebUI 没有 loginPhase 也能用。 */
+    /**
+     * 当前登录状态。字段宽容解析：旧版 WebUI 没有 loginPhase 也能用。
+     *
+     * 必须剥掉 data 外壳再返回 —— 这几个接口的响应是
+     * {"code":0,"data":{"qrcodeurl":…},"message":"success"}，
+     * 真正的字段在 data 里面。曾经这里直接把整个外壳返回，调用方却按
+     * 「qrcodeurl 就在顶层」去读，于是永远读到空串：**二维码一个都不显示**，
+     * 而且 loginPhase/loginError 也一起丢了，界面只剩「等待扫码」四个字。
+     * 单测当时用 data(...) 自己剥了一层，正好把这个错掩掉了（见回归测试）。
+     */
     public Map<String, Object> checkLoginStatus() throws ApiError {
-        return call("POST", "/api/QQLogin/CheckLoginStatus", null, 12000);
+        return Json.obj(call("POST", "/api/QQLogin/CheckLoginStatus", null, 12000), "data");
     }
 
     /** 刷新二维码，返回新的 qrcodeurl（可能为空串 + restarting=true）。 */
     public Map<String, Object> refreshQrcode() throws ApiError {
-        return call("POST", "/api/QQLogin/RefreshQRcode", null, 20000);
+        return Json.obj(call("POST", "/api/QQLogin/RefreshQRcode", null, 20000), "data");
     }
 
     /** 登录账号信息（uin / 昵称 / 头像 / online）。 */
     public Map<String, Object> loginInfo() throws ApiError {
-        return call("POST", "/api/QQLogin/GetQQLoginInfo", null, 12000);
+        return Json.obj(call("POST", "/api/QQLogin/GetQQLoginInfo", null, 12000), "data");
     }
 
     /**
@@ -190,7 +199,9 @@ public class NapCatClient {
         Map<String, Object> body = new LinkedHashMap<String, Object>();
         body.put("uin", uin.trim());
         body.put("passwordMd5", md5hex(password));
-        return call("POST", "/api/QQLogin/PasswordLogin", body, 30000);
+        // 同样要剥 data 外壳：needCaptcha / needNewDevice 这些标记都在 data 里。
+        // data 为 null（登录请求已受理）时 Json.obj 回空 Map，调用方按「没有标记」处理。
+        return Json.obj(call("POST", "/api/QQLogin/PasswordLogin", body, 30000), "data");
     }
 
     public void restartNapCat() throws ApiError {

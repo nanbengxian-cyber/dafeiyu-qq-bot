@@ -295,8 +295,11 @@ public final class LoginView {
                     // NapCat 的 WebUI Token 由服务器生成，用户看不到也不需要知道 ——
                     // 直接向管理服务要，经隧道用。
                     try {
+                        // 私密机器人要带上解锁口令，否则服务器不回 webui_token，
+                        // 下面会把「锁着」误报成「还没跑起来」。
                         useTok = Session.client().webuiToken(
-                                RoutingTransport.activeInstance());
+                                RoutingTransport.activeInstance(),
+                                RoutingTransport.activeUnlockPassword());
                     } catch (Exception e) {
                         fail("拿不到这个机器人的 WebUI 凭据：" + e.getMessage());
                         return;
@@ -466,7 +469,12 @@ public final class LoginView {
                     statusLine.setText(phaseText(phase));
                     statusLine.setTextColor(Theme.WARN);
                 }
-                if (!loginError.isEmpty()) {
+                // loginError 是 NapCat 的「上一次错误」，不会随新码自动清掉。
+                // 二维码每 30 秒自己换一张，换完之后 loginError 往往还停在
+                // 「二维码已过期，请刷新」—— 于是界面上同时出现一张**能扫的新码**
+                // 和一行红字说码过期了。用户看到红字就不敢扫 / 以为坏了。
+                // 手上已经拿到刚画好的新码时，这条过期提示就是过时的，不显示。
+                if (!loginError.isEmpty() && qr == null) {
                     detailLine.setText("最近错误：" + loginError);
                     detailLine.setTextColor(Theme.BAD);
                 } else {

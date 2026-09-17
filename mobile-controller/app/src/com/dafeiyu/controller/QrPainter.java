@@ -30,10 +30,9 @@ public final class QrPainter {
         } catch (IllegalArgumentException | NullPointerException e) {
             return null;
         }
-        int quiet = 4;
-        int modules = qr.size + quiet * 2;
-        int scale = Math.max(1, targetPx / modules);
-        int size = modules * scale;
+        int quiet = QrLayout.QUIET_MODULES;
+        int scale = QrLayout.scaleFor(qr.size, targetPx);
+        int size = QrLayout.pixelSize(qr.size, targetPx);
         Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bmp);
         canvas.drawColor(0xFFFFFFFF);

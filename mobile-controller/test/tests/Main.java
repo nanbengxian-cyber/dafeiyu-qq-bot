@@ -17,6 +17,7 @@ public final class Main {
         WebProxyPathTest.run();
         // 机器人列表搜索（对应「不能定向搜索机器人名字」这条反馈）
         RobotFilterTest.run();
+        QrLayoutTest.run();
         System.exit(T.report());
     }
 }

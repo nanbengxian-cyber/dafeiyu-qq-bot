@@ -19,7 +19,7 @@ SRC=app/src/com/dafeiyu/controller
 PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
 $SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
 $SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
-$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java"
+$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java $SRC/QrLayout.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
@@ -47,10 +47,13 @@ mkdir -p "$OUT"
 JSCH=lib/jsch-0.2.17.jar
 [ -f "$JSCH" ] || { echo "缺 $JSCH" >&2; exit 1; }
 
-javac -encoding UTF-8 -nowarn -d "$OUT" -cp "app/src:$JSCH" \
+ZXING=lib/zxing-core.jar:lib/zxing-jse.jar
+[ -f lib/zxing-core.jar ] || { echo "缺 lib/zxing-core.jar（测试用独立二维码解码器）" >&2; exit 1; }
+
+javac -encoding UTF-8 -nowarn -d "$OUT" -cp "app/src:$JSCH:$ZXING" \
   $PURE test/tests/*.java
 
-java -cp "$OUT:$JSCH" tests.Main
+java -cp "$OUT:$JSCH:$ZXING" tests.Main
 
 # 注入脚本要用**真 JS 引擎**跑一遍 —— 单测只能验证脚本字符串长什么样，
 # 证明不了它真的能工作。这段脚本坏了的表现是「页面能打开但一登录就失败」，

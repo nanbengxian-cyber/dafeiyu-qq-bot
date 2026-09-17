@@ -93,10 +93,6 @@ public final class NapCatClientTest {
         }
     }
 
-    private static Map<String, Object> data(Map<String, Object> envelope) {
-        return Json.obj(envelope, "data");
-    }
-
     public static void run() {
         T.group("地址归一化");
         T.eq("补 scheme", "http://1.2.3.4:6099", NapCatClient.normalize("1.2.3.4:6099"));
@@ -179,7 +175,7 @@ public final class NapCatClientTest {
         c5.configure("napcat.test", TOKEN, "");
         Map<String, Object> st = null;
         try {
-            st = data(c5.checkLoginStatus());
+            st = c5.checkLoginStatus();
         } catch (NapCatClient.ApiError e) {
             T.bad("状态查询应当成功", e.getMessage());
         }
@@ -193,11 +189,22 @@ public final class NapCatClientTest {
         int logins = f5.loginCalls;
         T.eq("Unauthorized 触发了重登", logins >= 2, true);
 
+        // 反回归（v1.0.4 真机 bug：APK 死活不出二维码）：
+        // NapCat 这几个接口回的是 {"code":0,"data":{...},"message":"success"}，
+        // 真正的字段在 data 里面。曾经 checkLoginStatus() 把整个外壳原样返回，
+        // 调用方按顶层读 qrcodeurl 就永远读到空串 —— 二维码一个都不显示。
+        // 这里直接对**生产返回值**断言，不许再像以前那样在测试里自己剥一层 data。
+        T.group("反回归：四个接口必须剥掉 data 外壳");
+        T.eq("CheckLoginStatus 顶层就有 qrcodeurl", true,
+                st.containsKey("qrcodeurl"));
+        T.eq("CheckLoginStatus 顶层就有 isLogin", true, st.containsKey("isLogin"));
+        T.eq("外壳字段 code 不该再露出来", false, st.containsKey("code"));
+
         T.group("刷新二维码 / 登录信息 / 重启");
         try {
-            Map<String, Object> rf = data(c5.refreshQrcode());
+            Map<String, Object> rf = c5.refreshQrcode();
             T.eq("刷新返回新码", "https://x.test/jump?2", Json.str(rf, "qrcodeurl"));
-            Map<String, Object> info = data(c5.loginInfo());
+            Map<String, Object> info = c5.loginInfo();
             T.eq("uin", "10001", Json.str(info, "uin"));
             T.eq("nick", "测试号", Json.str(info, "nick"));
             c5.restartNapCat();
@@ -209,14 +216,14 @@ public final class NapCatClientTest {
         T.group("密码登录（MD5 + 安全验证分支）");
         try {
             f5.passwordLoginData = "{\"needCaptcha\":true,\"proofWaterUrl\":\"https://cap.test/x\"}";
-            Map<String, Object> cap = data(c5.passwordLogin("10001", "pw12345"));
+            Map<String, Object> cap = c5.passwordLogin("10001", "pw12345");
             T.eq("needCaptcha 透传", true, Json.bool(cap, "needCaptcha", false));
             T.eq("验证地址透传", "https://cap.test/x", Json.str(cap, "proofWaterUrl"));
             f5.passwordLoginData = "{\"needNewDevice\":true,\"jumpUrl\":\"https://nd.test/y\"}";
-            Map<String, Object> nd = data(c5.passwordLogin("10001", "pw12345"));
+            Map<String, Object> nd = c5.passwordLogin("10001", "pw12345");
             T.eq("needNewDevice 透传", true, Json.bool(nd, "needNewDevice", false));
             f5.passwordLoginData = "null";
-            Map<String, Object> okData = data(c5.passwordLogin("10001", "pw12345"));
+            Map<String, Object> okData = c5.passwordLogin("10001", "pw12345");
             T.eq("成功时 data 为空对象", 0, okData.size());
         } catch (NapCatClient.ApiError e) {
             T.bad("密码登录分支不该失败", e.getMessage());
