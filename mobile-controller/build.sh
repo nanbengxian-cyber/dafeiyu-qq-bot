@@ -42,6 +42,18 @@ die() { printf '\033[31m✗ %s\033[0m\n' "$1" >&2; exit 1; }
 
 [ "${1:-}" = "--clean" ] && rm -rf "$BUILD"
 
+# ★ 每次都清掉**编译中间产物**（--clean 才删整个 build/ 含最终 APK）。
+#
+# 为什么必须清：javac 只写它编出来的 class，**从不删**已经不存在的源码对应的
+# 旧 class。踩到的实例：把短信/网页验证从独立 Activity 改成虚拟屏、删掉
+# WebLoginActivity.java 之后，build/classes 里那份 WebLoginActivity.class
+# 还在，d8 照样把它打进 dex —— 用户的包里带着一个已经作废、且是「以前的
+# 网页」那个实现的类。症状极其隐蔽：源码里搜不到、manifest 里也没声明，
+# 只有反编译 dex 才看得见。同理也会骗过「class 数量」这类自检。
+rm -rf "$BUILD/classes" "$BUILD/dex" "$BUILD/flat" "$BUILD/gen" \
+       "$BUILD/unsigned.apk" "$BUILD/aligned.apk" "$BUILD/classes.list" \
+       "$BUILD/flat.args" "$BUILD/check.dex"
+
 # ---------------------------------------------------------------- 前置检查
 for f in "$TOOLS/aapt2" "$TOOLS/zipalign" "$TOOLS/apksigner" "$TOOLS/lib/d8.jar" \
          "$ANDROID_JAR" "$JSCH_JAR"; do
@@ -104,6 +116,18 @@ for must in MainActivity LoginView ConsoleView NapCatClient Deployer Knobs; do
   [ -f "$BUILD/classes/com/dafeiyu/controller/$must.class" ] || die "$must.class 缺失（编译被跳过？）"
 done
 [ -f "$BUILD/classes/io/nayuki/qrcodegen/QrCode.class" ] || die "QrCode.class 缺失"
+# 1.2.0 新增的三个类也必须真在产物里 —— 少了任何一个，用户装上去
+# 要么看不到「三大验证」的第三块（WebScreen），要么收不到公告/更新（AppUpdate/UpdateFlow）。
+for must in WebScreen AppUpdate UpdateFlow ApkProvider; do
+  [ -f "$BUILD/classes/com/dafeiyu/controller/$must.class" ] || die "$must.class 缺失（1.2.0 的功能会整个不生效）"
+done
+# 反向检查：作废的类不许留在产物里（历史包袱 + 用户看到的「以前的网页」）。
+# 上面的 rm -rf 已经清过了，这里再钉一道 —— 万一哪天有人改成增量编译。
+for gone in WebLoginActivity; do
+  if [ -f "$BUILD/classes/com/dafeiyu/controller/$gone.class" ]; then
+    die "$gone.class 残留在产物里（源码已删除却还在编译输出目录）—— 先 rm -rf build/classes"
+  fi
+done
 say "  $CLASS_N 个 class"
 
 # ---------------------------------------------------------------- 4 dex
@@ -168,6 +192,17 @@ if ! grep -qa 'com/jcraft/jsch/Session' "$BUILD/check.dex"; then
 fi
 if ! grep -qa 'io/nayuki/qrcodegen/QrCode' "$BUILD/check.dex"; then
   die "dex 里没有 QR 库"
+fi
+# dex 层面的功能自检（只看源码目录是不够的，看到 dex 才算真进包）：
+#   * 1.2.0 的四个类必须在 —— 缺 WebScreen 则「三大验证」第三块打不开，
+#     缺 AppUpdate/UpdateFlow/ApkProvider 则公告与更新安装整条链断掉；
+#   * 已作废的 WebLoginActivity（旧的「独立网页」实现）必须**不在**。
+for must in 'Lcom/dafeiyu/controller/WebScreen;' 'Lcom/dafeiyu/controller/AppUpdate;' \
+            'Lcom/dafeiyu/controller/UpdateFlow;' 'Lcom/dafeiyu/controller/ApkProvider;'; do
+  grep -qa "$must" "$BUILD/check.dex" || die "dex 里没有 $must（1.2.0 的功能不会生效）"
+done
+if grep -qa 'Lcom/dafeiyu/controller/WebLoginActivity;' "$BUILD/check.dex"; then
+  die "dex 里残留 WebLoginActivity —— 旧的独立网页实现又被编进去了"
 fi
 # 预设闸门：**默认构建必须是空预设**（公开仓库零真实信息的硬规矩）。
 # build-preset.sh 会注入真实地址后构建并自动还原；万一还原失败（脚本被杀/磁盘满），

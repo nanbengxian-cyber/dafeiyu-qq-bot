@@ -24,7 +24,11 @@ import java.util.concurrent.Executors;
  *
  *   ① 二维码登录 → QrScreen（覆盖层虚拟屏，打开才画码、关掉即 recycle）
  *   ② 密码登录   → PwScreen（覆盖层虚拟屏，关掉即清空密码明文）
- *   ③ 短信/网页验证 → WebLoginActivity（独立 Activity，finish 即 destroy WebView）
+ *   ③ 短信/网页验证 → WebScreen（覆盖层虚拟屏，关掉即 destroy WebView）
+ *
+ * 三大验证统一为虚拟屏（2026-09-19 用户要求）：原来第③块是独立
+ * Activity，一点「短信 / 网页验证」就跳出一整页网页 —— 用户看到的就是
+ * 「之前的网页」，和另两块的悬浮屏体验割裂。现在它也是盖在主界面上的屏。
  *
  * 三块都是「用完即删、需要再建」：点开才构建、关闭立即释放，平时零占用。
  *
@@ -40,19 +44,11 @@ public final class LoginView {
     public interface Host {
         void toast(String msg);
 
-        /** 打开一块覆盖层虚拟屏（二维码 / 密码）。 */
+        /** 打开一块覆盖层虚拟屏（二维码 / 密码 / 网页验证）。 */
         void openScreen(VirtualScreen screen);
 
         /** 关闭当前覆盖层虚拟屏。 */
         void closeScreen();
-
-        /**
-         * 打开内置网页登录页（短信 / 验证码 / 两步验证兜底）。
-         * tunnelPort/instance/managerToken 都有值时经管理服务代理访问实例 WebUI；
-         * 否则直连 base。webuiToken 拼成 ?token= 让网页自动登录。
-         */
-        void openWebLogin(String base, int tunnelPort, String instance, String managerToken,
-                          String webuiToken);
     }
 
     private final Context ctx;
@@ -233,8 +229,12 @@ public final class LoginView {
         }));
     }
 
-    /** 短信 / 验证码 / 两步验证 → 内置网页登录页（独立 Activity，用完即删）。 */
+    /** 短信 / 验证码 / 两步验证 → 网页验证虚拟屏（假 WebView 屏，用完即毁）。 */
     private void openWebVerify() {
+        if (!client.connected()) {
+            host.toast("先连接");
+            return;
+        }
         if (RoutingTransport.viaServer()) {
             final String inst = RoutingTransport.activeInstance();
             final String pw = RoutingTransport.activeUnlockPassword();
@@ -257,7 +257,10 @@ public final class LoginView {
                             if (smsEntry != null) {
                                 smsEntry.setEnabled(true);
                             }
-                            host.openWebLogin("http://127.0.0.1", port, inst, mt, useTok);
+                            // 第三块虚拟屏：网页验证不再是独立 Activity，
+                            // 和二维码/密码一样盖在主界面上（用户要求三大验证统一）。
+                            host.openScreen(new WebScreen(
+                                    "http://127.0.0.1", port, inst, mt, useTok));
                         }
                     });
                 }
@@ -269,7 +272,7 @@ public final class LoginView {
             host.toast("先填上面的 WebUI 地址");
             return;
         }
-        host.openWebLogin(base, 0, "", "", token.getText().toString().trim());
+        host.openScreen(new WebScreen(base, 0, "", "", token.getText().toString().trim()));
     }
 
     private void confirmRestart() {

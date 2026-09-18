@@ -1,7 +1,7 @@
 package com.dafeiyu.controller;
 
-import android.app.Activity;
-import android.os.Bundle;
+import android.content.Context;
+import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -21,88 +21,83 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 内置网页登录页 —— 把服务器上这个实例的 NapCat WebUI 装进 App 的 WebView。
+ * 第三块虚拟屏 —— 内置网页验证（短信 / 验证码 / 两步验证兜底）。
  *
- * 什么时候用它：
- * - 密码登录触发了腾讯的验证码 / 新设备验证 —— 那套验证组件是网页 JS，
- *   官方网页登录页能直接跑完，App 原生页面做不了；
- * - WebUI 开了两步验证但手边没有验证器；
- * - 或者就是想看官方页面的完整信息。
+ * 它是「三大验证」里最后一块：二维码 → {@link QrScreen}、密码 →
+ * {@link PwScreen}、剩下的网页验证 → 本屏。三块都遵循 VirtualScreen
+ * 的「用完即弃」约定：点开才构建，关掉立刻 destroy WebView，平时零占用。
  *
- * ── 为什么要改写请求（这个坑踩过，症状是「网页老是连不上」）──────────────
+ * ── 为什么这一块也必须虚拟屏化（2026-09-19 用户要求）──────────────
+ *
+ * 原来它是个独立 Activity（WebLoginActivity）：点「短信 / 网页验证」
+ * 会跳出一整页独立的网页界面 —— 用户看到的就是「之前的网页」。
+ * 而另两块已经是悬浮屏了，体验被割裂：二维码/密码是盖在主界面上的
+ * 悬浮窗，验证码却整个跳出去。用户要求三大验证统一成虚拟屏。
+ *
+ * 于是把这页从 Activity 改成 VirtualScreen：同样是那套内置 WebView +
+ * 两层代理改写，但由 ScreenHost 托管，盖在主界面上，返回键直接回到 App。
+ *
+ * ── 两层改写缺一不可（这是老功能，坑记录保留）───────────────────
  *
  * 实例的 WebUI 只监听**服务器**的 127.0.0.1:实例端口，手机连不上，
- * 必须经管理服务的 /proxy/&lt;实例名&gt;/ 转发。但 NapCat 的网页是 React 应用，
- * 它引用资源用的是**绝对路径**：
+ * 必须经管理服务的 /proxy/&lt;实例名&gt;/ 转发。NapCat 网页是 React 应用，
+ * 资源用绝对路径（&lt;script src="/webui/assets/..."&gt;），所以：
  *
- *     &lt;script src="/webui/assets/index-CaeQ89K8.js"&gt;
+ *   ① HTTP 层（shouldInterceptRequest）：改写浏览器自己解析的静态资源。
+ *      GET、无 body，在 HTTP 层改地址即可。
+ *   ② JS 层（注入 shim）：页面 JS 自己发的 API 调用（如 POST
+ *      /api/auth/login 带 JSON body）。shouldInterceptRequest 拿不到
+ *      POST body（安卓公开 API 限制），硬拦会把登录请求变成空 body ——
+ *      页面能显示、一登录就失败，看起来一切正常，最难查。
+ *      所以必须在页面脚本执行前注入 shim，把 XHR/fetch 的地址换成代理
+ *      前缀，body 原样交给真正的请求。
  *
- * 于是 WebView 会去请求 http://127.0.0.1:&lt;隧道端口&gt;/webui/assets/...，
- * 而管理服务上那条路径是 404（它只认 /proxy/&lt;实例名&gt;/webui/...）。
- * 结果：HTML 能出来、样式和 JS 全 404，页面白屏或一直转圈 —— 看起来像
- * 「连不上」，其实只是每个子请求都少了个前缀。
- * 实测：页面引用的 8 个资源，未改写全部 404、改写后全部 200。
- *
- * ── 为什么需要**两层**改写（只做一层会静默坏掉登录）────────────────────
- *
- * 页面发出的请求分两类，必须分别处理：
- *
- * ① **浏览器自己解析的静态资源**（HTML 里的 src/href）：GET、没有 body。
- *    → 用 shouldInterceptRequest 在 HTTP 层改写即可。
- *
- * ② **页面 JS 自己发的 API 调用**：NapCat 用 axios（baseURL="/api"）和
- *    fetch("/api"+e)，登录是 `POST /api/auth/login` 带 JSON body
- *    {hash, totpCode}。
- *    → **不能在 HTTP 层改写**：WebView 的 shouldInterceptRequest
- *      拿不到 POST body（安卓公开 API 的限制，官方 issue tracker 确认
- *      "There is nothing to read the body of this request"）。
- *      硬拦会让登录请求变成空 body，页面能显示、但**一登录就失败** ——
- *      比白屏更难查，因为看起来一切正常。
- *    → 必须在**页面 JS 发起请求之前**改写 URL：注入一小段脚本，
- *      包装 XMLHttpRequest 和 fetch，把地址加上代理前缀。
- *      body 原样传给真正的请求，我们只是换了地址。
- *
- * 注入时机用 onPageStarted（文档开始加载时），早于页面里任何脚本执行；
- * 每次导航都重新注入（新文档 = 新的 window）。
+ * 注入时机：onPageStarted 每次导航都注入（新文档 = 新 window）；
+ * shouldInterceptRequest 命中 HTML 时直接把 shim 插进文档（确定性最高）。
  */
+public final class WebScreen implements VirtualScreen {
 
-public final class WebLoginActivity extends Activity {
-
-    /** 隧道本地端口；&lt;=0 表示直连模式（不用代理）。 */
-    public static final String EXTRA_TUNNEL_PORT = "tunnel_port";
-    /** 实例名；经代理时必填。 */
-    public static final String EXTRA_INSTANCE = "instance";
-    /** 管理口令（走 X-Dafeiyu-Token 头）。 */
-    public static final String EXTRA_MANAGER_TOKEN = "manager_token";
-    /** 实例的 WebUI 口令；有值时网页自动登录，用户不用手输 Token。 */
-    public static final String EXTRA_WEBUI_TOKEN = "webui_token";
+    private final String base;             // 直连模式地址（经代理时也能用）
+    private final int tunnelPort;          // ≤0 = 不用代理
+    private final String instance;
+    private final String managerToken;
+    private final String webuiToken;
+    private final boolean viaProxy;
 
     private WebView webView;
-    private int tunnelPort;
-    private String instance = "";
-    private String managerToken = "";
-    private String webuiToken = "";
-    private boolean viaProxy;
+    private boolean loaded;
+    private Context ctxForLoad;
+
+    /**
+     * @param base        直连模式下的 WebUI 地址（经代理时传 127.0.0.1 即可）
+     * @param tunnelPort  隧道本地端口；&lt;=0 表示直连
+     * @param instance    实例名；经代理时必填
+     * @param managerToken 管理口令（走 X-Dafeiyu-Token 头）
+     * @param webuiToken  实例 WebUI 口令；有值时网页自动登录
+     */
+    public WebScreen(String base, int tunnelPort, String instance,
+                     String managerToken, String webuiToken) {
+        this.base = base == null ? "" : base;
+        this.tunnelPort = tunnelPort;
+        this.instance = instance == null ? "" : instance;
+        this.managerToken = managerToken == null ? "" : managerToken;
+        this.webuiToken = webuiToken == null ? "" : webuiToken;
+        this.viaProxy = tunnelPort > 0 && !this.instance.isEmpty()
+                && !this.managerToken.isEmpty();
+    }
 
     @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        String base = getIntent().getStringExtra("base");
-        if (base == null || base.isEmpty()) {
-            finish();
-            return;
-        }
-        tunnelPort = getIntent().getIntExtra(EXTRA_TUNNEL_PORT, 0);
-        instance = str(getIntent().getStringExtra(EXTRA_INSTANCE));
-        managerToken = str(getIntent().getStringExtra(EXTRA_MANAGER_TOKEN));
-        webuiToken = str(getIntent().getStringExtra(EXTRA_WEBUI_TOKEN));
-        viaProxy = tunnelPort > 0 && !instance.isEmpty() && !managerToken.isEmpty();
+    public String title() {
+        return "短信 / 网页验证";
+    }
 
-        LinearLayout root = new LinearLayout(this);
+    @Override
+    public View build(Context ctx) {
+        LinearLayout root = new LinearLayout(ctx);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Theme.BG);
 
-        TextView hint = UiKit.text(this,
+        TextView hint = UiKit.text(ctx,
                 viaProxy
                         ? (webuiToken.isEmpty()
                             // 拿不到口令时如实说明，并告诉用户去哪找，
@@ -110,15 +105,15 @@ public final class WebLoginActivity extends Activity {
                             ? "下面是你服务器上这个机器人的 NapCat 网页。"
                               + "没能自动登录 —— 请在机器人页确认它是「已解锁」状态再进来。"
                             : "下面是你服务器上这个机器人的 NapCat 网页，已自动登录；"
-                              + "登录后可扫码或密码登录；完成后按返回键回到 App。")
+                              + "登录后可扫码或密码登录。验证完成按返回键回到 App。")
                         : "下面是你填的那个 NapCat 网页：输 Token 登录后可扫码或密码登录。"
                           + "完成后按返回键回到 App。",
                 12, Theme.DIM);
-        hint.setPadding(Theme.dp(this, 12), Theme.dp(this, 8), Theme.dp(this, 12),
-                Theme.dp(this, 8));
+        hint.setPadding(Theme.dp(ctx, 12), Theme.dp(ctx, 8), Theme.dp(ctx, 12),
+                Theme.dp(ctx, 8));
         root.addView(hint);
 
-        webView = new WebView(this);
+        webView = new WebView(ctx);
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -126,36 +121,59 @@ public final class WebLoginActivity extends Activity {
         s.setUseWideViewPort(true);
 
         if (viaProxy) {
-            // 两层改写，缺一不可（见类注释）：
-            //  ① HTTP 层：拦浏览器自己解析的静态资源（GET，无 body）
-            //  ② JS 层：包 XHR/fetch，改页面 JS 发的 API 调用（POST 带 body）
-            // 只做 ① 的话页面能显示，但一登录就失败（POST body 被丢掉），
-            // 而且看起来一切正常 —— 这种「静默坏掉」最难查。
+            // 两层改写（见类注释），缺一不可。
             webView.setWebViewClient(new ProxyClient());
         }
 
         webView.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         root.addView(webView);
-        setContentView(root);
+        ctxForLoad = ctx;
+        return root;
+    }
 
-        // 经代理时直接加载代理地址下的 /webui/ —— 不要加载 base 的根路径。
-        // 根路径在管理服务上没有对应路由（会 404），而且 WebUI 的正确入口
-        // 就是实例的 /webui/（实测 /proxy/<实例>/webui/ 返回完整页面）。
-        //
-        // ★ 带上 ?token= 让网页**自动登录**。
-        //
-        // 不带的话会被路由守卫踢到 /web_login，那儿是个写着「请输入token」的
-        // 输入框 —— 用户看到的就是这个（报过「网页让我输入 token 是什么情况」）。
-        // 那个 token 是 NapCat WebUI 的访问口令，用户既不知道也没处找。
-        //
-        // NapCat 的登录页支持从地址栏取 token 并自动提交，守卫跳转时也会
-        // 把 token 原样带到新地址，所以这里塞一次就够了。
-        webView.loadUrl(viaProxy
-                ? WebProxyPath.withToken(
-                        WebProxyPath.proxyUrlFor(tunnelPort, instance, "/webui/"),
-                        webuiToken)
-                : NapCatClient.normalize(base) + "/");
+    @Override
+    public void onEnter() {
+        // 视图已可见再加载，避免「屏还没显示就已经在请求」。
+        if (!loaded && webView != null) {
+            loaded = true;
+            webView.loadUrl(viaProxy
+                    ? WebProxyPath.withToken(
+                            WebProxyPath.proxyUrlFor(tunnelPort, instance, "/webui/"),
+                            webuiToken)
+                    : NapCatClient.normalize(base) + "/");
+        }
+    }
+
+    @Override
+    public boolean onBack() {
+        // 网页内部有历史：先回退，别一按返回键就把整屏关掉。
+        if (webView != null && webView.canGoBack()) {
+            webView.goBack();
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void dispose() {
+        // WebView 不 destroy 的话，它的渲染线程和 native 资源会一直留着
+        // （这和二维码位图不 recycle 是同一类泄漏）。关屏即毁。
+        if (webView != null) {
+            try {
+                webView.stopLoading();
+            } catch (Throwable ignore) {
+                // 已经卸载等极端情况下 stopLoading 也可能抛，关屏不能被卡住
+            }
+            try {
+                webView.destroy();
+            } catch (Throwable ignore) {
+                // destroy 抛异常也要继续往下 —— 屏必须能关掉
+            }
+            webView = null;
+        }
+        ctxForLoad = null;
+        loaded = false;
     }
 
     // ------------------------------------------------------------ 请求改写
@@ -169,13 +187,7 @@ public final class WebLoginActivity extends Activity {
      */
     private final class ProxyClient extends WebViewClient {
 
-        /**
-         * 文档开始加载时也注入一次（双保险）。
-         *
-         * 主路径是下面 shouldInterceptRequest 里把脚本**直接插进 HTML**（确定性最高）；
-         * 这里再补一次，因为 onPageStarted 对「页面内跳转」等场景仍然有效。
-         * 脚本是幂等的（已带 /proxy/ 前缀的地址会被原样放过），重复注入无害。
-         */
+        /** 文档开始加载时也注入一次（双保险）。脚本幂等，重复注入无害。 */
         @Override
         public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
             super.onPageStarted(view, url, favicon);
@@ -188,13 +200,7 @@ public final class WebLoginActivity extends Activity {
             return handle(url, req.getMethod(), req.getRequestHeaders());
         }
 
-        /**
-         * 老版本回调（API 21 起就有）。
-         *
-         * minSdk 是 26，走的是上面那个带 WebResourceRequest 的重载；
-         * 但这个也覆写掉 —— 万一在某些 ROM 上走了这条，行为保持一致，
-         * 而不是悄悄退化成「不代理、全部 404」。
-         */
+        /** 老版本回调（API 21 起就有）。某些 ROM 可能走这条，行为保持一致。 */
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
             return handle(url, "GET", null);
@@ -208,13 +214,8 @@ public final class WebLoginActivity extends Activity {
             }
             try {
                 WebResourceResponse r = fetch(target, method, headers);
-                // ★ 主文档（HTML）要**把改写脚本插进去**再交给 WebView。
-                //
-                // 为什么不用 onPageStarted + evaluateJavascript 就完事：
-                // 那是异步的，可能在页面自己的脚本之后才执行 —— 而页面脚本
-                // 一执行就把 XMLHttpRequest / fetch 的原始引用拿走了，
-                // 再包也没用（登录 POST 会变成空 body，静默坏掉）。
-                // 插进 HTML 里则是**确定性**的：它在页面任何脚本之前执行。
+                // ★ 主文档（HTML）要把改写脚本**插进去**再交给 WebView
+                //   （比 onPageStarted 注入更确定：在页面任何脚本之前执行）。
                 String ct = r.getMimeType() == null ? "" : r.getMimeType();
                 if (ct.contains("html") && r.getData() != null) {
                     return injectShim(r, WebProxyPath.shimJs(tunnelPort, instance));
@@ -233,12 +234,7 @@ public final class WebLoginActivity extends Activity {
         }
     }
 
-    /**
-     * 把改写脚本插到 HTML 最前面（&lt;head&gt; 之后，或文档最开头）。
-     *
-     * 放在最前面是为了保证它**先于页面自己的任何脚本**执行。
-     * 插不进就原样返回 —— 宁可少一次改写，也不能把页面弄坏。
-     */
+    /** 把改写脚本插到 HTML 最前面（&lt;head&gt; 之后，或文档最开头）。 */
     private static WebResourceResponse injectShim(WebResourceResponse r, String js) {
         if (js == null || js.isEmpty()) {
             return r;
@@ -327,27 +323,5 @@ public final class WebLoginActivity extends Activity {
         // 不 disconnect：返回的 InputStream 还要被 WebView 读，读完后连接会自己回收。
         return new WebResourceResponse(mime, charset, code,
                 code >= 200 && code < 300 ? "OK" : "HTTP " + code, rh, in);
-    }
-
-    private static String str(String s) {
-        return s == null ? "" : s;
-    }
-
-    @Override
-    public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) {
-            webView.goBack();
-        } else {
-            super.onBackPressed();
-        }
-    }
-
-    @Override
-    protected void onDestroy() {
-        if (webView != null) {
-            webView.destroy();
-            webView = null;
-        }
-        super.onDestroy();
     }
 }

@@ -20,7 +20,7 @@ PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
 $SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
 $SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
 $SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java $SRC/QrLayout.java \
-$SRC/Protocols.java"
+$SRC/Protocols.java $SRC/AppUpdate.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
@@ -188,6 +188,14 @@ if ! python3 test/test-key-restart-drift.py; then
   exit 1
 fi
 
+# 长期运行的容器：启动标记会被后续日志挤出 tail 80（线上 dfy 实例
+# 就是「Up 24h、日志 10555 行、标记在第 509 行」，于是一次写入配置
+# 都报「聊天服务还没启动完」）。就绪判据必须兜住「容器在跑」这一档。
+if ! python3 test/test-astrbot-ready.py; then
+  echo "AstrBot 就绪判据检查未通过：长期运行实例会被误判「没启动完」。"
+  exit 1
+fi
+
 # 识图 API 的**能力**探测。「能连上」不等于「能看图」——
 # 很多网关会接受带图片的请求然后完全忽略图片、瞎猜一个答案。
 # 这组测试用假服务器模拟「假装能看」的模型，证明探测不会被骗过去。
@@ -227,6 +235,23 @@ for tz in UTC Asia/Shanghai America/New_York; do
     exit 1
   fi
 done
+
+# 公告 / 检查更新的服务器端（app-update.json 解析、/app/apk 字节流导出）。
+# 服务器少个字段必须返回空壳而不是 500 —— App 靠它决定弹不弹窗，
+# 服务端坏了 App 不该跟着坏。
+if ! python3 test/test-app-update.py; then
+  echo "公告/更新接口（服务端）检查未通过：/app/update 或 /app/apk 有 bug。"
+  exit 1
+fi
+
+# 公告 / 检查更新的 App 端**接线**。逻辑（AppUpdateTest 解析/判定/sha256）
+# 测对了不代表接上了：「连接成功 → 弹窗 → 下载 → 校验 → 安装」整条链
+# 都在 View/Activity/manifest 层，单测照不到，只能静态扫 ——
+# 少接一环用户看到的现象就是「点了没反应 / 装了没校验 / 没有这个功能」。
+if ! python3 test/check-app-update-wiring.py; then
+  echo "公告/更新接线（App 端）检查未通过：功能没接上，用户看到的和没做一样。"
+  exit 1
+fi
 
 # 产物脱敏自检（有产物才跑 —— 纯测试时 build/ 可能是空的）
 if [ -f build/dafeiyu-controller.apk ]; then

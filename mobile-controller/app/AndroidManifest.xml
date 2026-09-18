@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dafeiyu.controller"
-    android:versionCode="1"
-    android:versionName="1.0">
+    android:versionCode="2"
+    android:versionName="1.2.0">
 
     <!-- minSdk 26 = Android 8.0。压在 26 是因为 JSch 的 SftpATTRS 用到了
          java.time（API 26 才有），再往下压就要引入 desugaring，手写构建链
@@ -14,6 +14,12 @@
          这个 App 做的事：连 NapCat WebUI 的 HTTP，和服务器的一条 SSH。 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- 1.2.0 新增：检查更新 + 下载安装 APK。
+         系统安装器（ACTION_VIEW 装 APK）需要这个权限声明 —— 没有它，
+         Android 8+ 会直接拒绝「安装未知应用」流程的发起。
+         （不会真的额外给 App 什么能力，只是放行系统的安装对话框。） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:label="@string/app_name"
@@ -39,10 +45,13 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".WebLoginActivity"
+        <!-- 1.2.0 新增：给系统安装器提供更新 APK 的 content:// 读取。
+             exported=false：只有本 App 显式授予临时读权限时系统安装器才能读。
+             grantUriPermissions：允许 ACTION_VIEW 带 FLAG_GRANT_READ_URI_PERMISSION。 -->
+        <provider
+            android:name=".ApkProvider"
+            android:authorities="com.dafeiyu.controller.apk"
             android:exported="false"
-            android:label="@string/app_name"
-            android:screenOrientation="portrait" />
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

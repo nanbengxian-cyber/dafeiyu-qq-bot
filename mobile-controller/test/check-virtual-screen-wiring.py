@@ -95,6 +95,7 @@ vs = strip_comments(read(SRC + "/VirtualScreen.java"))
 sh = strip_comments(read(SRC + "/ScreenHost.java"))
 qr = strip_comments(read(SRC + "/QrScreen.java"))
 pw = strip_comments(read(SRC + "/PwScreen.java"))
+ws = strip_comments(read(SRC + "/WebScreen.java"))
 ma = strip_comments(read(SRC + "/MainActivity.java"))
 lv = strip_comments(read(SRC + "/LoginView.java"))
 
@@ -151,11 +152,13 @@ ck("★ 回调里恢复了登录中枢（loginView.onShow）",
              ma, re.S) is not None)
 
 print()
-print("④ 接线：登录界面真的打开了这两块屏（不是死代码）")
+print("④ 接线：登录界面真的打开了这三块屏（不是死代码）")
 ck("★ 二维码登录打开 QrScreen",
    re.search(r"openScreen\(new QrScreen\(", lv) is not None)
 ck("★ 密码登录打开 PwScreen",
    re.search(r"openScreen\(new PwScreen\(", lv) is not None)
+ck("★ 短信/网页验证打开 WebScreen（三大验证统一成虚拟屏，不是 Activity）",
+   re.search(r"openScreen\(new WebScreen\(", lv) is not None)
 ck("★ 登录界面的 host 接口暴露了 openScreen/closeScreen",
    re.search(r"void openScreen\(VirtualScreen screen\);", lv) is not None and
    re.search(r"void closeScreen\(\);", lv) is not None)
@@ -168,6 +171,11 @@ ck("★ MainActivity 把 closeScreen 接到了 ScreenHost",
 ck("★ 登录页里不再自己塞二维码位图（应交给 QrScreen）",
    not re.search(r"setImageBitmap\(", lv),
    "LoginView 里还有 setImageBitmap —— 二维码又变回常驻面板了")
+# 反例：网页验证不再是独立 Activity（用户 2026-09-19 要求三大验证统一，
+# 之前「短信/网页验证」会跳出一整页网页 —— 那就是用户看到的现象）
+ck("★ WebLoginActivity 已移除（网页验证不再是「之前的网页」）",
+   os.path.exists(SRC + "/WebLoginActivity.java") is False,
+   "WebLoginActivity.java 还在 —— 短信/网页验证又会跳出独立网页")
 
 print()
 print("⑤ 覆盖层要真的盖在上面，且返回键先给虚拟屏")
@@ -209,6 +217,20 @@ i_null = pwd.find("qqPassword = null;")
 ck("★ 关屏抹掉密码明文（setText(\"\")）", i_clear >= 0)
 ck("★ 抹明文在丢引用之前（反了会 NPE 或忘了抹）",
    0 <= i_clear < i_null, "setText=%d 置空=%d" % (i_clear, i_null))
+
+wsd = method_body(ws, "public void dispose()")
+ck("切出了 WebScreen.dispose 方法体", len(wsd) > 80, len(wsd))
+ck("★ WebView 必须 destroy（否则渲染线程/native 资源常驻 = 同二维码位图那类泄漏）",
+   "webView.destroy()" in wsd)
+ck("★ destroy 前先 stopLoading（不然关屏时可能还在加载大页面）",
+   "webView.stopLoading()" in wsd)
+ck("★ destroy 后字段置空（不吊着已销毁的 WebView → 防二次 destroy 崩）",
+   "webView = null;" in wsd)
+# ★ WebScreen.onEnter 才加载，build 不 loadUrl —— 否则「屏还没显示就在请求」
+wse = method_body(ws, "public void onEnter()")
+ck("切出了 WebScreen.onEnter 方法体", len(wse) > 30, len(wse))
+ck("★ 加载在 onEnter（视图可见后）而不是 build 里",
+   re.search(r"loaded = true;\s*webView\.loadUrl", wse) is not None)
 
 print()
 print("FAILS: %d" % len(fails))

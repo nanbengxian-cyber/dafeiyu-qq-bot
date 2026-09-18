@@ -1,7 +1,6 @@
 package com.dafeiyu.controller;
 
 import android.app.Activity;
-import android.content.Intent;
 import android.os.Bundle;
 import android.view.View;
 import android.view.ViewGroup;
@@ -99,17 +98,6 @@ public final class MainActivity extends Activity {
             public void closeScreen() {
                 screenHost.close();
             }
-
-            public void openWebLogin(String base, int tunnelPort, String instance,
-                                     String managerToken, String webuiToken) {
-                Intent it = new Intent(MainActivity.this, WebLoginActivity.class);
-                it.putExtra("base", base);
-                it.putExtra(WebLoginActivity.EXTRA_TUNNEL_PORT, tunnelPort);
-                it.putExtra(WebLoginActivity.EXTRA_INSTANCE, instance);
-                it.putExtra(WebLoginActivity.EXTRA_MANAGER_TOKEN, managerToken);
-                it.putExtra(WebLoginActivity.EXTRA_WEBUI_TOKEN, webuiToken);
-                startActivity(it);
-            }
         }, store);
 
         robotsView = new RobotsView(this, new RobotsView.Host() {
@@ -139,6 +127,9 @@ public final class MainActivity extends Activity {
 
             public void onConnectionChanged() {
                 robotsView.onShow();
+                // 连接成功后顺带查一次公告/更新（有更新或公告才弹窗，
+                // 平时零打扰）。同一次连接只查一次。
+                UpdateFlow.maybeCheck(MainActivity.this);
             }
         });
 

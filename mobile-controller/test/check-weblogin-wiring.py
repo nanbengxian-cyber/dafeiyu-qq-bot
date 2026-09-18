@@ -10,9 +10,13 @@
 
 这次的同类风险：`WebProxyPath.withToken()` 有 10 项单测，
 但真正决定「用户会不会看到请输入token」的是三个 android 类里的接线：
-    LoginView        —— 取口令，并把它传出去
-    MainActivity     —— 把口令塞进 Intent
-    WebLoginActivity —— 从 Intent 取出口令，拼进要加载的地址
+    LoginView  —— 取口令，并把它传出去
+    WebScreen  —— 从构造参数取出口令，拼进要加载的地址（虚拟屏化后不再有 Activity）
+    MainActivity —— 不再启动独立 Activity（已删除 WebLoginActivity）
+
+2026-09-19：短信/网页验证从独立 Activity（WebLoginActivity）改成第三块
+虚拟屏（WebScreen）——「三大验证统一」用户要求。所有检查随之迁到 WebScreen；
+如果有人改回 Activity，这里会立刻失败（WebLoginActivity 不得复活）。
 
 这三处任意一处漏掉，单测照样全绿，而用户看到的现象和没修一模一样。
 View/Activity 刻意不进单测面（见 run-tests.sh 的注释），所以只能用静态扫。
@@ -32,32 +36,29 @@ CHECKS = [
     ("LoginView.java", "取实例的 WebUI 口令（带解锁口令，否则私密机器人拿到空串）",
      [r"webuiToken\s*\(\s*inst\s*,\s*pw\s*\)"]),
 
-    ("LoginView.java", "把口令交给 openWebLogin（取到不用 = 白取）",
-     [r"openWebLogin\s*\([^)]*useTok\s*\)"]),
+    ("LoginView.java", "把口令交给 WebScreen（取到不用 = 白取）",
+     [r"new WebScreen\s*\([^)]*useTok\s*\)"]),
 
     ("LoginView.java", "取口令走后台线程（别在主线程发网络请求）",
      [r"pool\.execute"]),
 
-    ("MainActivity.java", "把口令塞进 Intent",
-     [r"putExtra\s*\(\s*WebLoginActivity\.EXTRA_WEBUI_TOKEN"]),
+    ("LoginView.java", "★ 短信/网页验证打开的是 WebScreen 虚拟屏（不再是 Activity）",
+     [r"host\.openScreen\s*\(\s*new WebScreen\s*\("]),
 
-    ("WebLoginActivity.java", "声明 EXTRA_WEBUI_TOKEN",
-     [r'EXTRA_WEBUI_TOKEN\s*=\s*"webui_token"']),
+    ("WebScreen.java", "从构造参数接收 webuiToken",
+     [r"String webuiToken\s*\)"]),
 
-    ("WebLoginActivity.java", "从 Intent 取出口令",
-     [r"getStringExtra\s*\(\s*EXTRA_WEBUI_TOKEN\s*\)"]),
-
-    ("WebLoginActivity.java", "★ 拼进要加载的地址（漏了这步 = 用户照样看到请输入token）",
+    ("WebScreen.java", "★ 拼进要加载的地址（漏了这步 = 用户照样看到请输入token）",
      [r"withToken\s*\("]),
 
-    ("WebLoginActivity.java", "加载地址确实用了 withToken 的返回值",
+    ("WebScreen.java", "加载地址确实用了 withToken 的返回值",
      [r"loadUrl\s*\(\s*viaProxy\s*\?\s*WebProxyPath\.withToken\s*\("]),
 ]
 
-# 反向检查：不能把口令写进查询串之外的日志/持久化
+# 反向检查：不能把口令写进查询串之外的日志/持久化；网页验证必须是虚拟屏而非旧 Activity
 FORBIDDEN = [
     ("LoginView.java", r"store\.\w*[Ss]ave\w*\([^)]*[Tt]oken", "口令不能被持久化"),
-    ("WebLoginActivity.java", r"android\.util\.Log\.\w+\([^)]*webuiToken", "口令不能进日志"),
+    ("WebScreen.java", r"android\.util\.Log\.\w+\([^)]*webuiToken", "口令不能进日志"),
 ]
 
 

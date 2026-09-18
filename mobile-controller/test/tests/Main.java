@@ -20,6 +20,8 @@ public final class Main {
         QrLayoutTest.run();
         // 接口协议选择（对应「API 需要更多的详细自定义请求体和协议选择」）
         ProtocolsTest.run();
+        // 公告 + 检查更新（对应「加一个公告功能，还有检查更新并可以更新apk并安装功能」）
+        AppUpdateTest.run();
         System.exit(T.report());
     }
 }

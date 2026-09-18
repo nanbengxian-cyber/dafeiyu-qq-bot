@@ -629,4 +629,68 @@ public final class ManagerClient {
             return "启动中（napcat=" + napcat + ", astrbot=" + astrbot + "）";
         }
     }
+
+    // ------------------------------------------------------------ 公告 / 更新
+
+    /**
+     * 拉「公告 + 最新版本」信息（GET /app/update）。
+     *
+     * 服务器读 app-update.json：latest_code 是给 App 比大小的 versionCode，
+     * announcement 是公告正文。没有配置过就返回空壳（latest_code=0），
+     * App 只在 latest_code > 本地 versionCode 时才提示更新，公告有字才弹。
+     */
+    public Map<String, Object> appUpdate() throws Deployer.DeployException {
+        return request("GET", "/app/update", null, "");
+    }
+
+    /**
+     * 把内置版 APK 从服务器下载到本地文件（GET /app/apk）。
+     *
+     * ★ 为什么从服务器下载而不是去私有仓库：APK 已经通过 SSH 隧道连到
+     *   管理服务（127.0.0.1），下载复用这条隧道和双认证，App 里不需要
+     *   内置任何私有仓库的凭据。服务器把部署时放进去的那份原样发出来。
+     *
+     * 只在下载完成且字节数对上后才返回 true；中途网络断/内容不对算失败，
+     * 调用方负责删掉半截文件（半个 APK 装不上，留着也是垃圾）。
+     */
+    public boolean downloadApk(java.io.File dest) throws Deployer.DeployException {
+        HttpURLConnection c = null;
+        try {
+            URL u = new URL(base + "/app/apk");
+            c = (HttpURLConnection) u.openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(10000);
+            // 下载可以慢慢来：APK 有几 MB，手机上可能走 2G/弱网
+            c.setReadTimeout(300000);
+            c.setRequestProperty("Authorization", "Bearer " + token);
+            int code = c.getResponseCode();
+            if (code == 404) {
+                return false;   // 服务器上还没有可下载的安装包
+            }
+            if (code != 200) {
+                String err = readAll(c.getErrorStream());
+                throw new Deployer.DeployException("下载更新失败（服务器返回 "
+                        + code + "）：" + err);
+            }
+            java.io.InputStream in = c.getInputStream();
+            java.io.FileOutputStream out = new java.io.FileOutputStream(dest);
+            byte[] buf = new byte[16384];
+            int n;
+            try {
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+            } finally {
+                out.close();
+                in.close();
+            }
+            return true;
+        } catch (java.io.IOException e) {
+            throw new Deployer.DeployException("下载更新失败：" + e.getMessage());
+        } finally {
+            if (c != null) {
+                c.disconnect();
+            }
+        }
+    }
 }
