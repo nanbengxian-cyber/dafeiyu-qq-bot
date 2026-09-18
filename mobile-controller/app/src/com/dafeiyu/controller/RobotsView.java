@@ -351,16 +351,30 @@ public final class RobotsView {
                     host.gotoLoginTab();
                 }
             }));
+            // 按钮怎么给 —— 这里的判据是**「有没有容器还活着」**，
+            // 不是「两个都活着」。
+            //
+            // 2026-09-18 用户报「机器人运行中停止不了」，根因就在这：
+            // 原来只按 it.running()（两个都 running）二选一，
+            // 于是「NapCat 挂了、AstrBot 还在跑」这种最常见的半死状态
+            // 既不给「停止」也不给「修复」，用户完全没有下手的地方。
+            // 线上实测有实例就是 astrbot=running + napcat=exited。
+            //
+            // 现在：
+            //   · 还有容器活着 → 一定给「停止」（否则停不掉）
+            //   · 没在完整运行   → 也给「启动」（重启一次通常就好了）
+            //   两个按钮同时出现是**故意**的，不是重复。
+            if (it.partiallyRunning()) {
+                btns.addView(smallBtn("停止", new View.OnClickListener() {
+                    public void onClick(View v) {
+                        act("stop", it.name);
+                    }
+                }));
+            }
             if (!it.running()) {
                 btns.addView(smallBtn("启动", new View.OnClickListener() {
                     public void onClick(View v) {
                         act("start", it.name);
-                    }
-                }));
-            } else {
-                btns.addView(smallBtn("停止", new View.OnClickListener() {
-                    public void onClick(View v) {
-                        act("stop", it.name);
                     }
                 }));
             }
@@ -608,6 +622,70 @@ public final class RobotsView {
         panel.addView(apiKey);
         panel.addView(apiModel);
 
+        // ── 接口协议 ───────────────────────────────────────────────────
+        //
+        // ★ 为什么协议必须是用户能选的一项：
+        //   同一个模型可能只认某一种协议。中转站给的是 Anthropic 原生接口
+        //   （/v1/messages + x-api-key）时，按默认的 OpenAI 兼容去填会 404，
+        //   而报错指向「地址写错了」—— 用户于是去反复改一个**正确**的地址，
+        //   永远改不好。反过来，选错协议也可能拿到 401，被解释成
+        //   「Key 不对」，用户就去重新复制一个完全正确的 Key。
+        //   这两种错都会把人带偏到完全无关的方向，所以协议必须显式可配。
+        //
+        // 用下拉而不是让用户填字符串：那个 type 字符串是给机器看的
+        //   （AstrBot 拿它查适配器，查不到就加载失败），手打必然出错，
+        //   而错的后果是机器人一个字都不回、报错只有一行 traceback。
+        final android.widget.Spinner protoSpin = UiKit.spinner(ctx, Protocols.labels());
+        final TextView protoHint = UiKit.text(ctx, "", 11, Theme.DIM);
+        panel.addView(UiKit.caption(ctx, "接口协议（选错就通不了，不确定就选第一个）"));
+        panel.addView(protoSpin);
+        panel.addView(protoHint);
+        protoSpin.setOnItemSelectedListener(
+                new android.widget.AdapterView.OnItemSelectedListener() {
+                    public void onItemSelected(android.widget.AdapterView<?> p,
+                                               View v, int pos, long id) {
+                        protoHint.setText(Protocols.hintOfKey(
+                                Protocols.keyOfLabel(String.valueOf(
+                                        protoSpin.getSelectedItem()))));
+                    }
+
+                    public void onNothingSelected(android.widget.AdapterView<?> p) {
+                    }
+                });
+
+        // ── 自定义请求体（折叠）─────────────────────────────────────────
+        //
+        // 为什么折叠：它不是必填的，而且里面是 JSON —— 摆在明面上会让
+        // 新手以为必须填，反而卡住。会调参的人自己会点开。
+        //
+        // 为什么值得做这个功能：不同服务商对同一个模型的默认参数不一样，
+        // 有人要调 temperature 让机器人不那么死板，有人要调 max_tokens
+        // 控制回复长度，有人要给某些网关塞一个非标准字段。
+        // 没有这个入口时，用户只能去改服务器上的配置文件 —— 那正是
+        // 这个 App 要消灭的事情。
+        final LinearLayout extraBox = UiKit.column(ctx);
+        extraBox.setVisibility(View.GONE);
+        final EditText extraBody = UiKit.multiline(ctx,
+                "留空 = 不传额外参数。例如：\n{\n  \"temperature\": 0.8,\n"
+                + "  \"max_tokens\": 2048\n}", 4);
+        extraBox.addView(UiKit.caption(ctx,
+                "这里写的每一项都会**原样**发给你填的那家接口。\n"
+                + "常用的是 temperature（越大越随机，0~2）和 "
+                + "max_tokens（回复最长多少字）。\n"
+                + "不知道写什么就别填 —— 不填也能正常用。"));
+        extraBox.addView(extraBody);
+        final Button extraBtn = UiKit.button(ctx, "高级：自定义请求体（可选）", false);
+        extraBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                boolean show = extraBox.getVisibility() != View.VISIBLE;
+                extraBox.setVisibility(show ? View.VISIBLE : View.GONE);
+                extraBtn.setText(show ? "收起自定义请求体"
+                        : "高级：自定义请求体（可选）");
+            }
+        });
+        panel.addView(extraBtn);
+        panel.addView(extraBox);
+
         // ── 不知道去哪申请 API？展开引导 ────────────────────────────────
         //
         // 这是整条流程里唯一一个必须在**别的网站**完成的步骤，新手最容易卡死。
@@ -645,8 +723,15 @@ public final class RobotsView {
                 pool.execute(new Runnable() {
                     public void run() {
                         try {
+                            // 把协议和自定义请求体一起发给服务器 —— 否则会
+                            // 出现最难查的一种情况：「测试显示通了 ✓，但机器人
+                            // 真的跑起来 400」，因为测试发的请求体里没有用户
+                            // 自定义的那些参数。
                             final Map<String, Object> r = client().testApi(it.name, b, k,
-                                    apiModel.getText().toString().trim());
+                                    apiModel.getText().toString().trim(),
+                                    Protocols.keyOfLabel(String.valueOf(
+                                            protoSpin.getSelectedItem())),
+                                    extraBody.getText().toString());
                             ui.post(new Runnable() {
                                 public void run() {
                                     UiKit.setEnabledDeep(testBtn, true);
@@ -702,6 +787,23 @@ public final class RobotsView {
         visionBox.addView(visionKey);
         visionBox.addView(visionModel);
 
+        // 识图也要选协议 —— 而且它和主聊天的协议**互不相干**。
+        //
+        // ★ 为什么不能跟着主协议走：识图常常是另一家（主聊天用便宜的中转站、
+        //   识图用智谱或 Gemini 官方）。如果这里错跟了主协议，用户改主 API
+        //   的协议会把识图一起改坏，而现象是「文字能聊、图看不懂」——
+        //   极难联想到是主协议改动的副作用。
+        final android.widget.Spinner visionProto = UiKit.spinner(ctx, Protocols.labels());
+        visionBox.addView(UiKit.caption(ctx, "识图接口协议"));
+        visionBox.addView(visionProto);
+
+        // 识图的自定义请求体。有些视觉模型必须显式关掉思考模式，
+        // 不关就只回思考过程、不回正文，表现为「发了图它答非所问」。
+        final EditText visionExtra = UiKit.multiline(ctx,
+                "留空 = 不传额外参数。例如：\n{\n  \"temperature\": 0.2\n}", 3);
+        visionBox.addView(UiKit.caption(ctx, "识图自定义请求体（可选，不知道就别填）"));
+        visionBox.addView(visionExtra);
+
         final Button visionTest = UiKit.button(ctx,
                 "测试识图（真的发一张图看它认不认得）", false);
         visionTest.setOnClickListener(new View.OnClickListener() {
@@ -720,7 +822,10 @@ public final class RobotsView {
                     public void run() {
                         try {
                             final Map<String, Object> r = client().testVision(
-                                    it.name, b, k, m);
+                                    it.name, b, k, m,
+                                    Protocols.keyOfLabel(String.valueOf(
+                                            visionProto.getSelectedItem())),
+                                    visionExtra.getText().toString());
                             ui.post(new Runnable() {
                                 public void run() {
                                     UiKit.setEnabledDeep(visionTest, true);
@@ -896,6 +1001,40 @@ public final class RobotsView {
                             apiBase.setText(Json.str(cfg, "api_base", ""));
                             apiModel.setText(Json.str(cfg, "api_model", ""));
                             persona.setText(Json.str(cfg, "persona", ""));
+
+                            // 回填协议。★ 一定要判断「App 认不认识」：
+                            // 服务器可能比 App 新，加了 App 不知道的协议。
+                            // 直接 indexOfKey 会静默落到默认项（第一个），
+                            // 用户一保存就把一个**本来正确**的协议改成了
+                            // OpenAI 兼容 —— 那是把好配置改坏，而且他什么都
+                            // 没动过，根本查不出来。所以这里显式提示。
+                            //
+                            // 提示文案记在 unknownProtoMsg 里，最后统一显示：
+                            // 下面的「消息通道」判断也会写 note，直接在这里
+                            // setText 会被它覆盖掉，用户就看不到这个警告了。
+                            String protoKey = Json.str(cfg, "protocol", "");
+                            final String unknownProtoMsg;
+                            if (!Protocols.knows(protoKey)) {
+                                unknownProtoMsg = "⚠ 这个机器人用的接口协议（"
+                                        + protoKey + "）这个 App 版本不认识。"
+                                        + "**不要直接保存**，否则会被改成别的协议。"
+                                        + "请先更新 App。";
+                                protoSpin.setSelection(0);
+                            } else {
+                                unknownProtoMsg = "";
+                                protoSpin.setSelection(Protocols.indexOfKey(protoKey));
+                            }
+
+                            // 回填自定义请求体。服务器给的是格式化好的 JSON 文本。
+                            String eb = Json.str(cfg, "extra_body", "");
+                            extraBody.setText(eb);
+                            if (!eb.isEmpty()) {
+                                // 配过就自动展开 —— 配过的人多半是来改它的，
+                                // 藏在折叠里会让他以为「我配的东西丢了」。
+                                extraBox.setVisibility(View.VISIBLE);
+                                extraBtn.setText("收起自定义请求体");
+                            }
+
                             boolean keySet = Json.bool(cfg, "api_key_set", false);
                             apiKey.setHint(keySet
                                     ? "API Key 已设置（要换就填新的，留空=不改）"
@@ -907,6 +1046,9 @@ public final class RobotsView {
                             String vModel = Json.str(cfg, "vision_model", "");
                             visionBase.setText(vBase);
                             visionModel.setText(vModel);
+                            visionProto.setSelection(Protocols.indexOfKey(
+                                    Json.str(cfg, "vision_protocol", "")));
+                            visionExtra.setText(Json.str(cfg, "vision_extra_body", ""));
                             boolean vKeySet = Json.bool(cfg, "vision_key_set", false);
                             visionKey.setHint(vKeySet
                                     ? "识图 API Key 已设置（要换就填新的，留空=不改）"
@@ -921,8 +1063,15 @@ public final class RobotsView {
                             // 没配对时用户看到的现象和「API 填错」一模一样（都是
                             // 不回话），他会反复改 API 却永远改不好 —— 因为病根
                             // 不在那里。所以这里必须主动说出来，并且给一个按钮。
+                            //
+                            // 优先级：协议不认识的警告最高 —— 它会让用户**一保存
+                            // 就把好配置改坏**，比「不回话」更紧急（不回话至少
+                            // 配置是好的）。所以它盖过下面两条。
                             Map<String, Object> pr = Json.obj(d, "pairing");
-                            if (pr != null && !Json.bool(pr, "paired", false)) {
+                            if (!unknownProtoMsg.isEmpty()) {
+                                note.setText(unknownProtoMsg);
+                                note.setTextColor(Theme.WARN);
+                            } else if (pr != null && !Json.bool(pr, "paired", false)) {
                                 note.setText("⚠ 这个机器人的「消息通道」没接上，"
                                         + "它会收不到消息、一个字都不回。"
                                         + "点下面的「修复消息通道」就能修好。");
@@ -955,9 +1104,16 @@ public final class RobotsView {
                 final String vb = visionBase.getText().toString().trim();
                 final String vk = visionKey.getText().toString().trim();
                 final String vm = visionModel.getText().toString().trim();
+                final String proto = Protocols.keyOfLabel(String.valueOf(
+                        protoSpin.getSelectedItem()));
+                final String eb = extraBody.getText().toString().trim();
+                final String vproto = Protocols.keyOfLabel(String.valueOf(
+                        visionProto.getSelectedItem()));
+                final String veb = visionExtra.getText().toString().trim();
                 if (g.isEmpty() && f.isEmpty() && ab.isEmpty() && ak.isEmpty()
                         && am.isEmpty() && pe.isEmpty()
-                        && vb.isEmpty() && vk.isEmpty() && vm.isEmpty()) {
+                        && vb.isEmpty() && vk.isEmpty() && vm.isEmpty()
+                        && eb.isEmpty() && veb.isEmpty()) {
                     host.toast("什么都没填。");
                     return;
                 }
@@ -971,6 +1127,24 @@ public final class RobotsView {
                             + "（Key 留空=沿用已保存的）");
                     return;
                 }
+                // 自定义请求体本地先做一次「是不是 JSON」的粗查。
+                //
+                // ★ 为什么值得在本地查这一道（服务器也会查）：
+                //   手机上打字容易出错，而 JSON 的错（中文引号、多个逗号）
+                //   在视觉上几乎看不出来。让用户**立刻**知道，比等一次
+                //   网络往返再被告知要好；而且这里只查格式、不查语义，
+                //   语义（哪些字段不能写）留给服务器那份权威实现。
+                if (!eb.isEmpty() && !looksLikeJsonObject(eb)) {
+                    host.toast("自定义请求体要写成一对大括号包起来的字段，"
+                            + "比如 {\"temperature\": 0.7}。"
+                            + "注意引号要用英文的。");
+                    return;
+                }
+                if (!veb.isEmpty() && !looksLikeJsonObject(veb)) {
+                    host.toast("识图的自定义请求体格式不对，"
+                            + "要写成 {\"temperature\": 0.2} 这样。");
+                    return;
+                }
                 note.setText("正在写入…");
                 UiKit.setEnabledDeep(save, false);
                 pool.execute(new Runnable() {
@@ -982,7 +1156,7 @@ public final class RobotsView {
                                     ? unlockedPasswords.get(it.name) : "";
                             final List<String> changed = client().applyConfig(
                                     it.name, g, f, ab, ak, am, pe, lockPw,
-                                    vb, vk, vm);
+                                    vb, vk, vm, proto, eb, vproto, veb);
                             ui.post(new Runnable() {
                                 public void run() {
                                     apiKey.setText("");
@@ -1095,6 +1269,26 @@ public final class RobotsView {
                 }
             }
         });
+    }
+
+    /**
+     * 粗查一段文本「像不像一个 JSON 对象」。
+     *
+     * ★ 这是**故意做粗**的：只查最外层是不是一对大括号。
+     *   真正权威的校验在服务器上（parse_extra_body），那里能给出
+     *   「第几行第几个字符错了」这种精确报错。App 这边只做一件服务器
+     *   做不到的事：**在还没发网络请求之前**就把明显填错的拦下来，
+     *   省掉用户一次「等了好几秒才被告知引号用错了」。
+     *
+     * 为什么只查大括号、不自己写个 JSON 解析器：
+     *   手机上的半吊子解析器会把**合法**的 JSON 判成非法
+     *   （比如带注释、带尾随空白的），那样用户就被自己的 App 挡住了，
+     *   而他填的东西其实是对的 —— 比不查更糟。
+     *   所以这里只拦「一眼就不对」的情况，剩下的交给服务器。
+     */
+    private static boolean looksLikeJsonObject(String s) {
+        String t = s.trim();
+        return t.startsWith("{") && t.endsWith("}");
     }
 
     private static String join(List<Object> arr) {

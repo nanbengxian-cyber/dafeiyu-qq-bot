@@ -69,6 +69,94 @@ if head -1 "$KEY_FILE" | grep -q "OPENSSH PRIVATE KEY"; then
   fi
 fi
 
+# ---------------------------------------------------------------- 账号预检
+#
+# 为什么必须有这一步（2026-09-18 的线上事故）：
+#   v1.0.7 / v1.0.8 打包时 --ssh-user 传成了 `dafeiyu`，而服务器上
+#   **真实账号是 `dafeiyu-app`**（受限账号建的时候带 -app 后缀）。
+#   后果：App 一律连不上，报「服务器不接受这个 App 的密钥」——
+#   这句话把用户和排查者都指向「密钥过期」，而真凶是**账号名打错了**。
+#   密钥、指纹、口令、端口全都是对的，只有用户名错，所以所有「比对配置」
+#   式的自检都发现不了：产物里确实有地址、有指纹、有口令、有私钥。
+#
+#   教训：**「字段都在」不等于「字段是对的」。** 唯一能证明账号对的，
+#   是拿这把钥匙去服务器上真连一次。所以这里在构建前真连。
+#
+# 怎么判「对」：受限账号的 shell 是 nologin，登录成功后 sshd 会回
+#   「This account is currently not available.」—— 这是**成功**的标志
+#   （认证过了才轮到 shell 检查）。而账号不存在时 sshd 回
+#   「Permission denied (publickey)」/ JSch 回 "Auth fail"。
+#   两者要分开判，否则会把正常情况当失败。
+if [ "${SKIP_USER_CHECK:-0}" != "1" ]; then
+  if command -v ssh >/dev/null 2>&1; then
+    echo "→ 预检 SSH 账号 $SSH_USER@$HOST:$SSH_PORT …"
+    set +e
+    CHECK_OUT="$(ssh -i "$KEY_FILE" \
+        -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=15 -o IdentitiesOnly=yes \
+        -o PreferredAuthentications=publickey -o LogLevel=ERROR \
+        -p "$SSH_PORT" "$SSH_USER@$HOST" true 2>&1)"
+    CHECK_RC=$?
+    set -e
+    case "$CHECK_OUT" in
+      *"Permission denied"*|*"Auth fail"*|*"not exist"*)
+        echo "❌ 服务器不认这个账号：$SSH_USER" >&2
+        echo "   服务器原话：$CHECK_OUT" >&2
+        echo >&2
+        echo "   这几乎总是**账号名写错了**，不是密钥过期。" >&2
+        echo "   去服务器上确认真实账号名（注意可能有 -app 之类的后缀）：" >&2
+        echo "     awk -F: '\$1 ~ /dafeiyu/ {print \$1}' /etc/passwd" >&2
+        echo "   然后把这个名字原样传给 --ssh-user。" >&2
+        exit 2
+        ;;
+      *"This account is currently not available"*)
+        echo "  ✓ 账号存在且密钥可用（shell 被限制成 nologin，符合预期）"
+        ;;
+      "")
+        # 没有任何输出 + 退出码 0：认证通过且 shell 正常退出。
+        echo "  ✓ 账号预检通过（连上了，且没有任何报错）"
+        ;;
+      *)
+        # ★ 关键：**没连上**（超时/拒绝/域名解析不了）时绝不能当成通过。
+        #
+        # 这里踩过一个真坑，必须留记录（2026-09-18）：
+        #   原来这里是 `*) echo "✓ 账号预检通过"` —— 一个兜底「通过」。
+        #   结果服务器端口被拒（Connection refused，ssh 退出码 255）时，
+        #   预检照样打印「✓ 账号预检通过」，然后照样打包。
+        #   也就是说：**这道用来防「连不上」的检查，在真的连不上时是绿的。**
+        #   这和它要防的那次事故（v1.0.7 账号写错、自检全绿）是同一类错误 ——
+        #   兜底分支永远不该是「通过」。
+        #   实测证据：端口 10313 被拒时，旧版输出「✓ 账号预检通过」并产出了 APK。
+        #
+        # 判据改成 fail-closed：只有「明确的成功信号」才算通过，
+        # 其余一切（包括看不懂的输出）都当失败。
+        if [ "$CHECK_RC" -ne 0 ]; then
+          echo "❌ 预检没能连上服务器 —— 这**不能**当作「账号没问题」。" >&2
+          echo "   ssh 退出码：$CHECK_RC" >&2
+          echo "   ssh 原话：$CHECK_OUT" >&2
+          echo >&2
+          echo "   常见原因：" >&2
+          echo "     * 本机 IP 被服务器防火墙/防爆破（fail2ban）临时封了；" >&2
+          echo "     * 端口填错、或服务器换了端口；" >&2
+          echo "     * 网络不通。" >&2
+          echo "   先确认这个端口现在**真的能连上**再打包 —— 否则你打出来的包" >&2
+          echo "   和「账号写错」的包一样，用户装上一律连不上。" >&2
+          exit 2
+        fi
+        echo "❌ 预检结果看不懂，按失败处理（不能把不确定当通过）。" >&2
+        echo "   ssh 原话：$CHECK_OUT" >&2
+        exit 2
+        ;;
+    esac
+  else
+    echo "警告：本机没有 ssh 命令，跳过账号预检。" >&2
+    echo "      账号名写错会让用户一律连不上，且报错指向「密钥过期」——" >&2
+    echo "      强烈建议在能跑 ssh 的机器上构建，或手工确认账号名。" >&2
+  fi
+else
+  echo "警告：SKIP_USER_CHECK=1，跳过账号预检（仅用于离线复现构建）。" >&2
+fi
+
 # 指纹强烈建议填：不填就没法防中间人
 if [ -z "$FINGERPRINT" ]; then
   echo "警告：没提供 --fingerprint，App 将不校验服务器身份。" >&2
@@ -170,6 +258,7 @@ ls -la "$OUT"
 
 # ---- 构建后自检 ----
 fail=0
+CHECK_DEX="$(mktemp)"
 # ① 私钥必须真的进去了（否则装上连不上）
 #
 # 注意：classes.dex 在 zip 里是压缩的，`unzip -p | grep` 有时取不到，
@@ -197,6 +286,101 @@ fi
 # ④ 公开版字段必须仍为空（防止把旧的加密 Token 路径带进来）
 if grep -qa "TOKEN_CT = \"[A-Za-z0-9+/]" "$PRESET" 2>/dev/null; then
   echo "⚠ 检测到旧版 TOKEN_CT 有值（本次不应出现）"
+fi
+# ⑤ ★ 账号名必须真的进了产物，而且**必须精确匹配**。
+#
+# 这条是 2026-09-18 事故的直接补丁：当时产物里地址、指纹、口令、私钥
+# 一应俱全，自检全绿，但账号名是 `dafeiyu` 而不是 `dafeiyu-app` ——
+# 于是所有用户都连不上，报错还指向「密钥过期」。
+#
+# 为什么不用 grep -qa "$SSH_USER"：`dafeiyu` 是 `dafeiyu-app` 的前缀，
+# 子串匹配在**错的那一边也会通过**（包里到处是 dafeiyu-astrbot 这类串）。
+# 所以这里改成从 dex 里把 SSH_USER 常量**读出来比对**，而不是搜子串。
+#
+# ★★ 这道检查自己出过一次「假绿灯」，记在这里防止再犯（2026-09-18）：
+#   第一版是用 `re.finditer(rb'[A-Za-z0-9][A-Za-z0-9_.-]{2,31}', d)` 在
+#   **原始字节**上正则扫，然后要求候选里含 `$SSH_USER`。它看起来对，
+#   实际是坏的：那个字符集**包含斜杠和点**，于是 dex 里成百上千个
+#   `Lcom/dafeiyu/controller/Foo;` 会被切成 `...dafeiyu` 这样的片段，
+#   让「dafeiyu」变成一个候选 —— 于是拿错账号（dafeiyu）打的包
+#   自检**照样全绿**，正是这道检查要防的那次事故。
+#   实测：故意用 --ssh-user dafeiyu 构建，旧版自检输出
+#   「✓ 自检：SSH 账号 dafeiyu 在产物里」并留下了坏包。
+#
+#   修法（两层）：
+#     ① 正经解析 dex 字符串表（ULEB128），不再在原始字节上乱切；
+#     ② 账号名必须**整串等于**候选，且候选里不允许出现
+#        `/ . $ : _` 这些「这是包名/类名/字段名，不是账号」的字符。
+if unzip -p "$OUT" classes.dex > "$CHECK_DEX" 2>/dev/null && [ -s "$CHECK_DEX" ]; then
+  ACTUAL_USER="$(python3 - "$CHECK_DEX" <<'PY' 2>/dev/null || true
+import re, struct, sys
+
+def read_uleb(d, o):
+    r = 0; s = 0
+    while True:
+        b = d[o]; o += 1
+        r |= (b & 0x7f) << s
+        if not (b & 0x80):
+            break
+        s += 7
+    return r, o
+
+raw = open(sys.argv[1], "rb").read()
+if raw[:4] != b"dex\n":
+    raise SystemExit(0)
+n, off = struct.unpack_from("<II", raw, 0x38)
+# 账号名：全小写字母/数字/连字符。**刻意排除** / . $ _ : 空格 ——
+# 带上它们就会把 Lcom/dafeiyu/controller 这类包名也当成候选，
+# 而那正是让错账号蒙混过关的原因。
+ACCT = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+cands = set()
+for i in range(n):
+    p = struct.unpack_from("<I", raw, off + 4 * i)[0]
+    ln, p = read_uleb(raw, p)
+    s = raw[p:p + ln].decode("utf-8", "replace")
+    if ACCT.match(s):
+        cands.add(s)
+print(" ".join(sorted(cands)))
+PY
+)"
+  case " $ACTUAL_USER " in
+    *" $SSH_USER "*)
+      echo "  ✓ 自检：产物里内置的账号 = $SSH_USER（与 --ssh-user 一致）"
+      ;;
+    *)
+      echo "❌ 产物里的 SSH 账号对不上。" >&2
+      echo "   期望：$SSH_USER" >&2
+      echo "   产物里出现：${ACTUAL_USER:-（没找到任何候选）}" >&2
+      echo "   账号名错会让用户一律连不上，且报错指向「密钥过期」——" >&2
+      echo "   这正是 v1.0.7 / v1.0.8 的事故原因。" >&2
+      fail=1
+      ;;
+  esac
+else
+  echo "❌ 解不出产物里的 classes.dex，无法核对账号名。" >&2
+  fail=1
+fi
+rm -f "$CHECK_DEX"
+
+# ★ 说清这道自检**能证明什么、不能证明什么** —— 这一点必须写死在这里，
+#   因为上次的事故就是「自检全绿」给了人虚假的安全感：
+#
+#     它能证明：--ssh-user 传的那个值**真的进了产物**。
+#               （防的是「Preset.java 被还原/构建用了旧文件」这类问题）
+#     它不能证明：那个值**是对的**。
+#               账号名写错时，产物里当然还是那个错名字，
+#               自己跟自己比永远相等 —— 这是**同义反复**，
+#               不是校验。上次 `dafeiyu` 的包自检全绿就是这个原因。
+#
+#   唯一能证明账号对的是**拿这把钥匙去服务器上真连一次**（上面的预检）。
+#   所以跳过预检时，这里必须把话说得很重，不能让人以为「自检过了就没事」。
+if [ "${SKIP_USER_CHECK:-0}" = "1" ]; then
+  echo
+  echo "⚠️  本次跳过了账号预检（SKIP_USER_CHECK=1）。" >&2
+  echo "    上面的自检只证明「你传的账号进了产物」，**不能证明它是服务器上真实存在的账号**。" >&2
+  echo "    账号名写错时用户会一律连不上，而报错会误导向「密钥过期」。" >&2
+  echo "    这个包**不要发给别人**，除非你已经另行确认过账号名。" >&2
+  echo
 fi
 
 [ "$fail" = "0" ] || { echo "自检未通过，已删除产物。" >&2; rm -f "$OUT"; exit 1; }

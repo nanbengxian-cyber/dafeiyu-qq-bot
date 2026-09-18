@@ -7,10 +7,12 @@ import android.graphics.drawable.GradientDrawable;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 /**
@@ -112,6 +114,63 @@ public final class UiKit {
         lp.topMargin = Theme.dp(ctx, 6);
         e.setLayoutParams(lp);
         return e;
+    }
+
+    /**
+     * 多行输入框。给「自定义请求体」这类 JSON 用。
+     *
+     * ★ 为什么要单独一个、不用 input()：input() 设了 setSingleLine(true)，
+     * 而 JSON 天生是多行的（用户从文档里复制过来就带换行）。
+     * 单行框会把换行吞掉或者只显示最后一行，用户会以为自己贴错了。
+     * 这里同时关掉自动纠错 —— 安卓输入法会把 {"temperature":0.7} 的引号
+     * 自动换成中文引号，那样 JSON 就废了，而用户完全看不出区别。
+     */
+    public static EditText multiline(Context ctx, String hint, int lines) {
+        EditText e = new EditText(ctx);
+        e.setHint(hint);
+        e.setHintTextColor(Theme.DIM);
+        e.setTextColor(Theme.TEXT);
+        e.setTextSize(13);
+        e.setTypeface(Typeface.MONOSPACE);
+        e.setBackground(box(ctx));
+        int pad = Theme.dp(ctx, 9);
+        e.setPadding(pad, pad, pad, pad);
+        e.setSingleLine(false);
+        e.setMinLines(lines);
+        e.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
+        // 关掉输入法的「智能」处理：自动大写、自动纠错都会破坏 JSON。
+        e.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = Theme.dp(ctx, 6);
+        e.setLayoutParams(lp);
+        return e;
+    }
+
+    /**
+     * 下拉选择框。给「接口协议」用。
+     *
+     * 为什么用下拉而不是让用户填 type 字符串：
+     * 那个字符串（如 anthropic_chat_completion）是给机器看的，
+     * 用户手打必然出错，而写错的后果是 AstrBot 加载失败、
+     * 机器人一个字都不回，报错里只有一行 traceback。
+     * 下拉框保证用户只能选到**存在**的协议。
+     */
+    public static Spinner spinner(Context ctx, java.util.List<String> labels) {
+        Spinner s = new Spinner(ctx);
+        ArrayAdapter<String> ad = new ArrayAdapter<String>(ctx,
+                android.R.layout.simple_spinner_dropdown_item, labels);
+        s.setAdapter(ad);
+        s.setBackground(box(ctx));
+        s.setPadding(Theme.dp(ctx, 6), Theme.dp(ctx, 6),
+                Theme.dp(ctx, 6), Theme.dp(ctx, 6));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = Theme.dp(ctx, 6);
+        s.setLayoutParams(lp);
+        return s;
     }
 
     private static GradientDrawable box(Context ctx) {

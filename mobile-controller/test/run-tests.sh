@@ -19,7 +19,8 @@ SRC=app/src/com/dafeiyu/controller
 PURE="$SRC/Json.java $SRC/NapCatClient.java $SRC/Deployer.java \
 $SRC/DeployConfig.java $SRC/Knobs.java $SRC/Totp.java $SRC/ChatSetup.java \
 $SRC/PresetCrypto.java $SRC/Preset.java $SRC/Tunnel.java $SRC/ManagerClient.java \
-$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java $SRC/QrLayout.java"
+$SRC/ProxyTransport.java $SRC/WebProxyPath.java $SRC/ApiGuide.java $SRC/RobotFilter.java $SRC/QrLayout.java \
+$SRC/Protocols.java"
 
 for f in $PURE; do
   [ -f "$f" ] || { echo "缺源码：$f" >&2; exit 1; }
@@ -86,6 +87,60 @@ fi
 # 这条判据错了的话，用户看到的是「保存成功但依然不回话」。
 if ! python3 test/test-pairing.py; then
   echo "消息通道配对检查未通过：机器人会收不到消息（表现是一个字都不回）。" >&2
+  exit 1
+fi
+
+# 向后兼容：已经在跑的实例升级后必须**一点变化都没有**。
+# 这次改动会重写 AstrBot 的 provider 配置；对「没填协议」的老实例
+# 如果写错了什么，线上正在用的机器人会**同时**不回话，
+# 而用户的第一反应是「你把我的机器人搞坏了」。
+if ! python3 test/test-backward-compat.py; then
+  echo "向后兼容检查未通过：老实例升级后行为可能变了。" >&2
+  exit 1
+fi
+
+# 接口地址的规范化：用户填的各种形状都必须拼出**能用的** URL。
+# 用户是从别家配置复制地址过来的，`/v1` 常常留着；
+# 而各家适配器对 api_base 的处理不同，多一个 /v1 就会拼出 /v1/v1/... 的 404，
+# 报错却指向「地址写错了」—— 用户会去反复改地址，永远改不好。
+if ! python3 test/test-api-base-shapes.py; then
+  echo "地址规范化检查未通过：某些填法会拼出 404 的 URL。" >&2
+  exit 1
+fi
+
+# 「机器人运行中停止不了」的修复接线。
+# 这条 bug 的特征是「逻辑单测全绿、界面就是不给按钮」——
+# View 类不进单测面，只能静态扫。退回原状的话用户依然停不掉机器人。
+if ! python3 test/check-stop-button-wiring.py; then
+  echo "停止按钮接线检查未通过：半死状态下用户又会没有「停止」可用。" >&2
+  exit 1
+fi
+
+# 协议表里的每一项都必须**真实存在**于 AstrBot。
+# 这条抓到过一个真 bug：表里混进了 "mirarouter_chat_completion"，
+# 而生产 AstrBot 里根本没有这个适配器（全库 grep 零命中）。
+# 后果是「选了就坏」：AstrBot 加载失败，App 却显示「保存成功」，
+# 机器人再也不回话 —— 用户会一直去改 API Key，永远查不到病根。
+if ! python3 test/check-protocol-adapters.py; then
+  echo "协议适配器检查未通过：给了用户一个「选了就坏」的选项。" >&2
+  exit 1
+fi
+
+# provider 名必须和 AstrBot 官方模板一致。
+# 这个字段不参与适配器查找，所以写错**不会报错** ——
+# 它只决定厂商专属的请求改写是否生效（静默少一层兼容修正）。
+if ! python3 test/check-protocol-providers.py; then
+  echo "provider 名与官方模板不一致（不会报错，但会静默少一层厂商修正）。" >&2
+  exit 1
+fi
+
+# 接口协议与自定义请求体的接线。
+# 这一项防的是「服务器加了参数、App 没提交」这类断线 ——
+# 用户看到「保存成功」，实际协议没变、参数没生效，而且界面上
+# 完全看不出区别。还顺带核对 App 与服务器两份协议表必须一致
+# （不一致时用户会选到服务器不认的协议，或根本选不到某个协议）。
+if ! python3 test/check-protocol-wiring.py; then
+  echo "协议接线检查未通过：用户选了协议/填了参数，但根本没生效。" >&2
   exit 1
 fi
 

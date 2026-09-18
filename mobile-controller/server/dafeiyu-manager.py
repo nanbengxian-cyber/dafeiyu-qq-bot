@@ -1165,7 +1165,8 @@ def write_persona_db(name, persona_id, prompt):
 
 def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
                  lock_password="", vision_base="", vision_key="",
-                 vision_model=""):
+                 vision_model="", protocol="", extra_body="",
+                 vision_protocol="", vision_extra_body=""):
     """把配置写进实例的 AstrBot。
 
     写之前先备份原文件；写之后**回读校验**（生产机的教训：写完不读回，
@@ -1181,6 +1182,16 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         是生产机一直在用的做法（省钱且效果好）；
       * 用户升级前已经在用文本 API 了，不该逼他换掉。
     所以：不填 vision_* 就完全不动多模态配置，保持原样。
+
+    protocol：接口协议（PROTOCOLS 里的键）。空 = 沿用已保存的，
+    实例上也没保存过 = 默认 OpenAI 兼容。
+    ★ 为什么它必须是可选项：同一个地址可能只认某一种协议
+    （Anthropic 原生 / Gemini 原生 / OpenAI Responses），
+    选错就 404/400，而报错会指向「地址写错了」或「请求不合法」，
+    把用户带去改完全无关的东西。
+
+    extra_body：自定义请求体，一段 JSON 文本（如 {"temperature":0.7}）。
+    空 = 沿用已保存的；要清空得显式传 "{}"。
     """
     # 检查顺序有讲究，按「最可能出错 + 最便宜」排：
     #   ① 先校验用户填的内容 —— 输错 QQ 号是最常见的情况，且不用碰磁盘；
@@ -1188,6 +1199,24 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
     #   ③ 最后看配置有没有生成（需要实例启动过一次）。
     gids = normalize_ids(groups, "群号")
     fids = normalize_ids(friends, "私聊 QQ 号")
+
+    # 协议先规范化（不认识就报错，别等到写进配置后加载失败）。
+    # 空 = 沿用已保存的；实例上没配过 = 默认值（老用户升级上来无感）。
+    if protocol:
+        use_proto = normalize_protocol(protocol)
+    else:
+        use_proto = protocol_of(name)
+
+    # 自定义请求体：先解析 + 防呆。
+    # 空串 = 沿用已保存的；"{}" = 清空。
+    if (extra_body or "").strip():
+        new_extra, extra_warns = parse_extra_body(extra_body)
+        use_extra = new_extra
+        extra_touched = True
+    else:
+        use_extra = extra_body_of(name, "main")
+        extra_warns = []
+        extra_touched = False
 
     api_any = bool(api_base or api_key or api_model)
     if api_any:
@@ -1243,6 +1272,24 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
     # 沿用旧地址会配出一个「新模型名 + 旧地址」的坏组合，
     # 报错信息还会指向模型名，把人带偏。
     vision_any = bool(vision_base or vision_key or vision_model)
+    # 识图协议：空 = 沿用已保存的。
+    # 注意这里**不**跟着主协议走 —— 识图常常是另一家（如主聊天用中转站、
+    # 识图用智谱官方），两套协议可以完全不同。
+    if vision_protocol:
+        use_vproto = normalize_protocol(vision_protocol)
+    elif vision_any:
+        use_vproto = vision_protocol_of(name)
+    else:
+        use_vproto = DEFAULT_PROTOCOL
+    if (vision_extra_body or "").strip():
+        new_vextra, vextra_warns = parse_extra_body(
+            vision_extra_body, "识图 API 的自定义请求体")
+        use_vextra = new_vextra
+        vision_extra_touched = True
+    else:
+        use_vextra = extra_body_of(name, "vision")
+        vextra_warns = []
+        vision_extra_touched = False
     if vision_any:
         _vb, _vk, _vm = _vision_api_of(name)
         if not vision_key:
@@ -1276,7 +1323,8 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
                                "如果这个模型本身就能识图，直接把它填在"
                                "「主聊天 API」那里就行。")
 
-    if not (gids or fids or api_any or has_persona or vision_any):
+    if not (gids or fids or api_any or has_persona or vision_any
+            or extra_touched or vision_extra_touched):
         raise ManagerError("没填任何要改的内容。")
 
     load_meta(name)  # 实例不存在 → 在这里就报清楚
@@ -1369,13 +1417,22 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
     if api_base and api_key and api_model:
         src_id = "dafeiyu-main_source"
         pid = "dafeiyu-main"
+        # 协议决定 type/provider 两个字段。
+        # ★ type 是 AstrBot 查适配器的键（manager.py:700），
+        #   写错就是加载失败，而报错只有一行 traceback。
+        #   所以我们只从 PROTOCOLS 这张**已验证过存在**的表里取值，
+        #   绝不把用户输入的字符串直接写进去。
+        proto_meta = PROTOCOLS[use_proto]
         src = {
             "id": src_id,
-            "provider": "openai",
-            "type": "openai_chat_completion",
+            "provider": proto_meta["provider"],
+            "type": use_proto,
             "provider_type": "chat_completion",
             "key": [api_key],
-            "api_base": api_base,
+            # 地址按协议规范化：Anthropic 适配器内部会 removesuffix("/v1")
+            # （anthropic_source.py:98），存进去的必须是它期望的形状，
+            # 否则 App 回显的地址和实际用的地址不一致，用户会以为自己填错了。
+            "api_base": normalize_api_base(api_base, use_proto),
             "timeout": 120,
             "proxy": "",
             "custom_headers": {},
@@ -1386,8 +1443,12 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
             "provider_source_id": src_id,
             "enable": True,
             "model": api_model,
+            # ★ 识图能力靠 modalities 声明；文本模型必须**没有** image，
+            #   否则 AstrBot 会把图丢给它（它看不懂，只会瞎猜）。
             "modalities": ["text", "tool_use"],
-            "custom_extra_body": {},
+            # 用户自定义请求体：直接并进真实请求
+            # （openai_source.py:552-555）。空 dict 是合法值。
+            "custom_extra_body": use_extra,
         }
         # ★ 顺序很重要：把我们的 provider 放在**第一个**。
         #
@@ -1409,7 +1470,27 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         # 老版本（4.27 及以前）认这个键，写上没坏处；
         # 新版本会在启动时把它删掉，那时靠上面的顺序生效。
         cfg.setdefault("provider_settings", {})["default_provider_id"] = pid
-        changed.append("主聊天 API（%s）" % api_model)
+        changed.append("主聊天 API（%s · %s）"
+                       % (api_model, proto_meta["label"]))
+        if extra_touched:
+            changed.append("自定义请求体（%d 项）" % len(use_extra))
+
+    # ②'' 只改自定义请求体、不动 API 三要素时走这里。
+    #
+    # ★ 为什么必须单独一块：用户很常见的操作是「模型能用了，只想调一下
+    #   temperature」。这时他不会重填地址/Key/模型名，于是上面的块整个跳过，
+    #   use_extra 就白解析了 —— 表现为「提示什么都没填」，而用户明明填了。
+    #   更坏的是「想清空请求体」（传 "{}"）也会走到这里，
+    #   如果这里不处理，他就永远清不掉，只能靠重新填一遍 API 三要素。
+    if extra_touched and not api_any:
+        _provs_now = cfg.get("provider") or []
+        _target = [p for p in _provs_now if p.get("id") == "dafeiyu-main"]
+        if not _target:
+            raise ManagerError(
+                "这个机器人还没配过主聊天 API，没法只改请求体。"
+                "请先把接口地址、API Key、模型名填好。")
+        _target[0]["custom_extra_body"] = use_extra
+        changed.append("自定义请求体（%d 项）" % len(use_extra))
 
     # ②' 识图 API（可选，用户填了才动）
     #
@@ -1428,13 +1509,14 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
     if vision_any:
         vsrc_id = "dafeiyu-vision_source"
         vpid = "dafeiyu-vision"
+        vproto_meta = PROTOCOLS[use_vproto]
         vsrc = {
             "id": vsrc_id,
-            "provider": "openai",
-            "type": "openai_chat_completion",
+            "provider": vproto_meta["provider"],
+            "type": use_vproto,
             "provider_type": "chat_completion",
             "key": [vision_key],
-            "api_base": vision_base,
+            "api_base": normalize_api_base(vision_base, use_vproto),
             "timeout": 120,
             "proxy": "",
             "custom_headers": {},
@@ -1447,7 +1529,7 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
             "model": vision_model,
             # ★ 关键：必须声明 image，AstrBot 就是靠这个字段决定回退的
             "modalities": ["text", "image"],
-            "custom_extra_body": {},
+            "custom_extra_body": use_vextra,
         }
         cfg["provider_sources"] = [s for s in (cfg.get("provider_sources") or [])
                                    if s.get("id") != vsrc_id] + [vsrc]
@@ -1458,7 +1540,10 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         # 不指的话它还是空的，那条路径照样识别不了图。
         cfg.setdefault("provider_settings", {})[
             "default_image_caption_provider_id"] = vpid
-        changed.append("识图 API（%s）" % vision_model)
+        changed.append("识图 API（%s · %s）"
+                       % (vision_model, vproto_meta["label"]))
+        if vision_extra_touched:
+            changed.append("识图 API 自定义请求体（%d 项）" % len(use_vextra))
 
     # ③ 人格提示词
     #
@@ -1619,14 +1704,22 @@ def read_config(name):
         if s.get("id") == "dafeiyu-main_source":
             src = s
     model = ""
+    main_extra = {}
     for p in (cfg.get("provider") or []):
         if p.get("id") == "dafeiyu-main":
             model = p.get("model") or ""
+            eb = p.get("custom_extra_body")
+            if isinstance(eb, dict):
+                main_extra = eb
     # 识图 provider（可能没配）
     vmodel = ""
+    vision_extra = {}
     for p in (cfg.get("provider") or []):
         if p.get("id") == "dafeiyu-vision":
             vmodel = p.get("model") or ""
+            eb = p.get("custom_extra_body")
+            if isinstance(eb, dict):
+                vision_extra = eb
     vsrc = {}
     for s in (cfg.get("provider_sources") or []):
         if s.get("id") == "dafeiyu-vision_source":
@@ -1670,10 +1763,24 @@ def read_config(name):
         # Key 不回显：只告诉 App「有没有配」，避免密钥在网络上往返
         "api_key_set": bool(src.get("key")),
         "api_model": model,
+        # 接口协议：App 用它回填下拉框。老实例没这个字段 → 默认 OpenAI 兼容。
+        "protocol": (src.get("type") if src.get("type") in PROTOCOLS
+                     else DEFAULT_PROTOCOL),
+        # 自定义请求体：转成 JSON 文本回显给 App 的输入框。
+        # 空 dict 也回显成 "{}"（而不是空串）—— 让用户一眼看出
+        # 「当前是空的」而不是「读失败了」，两者在界面上长得一样但含义相反。
+        "extra_body": json.dumps(main_extra, ensure_ascii=False, indent=2)
+                      if main_extra else "",
+        "extra_body_set": bool(main_extra),
         # 识图 API（没配就是空串）。Key 同样不回显。
         "vision_base": vsrc.get("api_base") or "",
         "vision_key_set": bool(vsrc.get("key")),
         "vision_model": vmodel,
+        "vision_protocol": (vsrc.get("type") if vsrc.get("type") in PROTOCOLS
+                            else DEFAULT_PROTOCOL),
+        "vision_extra_body": json.dumps(vision_extra, ensure_ascii=False, indent=2)
+                             if vision_extra else "",
+        "vision_extra_body_set": bool(vision_extra),
         "persona": persona,
         # provider_ok：第一个 provider 就是主聊天 API 才算配好。
         # 不能看 default_provider_id —— 4.28+ 会删掉那个键。
@@ -1702,6 +1809,444 @@ API_PROBE_TIMEOUT = 12
 # 判成「对方返回的不是 JSON，可能不是 OpenAI 兼容接口」。
 # 这个 bug 只在「模型列表特别长」的服务商上出现，本地测小列表根本发现不了。
 MAX_API_BODY = 8 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# 协议表（protocol）
+# ---------------------------------------------------------------------------
+# ★ 为什么要有这张表，而不是让用户自己填一个 type 字符串：
+#
+# AstrBot 用 provider_sources[].type 去 provider_cls_map 里查适配器
+# （provider/manager.py:700 `if provider_config["type"] not in provider_cls_map`）。
+# 查不到就**加载失败**，而报错只有一行 traceback —— 用户在 App 上看到的是
+# 「保存成功」，机器人却再也不回话，完全查不出原因。
+#
+# 更麻烦的是：同一个模型可能只认某一种协议。实测踩过的两类：
+#   * 中转站给的是 Anthropic 原生接口（/v1/messages + x-api-key），
+#     用户按默认的 openai_chat_completion 去填 → 404，报错指向「地址写错了」，
+#     于是他去反复改地址，永远改不好；
+#   * 官方 OpenAI 的 /v1/responses 和 /v1/chat/completions 是两套不同的
+#     请求体，填错就 400。
+#
+# 所以：协议必须是**用户能选的一项**，而且选完要能当场验通。
+#
+# 表里每个协议描述四件事：
+#   provider : 写进 provider_sources[].provider 的值（AstrBot 用它做二次分组）
+#   label    : 给用户看的名字（不写英文 type 字符串 —— 那是给机器看的）
+#   auth     : 鉴权方式，决定探测时怎么带 Key
+#   kind     : 请求体形状，决定探测时发什么 payload、打哪个路径
+PROTOCOLS = {
+    "openai_chat_completion": {
+        "label": "OpenAI 兼容（最常见，选这个就对了）",
+        "provider": "openai",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "绝大多数中转站、DeepSeek、Kimi、智谱、通义都用这个。",
+    },
+    "anthropic_chat_completion": {
+        "label": "Anthropic 原生（Claude 官方 / Claude 中转）",
+        "provider": "anthropic",
+        "auth": "x-api-key",
+        "kind": "anthropic",
+        "hint": "接口地址填到域名即可，程序会自己补 /v1/messages。",
+    },
+    "googlegenai_chat_completion": {
+        "label": "Google Gemini 原生",
+        # ★ 必须是 "google"，不是 "googlegenai"。
+        #   依据是 AstrBot 自己的配置模板（core/config/default.py 里
+        #   "Google Gemini" 那一项的 provider 就是 "google"）。
+        #   这个字段**不参与适配器查找**（查找用 type，见 manager.py:700），
+        #   所以写错不会加载失败 —— 但它决定**厂商专属的请求改写**是否生效
+        #   （openai_source.py:412 按它判 nvidia/ollama，
+        #    openai_responses_source.py:77 判 deepseek）。
+        #   写错的后果是「静默少了一层兼容修正」，用户在界面上完全看不出来。
+        "provider": "google",
+        "auth": "x-goog-api-key",
+        "kind": "gemini",
+        "hint": "Gemini 官方接口。国内直连不通，需要能出国的服务器。",
+    },
+    "openai_responses": {
+        "label": "OpenAI Responses（官方新接口）",
+        "provider": "openai",
+        "auth": "bearer",
+        "kind": "openai_responses",
+        "hint": "只有官方 /v1/responses 才用这个。填成聊天接口会 400。",
+    },
+    "zhipu_chat_completion": {
+        "label": "智谱 GLM",
+        "provider": "zhipu",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "智谱官方接口，走 OpenAI 兼容格式。",
+    },
+    "groq_chat_completion": {
+        "label": "Groq",
+        "provider": "groq",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "Groq 官方接口，速度很快。",
+    },
+    "openrouter_chat_completion": {
+        "label": "OpenRouter",
+        "provider": "openrouter",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "OpenRouter 官方接口，一个 Key 用很多家模型。",
+    },
+    "xai_chat_completion": {
+        "label": "xAI Grok",
+        "provider": "xai",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "xAI 官方接口。",
+    },
+    "xiaomi_chat_completion": {
+        "label": "小米 MiMo",
+        "provider": "xiaomi",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "小米官方接口。",
+    },
+    "kimi_code_chat_completion": {
+        "label": "Kimi Code（Anthropic 格式）",
+        # ★ 对齐官方模板：AstrBot 的 "Kimi Coding Plan" 用的是 "kimi-code"
+        #   （带连字符），不是 "anthropic"。
+        #   虽然鉴权和请求体形状确实和 Anthropic 一样（所以 auth/kind 不变），
+        #   但 provider 名要和官方一致 —— 否则以后 AstrBot 按 provider
+        #   加厂商专属逻辑时，用 Kimi 的用户会静默漏掉那层修正。
+        "provider": "kimi-code",
+        "auth": "x-api-key",
+        "kind": "anthropic",
+        "hint": "Kimi 的 Anthropic 兼容端点。",
+    },
+    "longcat_chat_completion": {
+        "label": "美团 LongCat",
+        "provider": "longcat",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "LongCat 官方接口。",
+    },
+    "aihubmix_chat_completion": {
+        "label": "AiHubMix",
+        "provider": "aihubmix",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "AiHubMix 中转站。",
+    },
+    # ★ 这里原来有一项 "mirarouter_chat_completion"，**已删除**（2026-09-18）。
+    #   原因：生产 AstrBot（/AstrBot/astrbot/core/provider/sources/）里
+    #   **根本没有这个适配器** —— 全库 grep "mirarouter" 零命中。
+    #   它是从一份过时的适配器清单里抄进来的（那份清单还多算了它一个）。
+    #
+    #   为什么这个错误特别危险：
+    #     AstrBot 用 type 去 provider_cls_map 里查适配器
+    #     （provider/manager.py:700），查不到就**加载失败**，
+    #     而报错只有一行 traceback —— 用户在 App 上看到「保存成功」，
+    #     机器人却再也不回话，完全查不出原因。
+    #     换句话说：**提供一个不存在的协议 = 给用户埋一个「选了就坏」的选项。**
+    #
+    #   所以协议表的每一项都必须能在真实 AstrBot 里找到对应适配器，
+    #   这条现在由 test/check-protocol-adapters.py 对着真实源码钉住。
+    "ssycloud_chat_completion": {
+        "label": "胜算云",
+        "provider": "ssycloud",
+        "auth": "bearer",
+        "kind": "openai_chat",
+        "hint": "胜算云接口。",
+    },
+}
+
+# 默认协议。老用户升级上来没有这个字段 —— 必须当成 OpenAI 兼容，
+# 否则他们的配置会在升级那一刻失效（而他们什么都没改）。
+DEFAULT_PROTOCOL = "openai_chat_completion"
+
+# 探测/写配置时**不能**被用户自定义请求体覆盖的键。
+# 为什么必须拦：custom_extra_body 是直接并进请求体里的
+# （openai_source.py:552-555 `extra_body.update(custom_extra_body)`），
+# 覆盖了 model 就等于换模型、覆盖了 messages 就等于把用户的提问整条换掉。
+# 这类错误在界面上完全看不出来，只会表现为「机器人答非所问」。
+#
+# ★ 这里**故意不含** temperature / max_tokens / top_p ——
+#   它们恰恰是用户最需要调的东西（AstrBot 自己的 schema 就把它们
+#   列为 custom_extra_body 的示例）。把它们拦掉等于把「自定义请求体」
+#   这个功能做废。要拦的只是那些会破坏对话结构本身的键。
+RESERVED_BODY_KEYS = {
+    "model", "messages", "input", "contents", "stream", "tools",
+    "tool_choice", "system",
+}
+
+
+def protocol_of(name):
+    """读回实例当前用的是哪种协议。没配过 = 默认 OpenAI 兼容。"""
+    path = astrbot_cfg_path(name)
+    if not os.path.exists(path):
+        return DEFAULT_PROTOCOL
+    try:
+        cfg = read_json_maybe_bom(path)
+    except Exception:  # noqa: BLE001
+        return DEFAULT_PROTOCOL
+    for s in (cfg.get("provider_sources") or []):
+        if s.get("id") == "dafeiyu-main_source":
+            t = s.get("type") or ""
+            return t if t in PROTOCOLS else DEFAULT_PROTOCOL
+    return DEFAULT_PROTOCOL
+
+
+def normalize_protocol(value):
+    """把用户传上来的协议名规范化。空 = 默认；不认识 = 报错说清楚有哪些。"""
+    p = (value or "").strip()
+    if not p:
+        return DEFAULT_PROTOCOL
+    if p in PROTOCOLS:
+        return p
+    raise ManagerError(
+        "不认识的接口协议「%s」。可选的有：%s。"
+        % (p, "、".join(sorted(PROTOCOLS))))
+
+
+def normalize_api_base(base, protocol):
+    """按协议把接口地址规范成**能直接用**的形状。
+
+    ★ 这是踩出来的：Anthropic 的适配器会做 `removesuffix("/v1")`
+    （anthropic_source.py:98），所以用户按别家的习惯填成
+    `https://api.anthropic.com/v1` 时，程序内部变成 `https://api.anthropic.com`，
+    再拼 `/v1/messages` —— 结果是对的。
+    但如果用户在 App 里、或者在我们自己的探测里也照着「带 /v1」去拼，
+    就会拼出 `/v1/v1/messages` 这种 404。
+    所以地址的规范化必须**跟适配器的真实行为对齐**，两边不能各写一套。
+
+    Gemini 那边则是去掉结尾的 `/`（gemini_source.py:75-76）。
+    """
+    b = (base or "").strip()
+    if not b:
+        return b
+    if protocol in ("anthropic_chat_completion", "kimi_code_chat_completion"):
+        # 对齐 anthropic_source：先去掉结尾 /，再去掉结尾 /v1
+        b = b.rstrip("/")
+        if b.endswith("/v1"):
+            b = b[:-3]
+        return b
+    if protocol == "googlegenai_chat_completion":
+        # Gemini 官方模板的地址是 https://generativelanguage.googleapis.com/
+        # （**不带** /v1，见 AstrBot 的 core/config/default.py）。
+        # 而程序自己拼路径时会补 /v1beta/...。
+        #
+        # ★ 必须把用户可能多填的版本段剥掉，否则拼出
+        #   `/v1/v1beta/models/...` 这种 404。
+        #   为什么用户**一定会**多填：他多半是从别家（OpenAI 兼容）的
+        #   配置复制过来的，那边习惯是 `https://xxx/v1`；切到 Gemini 时
+        #   地址栏里那个 /v1 很容易留着。
+        #   而 404 的报错会指向「地址写错了」，他会去反复改地址，永远改不好。
+        #   实测（修复前）：https://x.example/v1
+        #     → https://x.example/v1/v1beta/models/m:generateContent  ← 404
+        b = b.rstrip("/")
+        for suffix in ("/v1beta", "/v1"):
+            if b.endswith(suffix):
+                b = b[: -len(suffix)]
+                break
+        return b.rstrip("/")
+    return b
+
+
+def protocol_endpoint(base, protocol, which, model=""):
+    """按协议拼出真正要请求的 URL。
+
+    which: "chat"（发一次真实请求）/ "models"（拉模型列表）
+    model: 只有 Gemini 的 chat 路径需要它（模型名在路径里）。
+    返回 None 表示这个协议没有这个端点（比如 Responses 没有 /models）。
+    """
+    b = normalize_api_base(base, protocol)
+    kind = PROTOCOLS[protocol]["kind"]
+    if kind == "openai_chat":
+        return b + ("/chat/completions" if which == "chat" else "/models")
+    if kind == "openai_responses":
+        # Responses 接口没有 /models（那是另一个端点），只探 chat。
+        return b + "/responses" if which == "chat" else None
+    if kind == "anthropic":
+        # 对齐 anthropic_source 的 base_url（已去掉 /v1）+ SDK 自己拼的路径
+        return b + ("/v1/messages" if which == "chat" else "/v1/models")
+    if kind == "gemini":
+        if which == "models":
+            return b + "/v1beta/models"
+        # ★ Gemini 的模型名在**路径**里，不是请求体字段：
+        #   POST /v1beta/models/{model}:generateContent
+        # 没有模型名就拼不出这个 URL。
+        if not model:
+            return None
+        return b + "/v1beta/models/%s:generateContent" % model
+    return None
+
+
+def protocol_probe_payload(protocol, model):
+    """按协议造一个**最小**的探测请求体。
+
+    每家要的字段名都不一样（messages / input / contents），
+    拿 OpenAI 的请求体去问 Anthropic 只会拿到 400，
+    而 400 的报错会指向「请求不合法」，把用户带偏到完全无关的方向。
+    """
+    kind = PROTOCOLS[protocol]["kind"]
+    if kind == "openai_chat":
+        return {"model": model, "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1, "stream": False}
+    if kind == "openai_responses":
+        return {"model": model, "input": "hi", "max_output_tokens": 16,
+                "stream": False}
+    if kind == "anthropic":
+        # Anthropic 的 max_tokens 是**必填**（不填直接 400），所以这里必须给。
+        return {"model": model, "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}]}
+    if kind == "gemini":
+        return {"contents": [{"parts": [{"text": "hi"}]}],
+                "generationConfig": {"maxOutputTokens": 16}}
+    return {"model": model, "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1}
+
+
+def protocol_headers(protocol, key):
+    """按协议造鉴权头。
+
+    ★ 这里必须分开写，不能一律 Bearer：
+    Anthropic 收 Bearer 会返回 401，而 401 在我们的报错表里对应
+    「Key 不对」—— 于是用户会去重新复制一个**完全正确**的 Key，
+    复制十遍也没用。错的是鉴权方式，不是 Key。
+    """
+    auth = PROTOCOLS[protocol]["auth"]
+    h = {"Accept": "application/json"}
+    if auth == "bearer":
+        h["Authorization"] = "Bearer %s" % key
+    elif auth == "x-api-key":
+        h["x-api-key"] = key
+        h["anthropic-version"] = "2023-06-01"
+    elif auth == "x-goog-api-key":
+        h["x-goog-api-key"] = key
+    return h
+
+
+def vision_protocol_of(name):
+    """读回识图 API 用的是哪种协议。没配过 = 默认 OpenAI 兼容。
+
+    ★ 单独一个函数而不是复用 protocol_of：识图常常是**另一家**
+    （主聊天用中转站、识图用智谱官方），两套协议互不相干。
+    如果这里错跟了主协议，用户改主 API 的协议会把识图一起改坏，
+    而现象是「文字能聊、图看不懂」—— 极难联想到是主协议改动的副作用。
+    """
+    path = astrbot_cfg_path(name)
+    if not os.path.exists(path):
+        return DEFAULT_PROTOCOL
+    try:
+        cfg = read_json_maybe_bom(path)
+    except Exception:  # noqa: BLE001
+        return DEFAULT_PROTOCOL
+    for s in (cfg.get("provider_sources") or []):
+        if s.get("id") == "dafeiyu-vision_source":
+            t = s.get("type") or ""
+            return t if t in PROTOCOLS else DEFAULT_PROTOCOL
+    return DEFAULT_PROTOCOL
+
+
+def extra_body_of(name, which="main"):
+    """读回用户自定义的请求体参数。没配过就返回 {}。
+
+    which: "main" 读主聊天 API，"vision" 读识图 API。
+    识图那一套也支持自定义请求体 —— 实测有些视觉模型必须显式关掉
+    thinking（reasoning_effort / thinking），不关就只回思考过程、不回正文，
+    表现为「发了图它答非所问」。
+    """
+    pid = "dafeiyu-main" if which == "main" else "dafeiyu-vision"
+    path = astrbot_cfg_path(name)
+    if not os.path.exists(path):
+        return {}
+    try:
+        cfg = read_json_maybe_bom(path)
+    except Exception:  # noqa: BLE001
+        return {}
+    for p in (cfg.get("provider") or []):
+        if p.get("id") == pid:
+            eb = p.get("custom_extra_body")
+            return dict(eb) if isinstance(eb, dict) else {}
+    return {}
+
+
+def parse_extra_body(raw, label="自定义请求体"):
+    """把用户填的一段 JSON 解析成 dict，并做防呆校验。
+
+    ★ 为什么要校验得这么细，而不是 json.loads 完直接用：
+    这段内容会被**原样并进发给模型的请求体**
+    （openai_source.py:552-555 `extra_body.update(custom_extra_body)`），
+    也就是说用户在这里写的每个字都会影响真实请求。踩过/可预见的坑：
+
+      * 写成 `{"temperature": 0.7,}` 这种尾逗号 → 解析失败，
+        如果只报「JSON 格式错」用户不知道该删哪个逗号，所以要把
+        Python 的原始报错带上（它带行列号）。
+      * 顶层写成数组 `[1,2]` 或字符串 → 不是 dict，update() 会炸，
+        而且是在**机器人回复时**炸，用户完全联系不到是这里填错了。
+      * 覆盖 model / messages → 等于把用户的提问整条换掉，
+        表现为「机器人答非所问」，界面上看不出来。
+      * 值写成字符串 "0.7" → 有些网关直接 400，有些静默按 0 处理。
+
+    返回 (dict, 警告列表)。警告不阻断保存 —— 用户可能有正当理由
+    （比如某个网关要一个非标准字段），但必须让他知道。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return {}, []
+    try:
+        obj = json.loads(s)
+    except ValueError as e:
+        raise ManagerError(
+            "%s不是合法的 JSON：%s。"
+            "常见的错是：用了中文引号「」、多了一个逗号、"
+            "或者忘了给字段名加英文双引号。" % (label, e))
+    if not isinstance(obj, dict):
+        raise ManagerError(
+            "%s要写成一对大括号包起来的字段，比如 {\"temperature\": 0.7}。"
+            "现在填的是一个%s，不是字段表。" % (
+                label,
+                "列表" if isinstance(obj, list) else
+                "数字" if isinstance(obj, (int, float)) and not isinstance(obj, bool)
+                else "字符串" if isinstance(obj, str) else "值"))
+    warns = []
+    for k in list(obj.keys()):
+        if k in RESERVED_BODY_KEYS:
+            raise ManagerError(
+                "%s里不能写「%s」—— 这个字段由程序自己填，"
+                "你在这里写会把它覆盖掉，机器人就会答非所问，"
+                "而且在界面上完全看不出来。请删掉这一项。" % (label, k))
+        if not isinstance(k, str) or not k.strip():
+            raise ManagerError("%s里有空字段名，请删掉。" % label)
+        v = obj[k]
+        if isinstance(v, (dict, list)):
+            continue          # 嵌套结构是合法的（如 thinking、extra_headers）
+        if isinstance(v, str) and v.strip() == "":
+            warns.append("「%s」是空字符串" % k)
+        if isinstance(v, str):
+            try:
+                float(v)
+            except ValueError:
+                pass
+            else:
+                warns.append("「%s」的值被引号包成了字符串（%r）—— "
+                             "数字应该写成不带引号的 %s" % (k, v, v))
+    return obj, warns
+
+
+def _extra_body_for_probe(raw):
+    """探测接口时用的自定义请求体：解析失败就**不当失败**，返回 None。
+
+    ★ 为什么不在这里抛错：用户点的是「测试接口」，不是「保存」。
+    他可能正打到一半（JSON 还没写完）就想先测测地址通不通。
+    这时报「JSON 格式错」会让他以为接口坏了 —— 而他只是没写完。
+    真正要拦的是**保存**那一步（parse_extra_body 在 apply_config 里会拦），
+    那一步不拦才会把坏配置写进机器人。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        obj, _ = parse_extra_body(raw)
+    except ManagerError:
+        return None
+    return obj or None
 
 
 def _vision_api_of(name):
@@ -1840,10 +2385,14 @@ def _api_error_hint(e, base=""):
     return "连不上：%s" % s
 
 
-def _api_request(url, key, payload=None):
-    """向 API 发一次请求。返回 (状态码, 响应体文本)。异常原样抛出给调用方翻译。"""
+def _api_request(url, key, payload=None, protocol=DEFAULT_PROTOCOL):
+    """向 API 发一次请求。返回 (状态码, 响应体文本)。异常原样抛出给调用方翻译。
+
+    ★ 鉴权头按协议走（见 protocol_headers）—— 不能一律 Bearer，
+    否则 Anthropic 会返回 401，被我们翻译成「Key 不对」，让用户白折腾。
+    """
     data = None
-    headers = {"Authorization": "Bearer %s" % key, "Accept": "application/json"}
+    headers = protocol_headers(protocol, key)
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -1870,7 +2419,35 @@ def _join_api(base, path):
     return b + path
 
 
-def list_api_models(name, base="", key=""):
+def _models_from_body(protocol, body):
+    """从各家**形状完全不同**的模型列表响应里挑出模型名。
+
+    不分开写的话，Gemini 的 {"models":[{"name":"models/gemini-2.0-flash"}]}
+    会被当成「对方没给模型列表」，用户于是只能手填 —— 而手填正是
+    最容易错的那一步（多一个空格、少一个 -preview 就 404）。
+    """
+    obj = json.loads(body)
+    kind = PROTOCOLS[protocol]["kind"]
+    ids = []
+    if kind == "gemini":
+        for m in (obj.get("models") or []):
+            if isinstance(m, dict) and m.get("name"):
+                # Gemini 返回的是 "models/gemini-2.0-flash"，调用时要的是后半段
+                ids.append(str(m["name"]).split("/")[-1])
+    elif kind == "anthropic":
+        for m in (obj.get("data") or []):
+            if isinstance(m, dict) and m.get("id"):
+                ids.append(str(m["id"]))
+    else:
+        for m in (obj.get("data") or []):
+            if isinstance(m, dict) and m.get("id"):
+                ids.append(str(m["id"]))
+            elif isinstance(m, str):
+                ids.append(m)
+    return ids
+
+
+def list_api_models(name, base="", key="", protocol=""):
     """拉取这个 API 支持的模型列表。
 
     base/key 传空则用实例里已保存的 —— 这样「还没保存就想先看看有哪些模型」
@@ -1881,7 +2458,13 @@ def list_api_models(name, base="", key=""):
     但 /chat/completions 用同样的无效 Key 返回 401。
     所以「拉得到模型列表」只证明**地址通**，不证明 Key 可用 ——
     真正验 Key 要用 probe_api 里那次真实聊天调用。
+
+    protocol 决定打哪个端点、怎么带 Key、怎么解析返回：
+    Gemini 的列表在 {"models":[...]} 里且名字带 "models/" 前缀，
+    Anthropic 的鉴权头是 x-api-key 而不是 Bearer —— 一律按 OpenAI 处理的话，
+    前者会「拉不到列表」，后者会「Key 不对」，两种都会把用户带偏。
     """
+    proto = normalize_protocol(protocol) if protocol else protocol_of(name)
     saved_base, saved_key, _ = _main_api_of(name)
     use_base = (base or "").strip() or saved_base
     use_key = (key or "").strip() or saved_key
@@ -1889,9 +2472,13 @@ def list_api_models(name, base="", key=""):
         raise ManagerError("还没填接口地址。")
     if not use_key:
         raise ManagerError("还没填 API Key。")
-    url = _join_api(use_base, "/models")
+    url = protocol_endpoint(use_base, proto, "models")
+    if not url:
+        # 这个协议没有独立的「列模型」端点（如 Responses）。
+        # 不报错 —— 那会挡住用户保存。返回空列表让他手填。
+        return []
     try:
-        code, body = _api_request(url, use_key)
+        code, body = _api_request(url, use_key, protocol=proto)
     except ManagerError:
         raise
     except Exception as e:  # noqa: BLE001
@@ -1899,10 +2486,13 @@ def list_api_models(name, base="", key=""):
 
     if code in (401, 403):
         raise ManagerError("能连上这个地址，但 API Key 不对（对方返回 %d）。"
-                           "检查 Key 有没有复制全、有没有多余空格。" % code)
+                           "检查 Key 有没有复制全、有没有多余空格；"
+                           "也要确认「接口协议」选对了 —— 选错协议时"
+                           "对方也会说 Key 不对。" % code)
     if code == 404:
-        raise ManagerError("能连上，但这个地址没有 /models 接口（404）。"
-                           "多半是地址写得不完整 —— 检查结尾是不是少了 /v1。")
+        raise ManagerError("能连上，但这个地址没有模型列表接口（404）。"
+                           "多半是地址写得不完整 —— 检查结尾是不是少了 /v1，"
+                           "或者「接口协议」选得不对。")
     if code == 429:
         raise ManagerError("能连上，但被限流了（429）。等一会儿再试，或检查额度。")
     if code >= 500:
@@ -1911,24 +2501,18 @@ def list_api_models(name, base="", key=""):
         raise ManagerError("对方返回了 %d，没能取到模型列表。" % code)
 
     try:
-        obj = json.loads(body)
+        ids = _models_from_body(proto, body)
     except ValueError:
         raise ManagerError("能连上，但对方返回的不是 JSON —— 这个地址可能不是 "
-                           "OpenAI 兼容接口。")
+                           "%s 接口。" % PROTOCOLS[proto]["label"])
 
-    ids = []
-    for m in (obj.get("data") or []):
-        if isinstance(m, dict) and m.get("id"):
-            ids.append(str(m["id"]))
-        elif isinstance(m, str):
-            ids.append(m)
     if not ids:
         # 有些网关 /models 返回空列表但实际可用 —— 不当失败，只是没得选。
         return []
     return sorted(set(ids))
 
 
-def _chat_probe(base, key, model):
+def _chat_probe(base, key, model, protocol=DEFAULT_PROTOCOL, extra_body=None):
     """发一次**最小**的真实聊天请求 —— 这是唯一能证明「配置可用」的测试。
 
     为什么非要发聊天请求、不能只看 /models：
@@ -1939,13 +2523,33 @@ def _chat_probe(base, key, model):
          这正是新手最常犯的错；
       ③ 用 max_tokens=1 让成本可以忽略。
 
+    ★ 按协议发对应的请求体和鉴权头：拿 OpenAI 的
+    {"messages":[…]} 去问 Anthropic 只会拿到 400，
+    而 400 的报错指向「请求不合法」，会把用户带去改完全无关的东西。
+    extra_body 是用户自定义的请求体，这里也一起带上 ——
+    否则「自定义了参数却测通、真跑起来 400」这种最难查的情况就会发生。
+
     返回 (ok, 说明文字)。ok=False 时说明文字已经是给人看的话。
     """
-    url = _join_api(base, "/chat/completions")
-    payload = {"model": model, "messages": [{"role": "user", "content": "hi"}],
-               "max_tokens": 1, "stream": False}
+    proto = normalize_protocol(protocol)
+    url = protocol_endpoint(base, proto, "chat", model)
+    if not url:
+        # 拼不出 URL（如 Gemini 没给模型名）。此时**不能**返回 ok=True ——
+        # 那是没根据的假绿灯：用户会看到「通了 ✓」然后发现机器人不回话。
+        # 也**不能**返回 False：那会把「我们测不了」说成「你的配置坏了」。
+        # 正确做法是抛一个 ManagerError，让 probe_api 如实转述，
+        # 并且**不**把它算成认证失败。
+        raise ManagerError(
+            "这个协议（%s）的地址里要带模型名，所以必须先填模型名才能测。"
+            % PROTOCOLS[proto]["label"])
+    payload = protocol_probe_payload(proto, model)
+    if extra_body:
+        # 探测时不覆盖 model —— 探测必须问的是用户填的那个模型。
+        for k, v in extra_body.items():
+            if k not in ("model", "messages", "input", "contents"):
+                payload[k] = v
     try:
-        code, body = _api_request(url, key, payload)
+        code, body = _api_request(url, key, payload, protocol=proto)
     except ManagerError:
         raise
     except Exception as e:  # noqa: BLE001
@@ -1954,8 +2558,9 @@ def _chat_probe(base, key, model):
     if code == 200:
         return True, ""
     if code in (401, 403):
-        return False, ("Key 不对（对方返回 %d）。检查有没有复制全、"
-                       "有没有多余空格。" % code)
+        return False, ("Key 不对，或者「接口协议」选错了（对方返回 %d）。"
+                       "先确认协议选的是不是这一家的官方协议，"
+                       "再检查 Key 有没有复制全、有没有多余空格。" % code)
     if code == 404:
         # 404 有两种可能：地址不对，或模型名不对 —— 看对方怎么说。
         low = body.lower()
@@ -1963,7 +2568,8 @@ def _chat_probe(base, key, model):
             return False, ("接口地址是对的，但对方不认识「%s」这个模型名。"
                            "点「获取可用模型」从列表里挑一个。" % model)
         return False, ("这个地址没有聊天接口（404）—— 地址多半写得不完整，"
-                       "检查结尾是不是少了 /v1。")
+                       "检查结尾是不是少了 /v1；如果地址是对的，"
+                       "那就是「接口协议」选错了。")
     if code == 400:
         low = body.lower()
         if "model" in low:
@@ -1980,14 +2586,20 @@ def _chat_probe(base, key, model):
     return False, "对方返回 %d：%s" % (code, body[:200])
 
 
-def probe_api(name, base="", key="", model=""):
+def probe_api(name, base="", key="", model="", protocol="", extra_body=None):
     """测主聊天 API 到底通不通。返回一份给人看的结论。
 
     结论分三层，分开说 —— 混成一句「失败」用户就不知道下一步做什么：
       reachable : 服务器能不能连上这个地址（网络层）
       auth_ok   : Key 对不对（认证层）
       model_ok  : 模型名在不在对方的列表里（配置层）
+
+    ★ 第四层是「协议对不对」：地址通、Key 对、模型名对，
+    但协议选错（拿 OpenAI 的请求体去问 Anthropic）照样跑不起来，
+    而报错会指向「请求不合法」。所以这里把协议也一起验，
+    并且把选用的协议回显给用户，让他能对照官网确认。
     """
+    proto = normalize_protocol(protocol) if protocol else protocol_of(name)
     saved_base, saved_key, saved_model = _main_api_of(name)
     use_base = (base or "").strip() or saved_base
     use_key = (key or "").strip() or saved_key
@@ -2001,6 +2613,11 @@ def probe_api(name, base="", key="", model=""):
         "model_count": 0,
         "message": "",
         "api_base": use_base,
+        "protocol": proto,
+        "protocol_label": PROTOCOLS[proto]["label"],
+        # 回显规范化后的地址 —— Anthropic 会去掉结尾的 /v1，
+        # 用户看到这个才知道自己填的地址最终被用成了什么。
+        "api_base_effective": normalize_api_base(use_base, proto),
     }
 
     if not use_base:
@@ -2016,7 +2633,7 @@ def probe_api(name, base="", key="", model=""):
     #    所以不能拿它的成功来宣布「Key 没问题」（那会是假绿灯）。
     models = []
     try:
-        models = list_api_models(name, use_base, use_key)
+        models = list_api_models(name, use_base, use_key, proto)
         out["reachable"] = True
         out["models"] = models
         out["model_count"] = len(models)
@@ -2055,7 +2672,7 @@ def probe_api(name, base="", key="", model=""):
         return out
 
     try:
-        ok, why = _chat_probe(use_base, use_key, use_model)
+        ok, why = _chat_probe(use_base, use_key, use_model, proto, extra_body)
     except ManagerError as e:
         out["message"] = str(e)
         return out
@@ -2063,7 +2680,8 @@ def probe_api(name, base="", key="", model=""):
     if ok:
         out["auth_ok"] = True
         out["model_ok"] = True
-        out["message"] = "通了 ✓ 接口、Key、模型名都对，机器人可以用了。"
+        out["message"] = ("通了 ✓ 接口、Key、模型名、协议都对，机器人可以用了。"
+                          "（当前协议：%s）" % PROTOCOLS[proto]["label"])
         return out
 
     # 失败：分清是 Key 的问题还是模型名的问题 —— 用户要改的地方不一样。
@@ -2130,78 +2748,46 @@ _VISION_REFUSAL_WORDS = (
 )
 
 
-def probe_vision(name, base="", key="", model="", saved=None):
-    """测「多模态（识图）API」能不能真的看图。返回给人看的结论。
+def _vision_payload(protocol, model, png_b64, prompt):
+    """按协议造「带图提问」的请求体。
 
-    比测聊天 API 多一层，而且这层才是关键：
-      reachable       : 服务器能不能连上这个地址
-      auth_ok         : Key 对不对
-      vision_capable  : **它到底能不能看图** ← 用户真正要的答案
-
-    ★ 为什么必须实测、不能靠「模型名看着像」或「/models 里有它」：
-      很多 OpenAI 兼容网关会把不识图的模型也列出来，甚至**默默接受**
-      带图片的请求、然后完全忽略图片只回文字。用户以为自己配好了识图，
-      实际上机器人一直在瞎猜 —— 这正是要防的呆。
-      唯一可靠的办法：给一张**随机颜色的纯色图**，问它什么颜色。
-      真能看图的必然答对；假装能看的会答错或说看不到。
+    ★ 图片在三种协议里的表示**完全不同**：
+      OpenAI 兼容 : content 数组里的 {"type":"image_url","image_url":{"url":"data:…"}}
+      Anthropic   : content 数组里的 {"type":"image","source":{"type":"base64",…}}
+      Gemini      : parts 里的 {"inline_data":{"mime_type":…,"data":…}}
+    拿 OpenAI 的形状去问 Anthropic/Gemini，对方会返回 400 说「请求不合法」，
+    而我们的报错表会把 400 解释成「它不接受图片」—— 于是用户被引导去
+    换一个**本来没问题**的识图模型，白折腾一圈还是不行。
     """
-    saved = saved or {}
-    use_base = (base or "").strip() or saved.get("api_base", "")
-    use_key = (key or "").strip() or saved.get("api_key", "")
-    use_model = (model or "").strip() or saved.get("api_model", "")
-
-    out = {
-        "reachable": False,
-        "auth_ok": False,
-        "vision_capable": None,   # None = 没能测出来
-        "models": [],
-        "model_count": 0,
-        "message": "",
-        "api_base": use_base,
-        "tested_color": "",
-        "answered": "",
-    }
-
-    if not use_base:
-        out["message"] = "还没填接口地址。"
-        return out
-    if not use_key:
-        out["message"] = "还没填 API Key。"
-        return out
-    if not use_model:
-        out["message"] = "还没填模型名。识图模型的名字通常带 vision 字样，请照官网文档填。"
-        return out
-
-    # ① 模型列表：只用来判断「地址通不通」和给用户挑名字，不当作能力证明。
-    try:
-        out["models"] = list_api_models(name, use_base, use_key)
-        out["reachable"] = True
-        out["model_count"] = len(out["models"])
-    except ManagerError as e:
-        msg = str(e)
-        out["reachable"] = ("能连上" in msg)
-        if not out["reachable"]:
-            out["message"] = msg
-            return out
-        if "API Key 不对" in msg:
-            out["message"] = msg
-            return out
-    except Exception as e:  # noqa: BLE001
-        out["message"] = _api_error_hint(e, use_base)
-        return out
-
-    # ② 真正的能力测试：随机挑个颜色，造图，问它。
-    rgb, names = secrets.choice(_VISION_COLORS)
-    out["tested_color"] = names[0]  # names = (中文名, 同义词元组)
-    png_b64 = base64.b64encode(_make_test_png(rgb)).decode("ascii")
-
-    payload = {
-        "model": use_model,
+    kind = PROTOCOLS[protocol]["kind"]
+    if kind == "anthropic":
+        return {"model": model, "max_tokens": 1000, "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png",
+                    "data": png_b64}},
+            ]}]}
+    if kind == "gemini":
+        return {"contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": png_b64}},
+        ]}], "generationConfig": {"maxOutputTokens": 1000}}
+    if kind == "openai_responses":
+        return {"model": model, "max_output_tokens": 1000, "input": [{
+            "role": "user", "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image",
+                 "image_url": "data:image/png;base64," + png_b64},
+            ]}]}
+    # OpenAI 兼容（默认）
+    return {
+        "model": model,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text",
-                 "text": "这张图是什么颜色？只回答颜色名称，不要别的字。"},
+                {"type": "text", "text": prompt},
                 {"type": "image_url",
                  "image_url": {"url": "data:image/png;base64," + png_b64}},
             ],
@@ -2225,16 +2811,141 @@ def probe_vision(name, base="", key="", model="", saved=None):
         "stream": False,
     }
 
+
+def _vision_text_of(protocol, body):
+    """从各协议的响应里取出模型说的话。取不到返回 ""。"""
+    kind = PROTOCOLS[protocol]["kind"]
     try:
-        code, body = _api_request(_join_api(use_base, "/chat/completions"),
-                                  use_key, payload)
+        data = json.loads(body)
+    except ValueError:
+        return ""
+    if kind == "anthropic":
+        parts = data.get("content") or []
+        return " ".join(str(b.get("text", "")) for b in parts
+                        if isinstance(b, dict) and b.get("type") == "text").strip()
+    if kind == "gemini":
+        cands = data.get("candidates") or []
+        if not cands:
+            return ""
+        parts = ((cands[0] or {}).get("content") or {}).get("parts") or []
+        return " ".join(str(p.get("text", "")) for p in parts
+                        if isinstance(p, dict)).strip()
+    if kind == "openai_responses":
+        # Responses 的正文在 output[].content[].text
+        out = []
+        for item in (data.get("output") or []):
+            if not isinstance(item, dict):
+                continue
+            for c in (item.get("content") or []):
+                if isinstance(c, dict) and c.get("text"):
+                    out.append(str(c["text"]))
+        if out:
+            return " ".join(out).strip()
+        # 有些网关仍给 output_text
+        return str(data.get("output_text") or "").strip()
+    # OpenAI 兼容
+    ch = (data.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    content = msg.get("content") or ""
+    if isinstance(content, list):
+        # 有些网关把 content 也做成数组
+        content = " ".join(str(c.get("text", "")) if isinstance(c, dict)
+                           else str(c) for c in content)
+    return str(content).strip()
+
+
+def probe_vision(name, base="", key="", model="", saved=None, protocol=""):
+    """测「多模态（识图）API」能不能真的看图。返回给人看的结论。
+
+    比测聊天 API 多一层，而且这层才是关键：
+      reachable       : 服务器能不能连上这个地址
+      auth_ok         : Key 对不对
+      vision_capable  : **它到底能不能看图** ← 用户真正要的答案
+
+    ★ 为什么必须实测、不能靠「模型名看着像」或「/models 里有它」：
+      很多 OpenAI 兼容网关会把不识图的模型也列出来，甚至**默默接受**
+      带图片的请求、然后完全忽略图片只回文字。用户以为自己配好了识图，
+      实际上机器人一直在瞎猜 —— 这正是要防的呆。
+      唯一可靠的办法：给一张**随机颜色的纯色图**，问它什么颜色。
+      真能看图的必然答对；假装能看的会答错或说看不到。
+
+    protocol：识图 API 的协议。它决定**图片怎么放进请求体** ——
+    三种协议的图片表示完全不同，用错就会拿到 400，
+    而 400 会被解释成「这个模型不识图」，把用户引去换一个没问题的模型。
+    """
+    saved = saved or {}
+    use_base = (base or "").strip() or saved.get("api_base", "")
+    use_key = (key or "").strip() or saved.get("api_key", "")
+    use_model = (model or "").strip() or saved.get("api_model", "")
+    proto = normalize_protocol(protocol) if protocol else vision_protocol_of(name)
+
+    out = {
+        "reachable": False,
+        "auth_ok": False,
+        "vision_capable": None,   # None = 没能测出来
+        "models": [],
+        "model_count": 0,
+        "message": "",
+        "api_base": use_base,
+        "protocol": proto,
+        "protocol_label": PROTOCOLS[proto]["label"],
+        "api_base_effective": normalize_api_base(use_base, proto),
+        "tested_color": "",
+        "answered": "",
+    }
+
+    if not use_base:
+        out["message"] = "还没填接口地址。"
+        return out
+    if not use_key:
+        out["message"] = "还没填 API Key。"
+        return out
+    if not use_model:
+        out["message"] = "还没填模型名。识图模型的名字通常带 vision 字样，请照官网文档填。"
+        return out
+
+    # ① 模型列表：只用来判断「地址通不通」和给用户挑名字，不当作能力证明。
+    try:
+        out["models"] = list_api_models(name, use_base, use_key, proto)
+        out["reachable"] = True
+        out["model_count"] = len(out["models"])
+    except ManagerError as e:
+        msg = str(e)
+        out["reachable"] = ("能连上" in msg)
+        if not out["reachable"]:
+            out["message"] = msg
+            return out
+        if "API Key 不对" in msg:
+            out["message"] = msg
+            return out
+    except Exception as e:  # noqa: BLE001
+        out["message"] = _api_error_hint(e, use_base)
+        return out
+
+    # ② 真正的能力测试：随机挑个颜色，造图，问它。
+    rgb, names = secrets.choice(_VISION_COLORS)
+    out["tested_color"] = names[0]  # names = (中文名, 同义词元组)
+    png_b64 = base64.b64encode(_make_test_png(rgb)).decode("ascii")
+
+    vurl = protocol_endpoint(use_base, proto, "chat", use_model)
+    if not vurl:
+        out["message"] = ("这个协议（%s）暂时没法自动测试识图。"
+                          "请保存后在群里发一张图试试。"
+                          % PROTOCOLS[proto]["label"])
+        return out
+    prompt = "这张图是什么颜色？只回答颜色名称，不要别的字。"
+    payload = _vision_payload(proto, use_model, png_b64, prompt)
+
+    try:
+        code, body = _api_request(vurl, use_key, payload, protocol=proto)
     except Exception as e:  # noqa: BLE001
         out["message"] = _api_error_hint(e, use_base)
         return out
 
     if code in (401, 403):
-        out["message"] = ("Key 不对（对方返回 %d）。检查有没有复制全、"
-                          "有没有多余空格。" % code)
+        out["message"] = ("Key 不对，或者「识图协议」选错了（对方返回 %d）。"
+                          "先确认协议选的是不是这一家的官方协议，"
+                          "再检查 Key 有没有复制全、有没有多余空格。" % code)
         return out
     if code == 404:
         # 404 有两种可能：地址不对，或**模型名不对** —— 看对方怎么说。
@@ -2248,7 +2959,8 @@ def probe_vision(name, base="", key="", model="", saved=None):
                               "点「获取可用模型」从列表里挑一个。" % use_model)
             return out
         out["message"] = ("这个地址没有聊天接口（404）—— 地址多半写得不完整，"
-                          "检查结尾是不是少了 /v1。")
+                          "检查结尾是不是少了 /v1；如果地址是对的，"
+                          "那就是「识图协议」选错了。")
         return out
     if code == 402:
         out["message"] = "账户余额不足或未开通（402）—— 去官网充值/开通后再试。"
@@ -2288,26 +3000,13 @@ def probe_vision(name, base="", key="", model="", saved=None):
     #   自己的 API 有问题。
     content = ""
     for attempt in range(3):
-        try:
-            data = json.loads(body)
-            ch = (data.get("choices") or [{}])[0]
-            msg = ch.get("message") or {}
-            content = msg.get("content") or ""
-            finish = ch.get("finish_reason")
-        except (ValueError, AttributeError, IndexError):
-            content, finish = "", None
-        if isinstance(content, list):
-            # 有些网关把 content 也做成数组
-            content = " ".join(str(c.get("text", "")) if isinstance(c, dict)
-                               else str(c) for c in content)
-        content = str(content).strip()
+        content = _vision_text_of(proto, body)
         if content:
             break
         # 空了才重试；最后一次不再试
         if attempt < 2:
             try:
-                code2, body2 = _api_request(
-                    _join_api(use_base, "/chat/completions"), use_key, payload)
+                code2, body2 = _api_request(vurl, use_key, payload, protocol=proto)
                 if code2 == 200:
                     body = body2
                     continue
@@ -2698,7 +3397,8 @@ def make_server(port, token):
                 self._handle(lambda: {"models": list_api_models(
                     (q.get("name") or [""])[0],
                     (q.get("base") or [""])[0],
-                    (q.get("key") or [""])[0])})
+                    (q.get("key") or [""])[0],
+                    (q.get("protocol") or [""])[0])})
             elif path.startswith("/instance/"):
                 name = path[len("/instance/"):].split("/")[0]
                 # ★ 密码走请求头，不走查询串。
@@ -2740,13 +3440,20 @@ def make_server(port, token):
                     body.get("lock_password", ""),
                     # 识图 API：不填就完全不动多模态配置（老用户升级不受影响）
                     body.get("vision_base", ""), body.get("vision_key", ""),
-                    body.get("vision_model", "")))
+                    body.get("vision_model", ""),
+                    # 接口协议：空 = 沿用已保存的（老用户升级无感）
+                    body.get("protocol", ""),
+                    # 自定义请求体：空 = 沿用；"{}" = 清空
+                    body.get("extra_body", ""),
+                    body.get("vision_protocol", ""),
+                    body.get("vision_extra_body", "")))
             elif path == "/instance/vision/test":
                 # 测识图 API 能不能**真的看图**（不只是「能不能连上」）。
                 # 不传 base/key/model 就用实例里已保存的。
                 self._handle(lambda: probe_vision(
                     body["name"], body.get("api_base", ""),
-                    body.get("api_key", ""), body.get("api_model", "")))
+                    body.get("api_key", ""), body.get("api_model", ""),
+                    protocol=body.get("protocol", "")))
             elif path == "/instance/lock":
                 # 设为私密 / 取消私密 / 改密码
                 self._handle(lambda: {"lock": lock_state(set_instance_lock(
@@ -2758,9 +3465,13 @@ def make_server(port, token):
             elif path == "/instance/api/test":
                 # 测主聊天 API：**在服务器上**发请求，因为真正要用它的是
                 # 服务器上的 AstrBot（手机通不代表服务器通）。
+                # 带上 protocol 和 extra_body：这样「自定义了请求体却测通、
+                # 真跑起来 400」这种最难查的情况会在测试这一步就暴露。
                 self._handle(lambda: probe_api(
                     body["name"], body.get("api_base", ""),
-                    body.get("api_key", ""), body.get("api_model", "")))
+                    body.get("api_key", ""), body.get("api_model", ""),
+                    body.get("protocol", ""),
+                    _extra_body_for_probe(body.get("extra_body", ""))))
             elif path == "/instance/repair-channel":
                 # 「机器人不回话」一键修复。详见 repair_channel 的说明。
                 self._handle(lambda: repair_channel(body["name"]))

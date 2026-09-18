@@ -243,6 +243,36 @@ public final class ManagerClient {
                                     String visionBase, String visionKey,
                                     String visionModel)
             throws Deployer.DeployException {
+        return applyConfig(name, groups, friends, apiBase, apiKey, apiModel,
+                persona, lockPassword, visionBase, visionKey, visionModel,
+                "", "", "", "");
+    }
+
+    /**
+     * 写入配置，含「接口协议」和「自定义请求体」。
+     *
+     * protocol：PROTOCOLS 里的键（如 "anthropic_chat_completion"）。
+     *   空串 = 沿用已保存的（老用户升级上来无感）。
+     *   ★ 为什么它是必需的：同一个地址可能只认某一种协议。中转站给的是
+     *   Anthropic 原生接口时，按默认的 OpenAI 兼容去填会 404，
+     *   而报错指向「地址写错了」—— 用户会去反复改一个正确的地址。
+     *
+     * extraBody：自定义请求体，一段 JSON 文本（如 {"temperature":0.7}）。
+     *   空串 = 沿用已保存的；"{}" = 清空。
+     *   它在服务器上会被逐项校验：覆盖 model/messages 之类会破坏对话结构的
+     *   键会被明确拒绝（那种错在界面上完全看不出来，只会表现为答非所问）。
+     *
+     * visionProtocol / visionExtraBody 同理，但作用于识图 API ——
+     * 两套协议互不相干，因为识图常常是另一家。
+     */
+    public List<String> applyConfig(String name, String groups, String friends,
+                                    String apiBase, String apiKey, String apiModel,
+                                    String persona, String lockPassword,
+                                    String visionBase, String visionKey,
+                                    String visionModel,
+                                    String protocol, String extraBody,
+                                    String visionProtocol, String visionExtraBody)
+            throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
         b.put("groups", groups == null ? "" : groups);
@@ -254,6 +284,11 @@ public final class ManagerClient {
         b.put("vision_base", visionBase == null ? "" : visionBase);
         b.put("vision_key", visionKey == null ? "" : visionKey);
         b.put("vision_model", visionModel == null ? "" : visionModel);
+        b.put("protocol", protocol == null ? "" : protocol);
+        b.put("extra_body", extraBody == null ? "" : extraBody);
+        b.put("vision_protocol", visionProtocol == null ? "" : visionProtocol);
+        b.put("vision_extra_body",
+                visionExtraBody == null ? "" : visionExtraBody);
         if (lockPassword != null && !lockPassword.isEmpty()) {
             b.put("lock_password", lockPassword);
         }
@@ -275,11 +310,31 @@ public final class ManagerClient {
      */
     public Map<String, Object> testVision(String name, String base, String key,
                                           String model) throws Deployer.DeployException {
+        return testVision(name, base, key, model, "", "");
+    }
+
+    /**
+     * 测识图（带协议）。
+     *
+     * protocol 决定**图片怎么放进请求体**：OpenAI 兼容用 image_url、
+     * Anthropic 用 image/source/base64、Gemini 用 inline_data。
+     * 用错形状对方会返回 400，而 400 会被解释成「这个模型不识图」——
+     * 用户于是去换一个本来没问题的模型，白折腾。
+     *
+     * extraBody：识图 API 的自定义请求体（JSON 文本，可空）。
+     * 有些视觉模型必须显式关掉 thinking，否则只回思考过程不回正文。
+     */
+    public Map<String, Object> testVision(String name, String base, String key,
+                                          String model, String protocol,
+                                          String extraBody)
+            throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
         b.put("api_base", base == null ? "" : base);
         b.put("api_key", key == null ? "" : key);
         b.put("api_model", model == null ? "" : model);
+        b.put("protocol", protocol == null ? "" : protocol);
+        b.put("extra_body", extraBody == null ? "" : extraBody);
         return request("POST", "/instance/vision/test", Json.write(b));
     }
 
@@ -326,11 +381,29 @@ public final class ManagerClient {
      */
     public Map<String, Object> testApi(String name, String apiBase, String apiKey,
                                        String apiModel) throws Deployer.DeployException {
+        return testApi(name, apiBase, apiKey, apiModel, "", "");
+    }
+
+    /**
+     * 测主聊天 API 通不通（带协议和自定义请求体）。
+     *
+     * ★ 为什么探测也要带上自定义请求体：否则会出现最难查的一种情况 ——
+     * 「测试显示通了 ✓，但机器人真的跑起来 400」。因为测试发的是
+     * 程序自己的最小请求体，而真实请求会带上用户自定义的参数。
+     * 把自定义请求体一起发出去，「自定义的参数对方不认」会在
+     * 测试这一步就暴露，而不是等用户去群里试。
+     */
+    public Map<String, Object> testApi(String name, String apiBase, String apiKey,
+                                       String apiModel, String protocol,
+                                       String extraBody)
+            throws Deployer.DeployException {
         Map<String, Object> b = new HashMap<String, Object>();
         b.put("name", name);
         b.put("api_base", apiBase == null ? "" : apiBase);
         b.put("api_key", apiKey == null ? "" : apiKey);
         b.put("api_model", apiModel == null ? "" : apiModel);
+        b.put("protocol", protocol == null ? "" : protocol);
+        b.put("extra_body", extraBody == null ? "" : extraBody);
         return request("POST", "/instance/api/test", Json.write(b));
     }
 
@@ -342,6 +415,20 @@ public final class ManagerClient {
      */
     public List<String> listModels(String name, String apiBase, String apiKey)
             throws Deployer.DeployException {
+        return listModels(name, apiBase, apiKey, "");
+    }
+
+    /**
+     * 拉取模型列表（带协议）。
+     *
+     * ★ 协议必须传：各家列模型的端点、鉴权头、返回形状都不同 ——
+     * Gemini 在 /v1beta/models 且返回 {"models":[{"name":"models/xxx"}]}，
+     * Anthropic 要 x-api-key 头。一律按 OpenAI 处理的话，前者「拉不到列表」
+     * （用户只能手填，而手填正是最容易错的一步），后者报「Key 不对」。
+     */
+    public List<String> listModels(String name, String apiBase, String apiKey,
+                                   String protocol)
+            throws Deployer.DeployException {
         StringBuilder q = new StringBuilder("/instance/api/models?name=");
         q.append(enc(name));
         if (apiBase != null && !apiBase.isEmpty()) {
@@ -349,6 +436,9 @@ public final class ManagerClient {
         }
         if (apiKey != null && !apiKey.isEmpty()) {
             q.append("&key=").append(enc(apiKey));
+        }
+        if (protocol != null && !protocol.isEmpty()) {
+            q.append("&protocol=").append(enc(protocol));
         }
         Map<String, Object> r = request("GET", q.toString(), null);
         List<String> out = new ArrayList<String>();
@@ -494,18 +584,49 @@ public final class ManagerClient {
             return "running".equals(napcat) && "running".equals(astrbot);
         }
 
+        /**
+         * 有没有**任何一个**容器还活着。
+         *
+         * 为什么要单独有这个判断（2026-09-18 用户报「运行中停止不了」）：
+         *   原先界面只认 running()（两个都 running）来决定显示「启动」还是「停止」。
+         *   但 NapCat 经常单独挂掉（QQ 掉线/被顶号），AstrBot 还活着 ——
+         *   这时 running()=false，界面就只给「启动」，**没有「停止」按钮**。
+         *   用户看到的是「机器人明明还在跑（AstrBot 在跑、还占着端口），
+         *   却停不掉」。
+         *   实际数据佐证：线上实例 1 就是 astrbot=running + napcat=exited。
+         *
+         * 所以：只要还有容器活着，就必须给「停止」，否则用户没有任何办法
+         * 把它停下来（只能去服务器上敲 docker，而 App 的用户不会）。
+         */
+        public boolean partiallyRunning() {
+            return "running".equals(napcat) || "running".equals(astrbot);
+        }
+
+        /** 两个容器是否都不在了（从没启动过 / 已销毁）。 */
+        public boolean absent() {
+            return "absent".equals(napcat) && "absent".equals(astrbot);
+        }
+
         /** 给界面看的短状态。 */
         public String stateText() {
             if (running()) {
                 return "运行中";
             }
-            if ("absent".equals(napcat) && "absent".equals(astrbot)) {
+            if (absent()) {
                 return "未启动";
             }
             if ("exited".equals(napcat) && "exited".equals(astrbot)) {
                 return "已停止";
             }
-            return "启动中 / 异常（napcat=" + napcat + ", astrbot=" + astrbot + "）";
+            // 一个活一个死 —— 说清是哪一个，别只写「异常」。
+            // 这正是「机器人不说话 / 停不掉」最常见的那种状态。
+            if ("running".equals(astrbot)) {
+                return "半死：聊天服务还在跑，QQ 已掉线";
+            }
+            if ("running".equals(napcat)) {
+                return "半死：QQ 还在，聊天服务已停";
+            }
+            return "启动中（napcat=" + napcat + ", astrbot=" + astrbot + "）";
         }
     }
 }

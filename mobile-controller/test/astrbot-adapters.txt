@@ -1,0 +1,42 @@
+aihubmix_chat_completion|AIHubMix Chat Completion Provider Adapter|oai_aihubmix_source.py
+anthropic_chat_completion|Anthropic Claude API 提供商适配器|anthropic_source.py
+azure_tts|Azure TTS|azure_tts_source.py
+bailian_rerank|阿里云百炼文本排序适配器|bailian_rerank_source.py
+dashscope_embedding|阿里云百炼(DashScope) Embedding 提供商适配器|dashscope_embedding_source.py
+dashscope_tts|Dashscope TTS API|dashscope_tts.py
+edge_tts|Microsoft Edge TTS|edge_tts_source.py
+elevenlabs_tts_api|ElevenLabs TTS API|elevenlabs_tts_source.py
+fishaudio_tts_api|FishAudio TTS API|fishaudio_tts_api_source.py
+gemini_embedding|Google Gemini Embedding 提供商适配器|gemini_embedding_source.py
+gemini_tts|Gemini TTS API|gemini_tts_source.py
+genie_tts|Genie TTS|genie_tts.py
+googlegenai_chat_completion|Google Gemini Chat Completion 提供商适配器|gemini_source.py
+groq_chat_completion|Groq Chat Completion Provider Adapter|groq_source.py
+gsvi_tts_api|GSVI TTS API|gsvi_tts_source.py
+kimi_code_chat_completion|Kimi Code Provider Adapter|kimi_code_source.py
+longcat_chat_completion|LongCat Chat Completion Provider Adapter|longcat_source.py
+mimo_stt_api|MiMo STT API|mimo_stt_api_source.py
+mimo_tts_api|MiMo TTS API|mimo_tts_api_source.py
+minimax_token_plan|MiniMax Token Plan Provider Adapter|minimax_token_plan_source.py
+minimax_tts_api|MiniMax TTS API|minimax_tts_api_source.py
+nvidia_embedding|NVIDIA NIM Embedding 提供商适配器|nvidia_embedding_source.py
+nvidia_rerank|NVIDIA Rerank 适配器|nvidia_rerank_source.py
+ollama_embedding|Ollama Embedding 提供商适配器|ollama_embedding_source.py
+openai_chat_completion|OpenAI API Chat Completion 提供商适配器|openai_source.py
+openai_embedding|OpenAI API Embedding 提供商适配器|openai_embedding_source.py
+openai_responses|OpenAI-compatible Responses API provider adapter|openai_responses_source.py
+openai_tts_api|OpenAI TTS API|openai_tts_api_source.py
+openai_whisper_api|OpenAI Whisper API|whisper_api_source.py
+openai_whisper_selfhost|OpenAI Whisper 模型部署|whisper_selfhosted_source.py
+openrouter_chat_completion|OpenRouter Chat Completion Provider Adapter|openrouter_source.py
+sensevoice_stt_selfhost|SenseVoice 自托管语音识别 模型部署|sensevoice_selfhosted_source.py
+ssycloud_chat_completion|SSYCloud Chat Completion Provider Adapter|ssycloud_source.py
+tei_rerank|HuggingFace TEI Rerank 适配器|tei_rerank_source.py
+vllm_rerank|VLLM Rerank 适配器|vllm_rerank_source.py
+volcengine_tts|火山引擎 TTS|volcengine_tts.py
+xai_chat_completion|xAI Chat Completion Provider Adapter|xai_source.py
+xiaomi_chat_completion|Xiaomi API 提供商适配器 (OpenAI 兼容)|xiaomi_source.py
+xiaomi_token_plan|Xiaomi Token Plan 提供商适配器|xiaomi_token_plan_source.py
+xinference_rerank|Xinference Rerank 适配器|xinference_rerank_source.py
+xinference_stt|Xinference STT|xinference_stt_provider.py
+zhipu_chat_completion|智谱 Chat Completion 提供商适配器|zhipu_source.py

@@ -18,6 +18,8 @@ public final class Main {
         // 机器人列表搜索（对应「不能定向搜索机器人名字」这条反馈）
         RobotFilterTest.run();
         QrLayoutTest.run();
+        // 接口协议选择（对应「API 需要更多的详细自定义请求体和协议选择」）
+        ProtocolsTest.run();
         System.exit(T.report());
     }
 }

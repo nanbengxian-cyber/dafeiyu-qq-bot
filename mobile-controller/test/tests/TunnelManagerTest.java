@@ -115,12 +115,34 @@ public final class TunnelManagerTest {
         cs.put("astrbot", "exited");
         ManagerClient.Instance half = ManagerClient.Instance.from(m);
         T.isFalse("★ 一个容器挂了就不能算运行中", half.running());
-        T.isTrue("★ 半死状态要提示异常/启动中，不能谎报正常",
-                half.stateText().contains("异常") || half.stateText().contains("启动中"));
+        // 文案要求：① 不能说「运行中」（谎报正常）；
+        //          ② 要说清**是哪一个**还活着 —— 只说「异常」的话，
+        //             用户不知道该去修 QQ 还是修聊天服务。
+        // 这是 2026-09-18「运行中停不掉」那次修复的一部分：
+        // 界面的按钮选择完全依赖这两个判断，所以它们必须被测住。
+        T.isFalse("★ 半死状态不能谎报「运行中」", half.stateText().contains("运行中"));
+        T.isTrue("★ 半死状态要说清是聊天服务还活着",
+                half.stateText().contains("聊天服务") && half.stateText().contains("QQ"));
+        T.isTrue("★ 半死状态要能被识别成「还活着」（否则界面不给「停止」按钮）",
+                half.partiallyRunning());
+        T.isFalse("半死状态不是「未启动」", half.absent());
+
+        // 反过来的半死：QQ 还在，聊天服务停了。方向必须说对 ——
+        // 说反了用户会去修错的那一半。
+        cs.put("napcat", "running");
+        cs.put("astrbot", "exited");
+        ManagerClient.Instance half2 = ManagerClient.Instance.from(m);
+        T.isTrue("★ 反方向的半死也要给「停止」", half2.partiallyRunning());
+        T.isTrue("★ 反方向要说清是 QQ 还活着",
+                half2.stateText().contains("QQ") && half2.stateText().contains("聊天服务"));
+        T.isFalse("★ 反方向也不能谎报「运行中」", half2.stateText().contains("运行中"));
 
         cs.put("napcat", "absent");
         cs.put("astrbot", "absent");
         T.eq("未启动文案", "未启动", ManagerClient.Instance.from(m).stateText());
+        T.isTrue("两个都不在 → absent()", ManagerClient.Instance.from(m).absent());
+        T.isFalse("两个都不在 → 没有「停止」按钮（没什么可停的）",
+                ManagerClient.Instance.from(m).partiallyRunning());
 
         // 缺字段不能崩（服务器版本不同时可能出现）
         Map<String, Object> bare = new HashMap<String, Object>();

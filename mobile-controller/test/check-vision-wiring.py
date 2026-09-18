@@ -96,18 +96,27 @@ ck("路由在 do_POST 分支（它要收 Key，不能走 GET 查询串）",
 # ② 探测必须真的发图 —— 只看 /models 是假绿灯
 pv = mgr.split("def probe_vision(", 1)[1].split("\ndef ", 1)[0] \
     if "def probe_vision(" in mgr else ""
-ck("★ 探测真的构造了图片（image_url）", '"image_url"' in pv)
+# 图片请求体的构造按协议分家了（三种协议的图片形状完全不同），
+# 所以「真的构造了图片」要在 _vision_payload 里查，
+# 而 probe_vision 里要查「它确实调用了那个构造函数」。
+vp = mgr.split("def _vision_payload(", 1)[1].split("\ndef ", 1)[0] \
+    if "def _vision_payload(" in mgr else ""
+ck("★ 探测真的构造了图片（image_url）", '"image_url"' in vp)
 ck("★ 图片是 base64 内联的（服务器本地造图，不依赖外网图床）",
-   "data:image/png;base64," in pv)
+   "data:image/png;base64," in vp)
+ck("★ probe_vision 调用了 _vision_payload（不是自己另拼一套）",
+   "_vision_payload(proto" in pv)
+ck("★ 图片按协议分别构造（Anthropic/Gemini 的形状和 OpenAI 不同）",
+   '"type": "image"' in vp and "inline_data" in vp)
 ck("有造图函数 _make_test_png",
    re.search(r"^def _make_test_png\(", mgr, re.M) is not None)
 ck("测试颜色是随机的（防模型背答案）",
    "secrets.choice(_VISION_COLORS)" in pv)
 ck("★ max_tokens 给足（推理模型给少了正文为空，会误判）",
-   re.search(r'"max_tokens":\s*(\d+)', pv) is not None
-   and int(re.search(r'"max_tokens":\s*(\d+)', pv).group(1)) >= 800,
-   re.search(r'"max_tokens":\s*(\d+)', pv).group(1)
-   if re.search(r'"max_tokens":\s*(\d+)', pv) else "没找到")
+   re.search(r'"max_tokens":\s*(\d+)', vp) is not None
+   and int(re.search(r'"max_tokens":\s*(\d+)', vp).group(1)) >= 800,
+   re.search(r'"max_tokens":\s*(\d+)', vp).group(1)
+   if re.search(r'"max_tokens":\s*(\d+)', vp) else "没找到")
 ck("★ 空回复会重试（推理模型偶尔把预算全花在思考上）",
    "for attempt in range(" in pv)
 ck("★ 同义词也算答对（答「金色」不该被判成没看图）",
@@ -167,8 +176,8 @@ ck("RobotsView 有识图输入框", "visionBase" in rv and "visionModel" in rv)
 ck("识图 Key 输入框是密码样式", re.search(
     r'visionKey = UiKit\.input\(ctx,[^;]*?true\)', rv, re.S) is not None)
 ck("★ 保存时把 vision_* 传给了 applyConfig",
-   re.search(r"applyConfig\(\s*it\.name,\s*g,\s*f,\s*ab,\s*ak,\s*am,\s*pe,\s*lockPw,\s*vb,\s*vk,\s*vm\)",
-             rv, re.S) is not None)
+   re.search(r"applyConfig\(\s*it\.name,\s*g,\s*f,\s*ab,\s*ak,\s*am,\s*pe,\s*lockPw,\s*"
+             r"vb,\s*vk,\s*vm", rv, re.S) is not None)
 
 # ⑩ 能力结论要影响界面（否则「不能识图」和「能识图」长得一样）
 ck("★ 读了 vision_capable", '"vision_capable"' in rv)

@@ -1,0 +1,24 @@
+OpenAI Compatible|openai|openai|openai_chat_completion
+OpenAI Responses|openai-responses|openai|openai_responses
+Google Gemini|google_gemini|google|googlegenai_chat_completion
+Anthropic|anthropic|anthropic|anthropic_chat_completion
+Kimi Coding Plan|kimi-code|kimi-code|kimi_code_chat_completion
+Moonshot|moonshot|moonshot|openai_chat_completion
+MiniMax|minimax|minimax|openai_chat_completion
+MiniMax Token Plan|minimax-token-plan|minimax-token-plan|minimax_token_plan
+Xiaomi|xiaomi|xiaomi|xiaomi_chat_completion
+Xiaomi Token Plan|xiaomi-token-plan|xiaomi-token-plan|xiaomi_token_plan
+xAI|xai|xai|openai_responses
+DeepSeek|deepseek|deepseek|openai_chat_completion
+DeepSeek Responses|deepseek-responses|deepseek|openai_responses
+Zhipu|zhipu|zhipu|zhipu_chat_completion
+LongCat|longcat|longcat|longcat_chat_completion
+AIHubMix|aihubmix|aihubmix|aihubmix_chat_completion
+OpenRouter|openrouter|openrouter|openrouter_chat_completion
+SSYCloud(胜算云)|ssycloud|ssycloud|ssycloud_chat_completion
+NVIDIA|nvidia|nvidia|openai_chat_completion
+Azure OpenAI|azure_openai|azure|openai_chat_completion
+Ollama|ollama|ollama|openai_chat_completion
+LM Studio|lm_studio|lm_studio|openai_chat_completion
+Gemini_OpenAI_API|google_gemini_openai|google|openai_chat_completion
+Groq|groq|groq|groq_chat_completion
