@@ -1059,12 +1059,20 @@ def wait_astrbot_ready(name, timeout=READY_TIMEOUT, need_db=False, need_cfg=Fals
 
     就绪的判据是**一组文件**，不是一个瞬间：
       * need_cfg=True → cmd_config.json 存在（AstrBot 启动早期就会写出来）
-      * need_db=True  → data_v4.db 存在（要等 ORM 初始化完才落盘）
+      * need_db=True  → data_v4.db 存在**且 personas 表已建好**
+                        （要等 ORM 建表完才算数）
 
     need_db 为什么不能省：cmd_config.json 生成得很早（所以界面会显示「运行中」），
     但 data_v4.db 要晚得多。只等日志里的 "AstrBot started" 就去写人格，会撞上
     「文件还不存在」—— 用户看到的是「请先启动一次」，而他明明刚启动过。
     这正是实测踩到的坑。
+
+    ★ need_db 光等**文件存在**还不够（这是「提示词写入失败」那个 bug 的根因）：
+      AstrBot 的 ORM 是「先落盘 data_v4.db 文件 → 再逐张建表」，两步之间有个
+      几百毫秒到几秒的窗口。文件已经在、personas 表却还没建好时就去写人格，
+      write_persona_db 会抛「这个 AstrBot 版本还没有 personas 表」——
+      用户看到的就是「提示词写入失败」，而其实只是**等早了**。
+      所以 need_db 的判据必须是「文件在 且 personas 表已建好」。
 
     把 cfg 也并进同一个判据里（而不是在外面再补一次等待），是为了守住
     App 的读超时预算：apply_config 里只等两次，每次上限 READY_TIMEOUT。
@@ -1076,8 +1084,12 @@ def wait_astrbot_ready(name, timeout=READY_TIMEOUT, need_db=False, need_cfg=Fals
     def files_ready():
         if need_cfg and not os.path.exists(astrbot_cfg_path(name)):
             return False
-        if need_db and not os.path.exists(persona_db_path(name)):
-            return False
+        if need_db:
+            if not os.path.exists(persona_db_path(name)):
+                return False
+            # 文件在还不够 —— personas 表建好了才算 data_v4.db 真就绪。
+            if not personas_table_ready(name):
+                return False
         return True
 
     def ready_now():
@@ -1107,6 +1119,38 @@ def wait_astrbot_ready(name, timeout=READY_TIMEOUT, need_db=False, need_cfg=Fals
 
 def persona_db_path(name):
     return os.path.join(instance_dir(name), "astrbot", "data", "data_v4.db")
+
+
+def personas_table_ready(name):
+    """实例的 data_v4.db 里 personas 表建好了没有。
+
+    为什么要单独判「表」而不是只看文件在不在：
+    AstrBot 的 ORM 是**先落盘 data_v4.db 文件、再逐张建表**，两步之间有个
+    几百毫秒到几秒的窗口。文件已经在、personas 表却还没建好时写人格，
+    write_persona_db 会抛「这个 AstrBot 版本还没有 personas 表」——
+    用户看到的就是「提示词写入失败」，而其实只是**等早了**。
+    所以「数据库就绪」的判据必须是表建好了，不是文件在。
+
+    只读打开：别在 AstrBot 建表的当口去锁库或建库。
+    拿不准（打不开、还在锁、查询报错）一律返回 False（当「还没好」）——
+    宁可多等几秒，也不要放行到 write_persona_db 里再抛「没有 personas 表」。
+    """
+    path = persona_db_path(name)
+    if not os.path.exists(path):
+        return False
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='personas'").fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
 
 
 def write_persona_db(name, persona_id, prompt):
@@ -1368,7 +1412,10 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         raise ManagerError("这个机器人还在初始化（第一次启动要拉镜像、建目录，"
                            "可能要一两分钟）。请稍等一会儿再点「保存」。")
     if not ready:
-        if has_persona and not os.path.exists(persona_db_path(name)):
+        if has_persona and not personas_table_ready(name):
+            # 要写人格、而数据库还没就绪：可能是文件还没生成，也可能是
+            # 文件在但 personas 表还没建好（ORM 建表比落盘晚）。
+            # 两种都给「内部数据库还在初始化」——用户下一步动作一样：等一下再点。
             raise ManagerError("这个机器人刚启动，内部数据库还在初始化，"
                                "请等半分钟再点「保存」。")
         raise ManagerError("这个机器人的聊天服务还没启动完，稍等半分钟再试。")

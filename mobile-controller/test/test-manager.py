@@ -602,6 +602,71 @@ def test_persona_written_after_ready():
        "★ 用容器是否存在区分「从没启动」和「正在初始化」两种人")
 
 
+def test_ready_waits_for_personas_table():
+    """★ 回归测试：need_db 的就绪判据必须是「文件在 且 personas 表已建好」。
+
+    这是用户反馈的「提示词写入失败」bug 的根因：
+      AstrBot 的 ORM 先落盘 data_v4.db 文件、再逐张建表，两步之间有个窗口。
+      老的 wait_astrbot_ready 只看**文件存在**就放行，于是在这个窗口里
+      write_persona_db 会撞上「这个 AstrBot 版本还没有 personas 表」——
+      用户看到的就是「提示词写入失败」，其实只是等早了。
+
+    判据（行为验证，不是抠字符串）：
+      ① 库文件在、但没有 personas 表时，need_db 就绪等待必须返回 False；
+      ② personas 表建好后，同样的等待必须返回 True。
+    这样才真挡住那个 bug；只静态检查「源码里有没有 personas」会假绿。
+    """
+    print("\n【就绪等待：必须等到 personas 表建好，不只是文件存在】")
+    import sqlite3
+    root = tempfile.mkdtemp()
+    try:
+        m = load_module(root)
+        m.ensure_dirs()
+        # ★ 故意不调 create_instance：它会去「占一个端口」，在真实管理机上
+        #   会撞到正在跑的线上实例（实测在服务器上跑就因端口被占而崩）。
+        #   这个用例只关心「就绪判据」，自己把目录和文件摆出来就够了。
+        name = "t1"
+        # 钉住「日志说已启动」，把变量收敛到只剩「表建没建好」。
+        m.astrbot_started_marker = lambda n: True
+        # ★ 必须**显式传 timeout**：wait_astrbot_ready 的默认值是
+        #   `timeout=READY_TIMEOUT`，那是**定义时**就绑定的常量 ——
+        #   在测试里改 m.READY_TIMEOUT 根本不起作用，会老老实实等满 40 秒
+        #   （实测这个用例因此要跑 42 秒，还把整个测试文件拖到超时）。
+        FAST = 2
+
+        dbp = m.persona_db_path(name)
+        cfgp = m.astrbot_cfg_path(name)
+        os.makedirs(os.path.dirname(dbp), exist_ok=True)
+        os.makedirs(os.path.dirname(cfgp), exist_ok=True)
+        open(cfgp, "w", encoding="utf-8").write("{}")
+
+        # 场景一：库文件在，但只有别的表、没有 personas —— ORM 还没建到它。
+        c = sqlite3.connect(dbp)
+        c.execute("CREATE TABLE other (x INTEGER)")
+        c.commit(); c.close()
+        r1 = m.wait_astrbot_ready("t1", timeout=FAST, need_db=True, need_cfg=True)
+        eq(r1, False,
+           "★ 库文件在、但 personas 表还没建时返回 False（别放行到「写入失败」）")
+
+        # 场景二：personas 表建好了 —— 这才算 data_v4.db 真就绪。
+        c = sqlite3.connect(dbp)
+        c.execute("CREATE TABLE personas (id INTEGER NOT NULL, "
+                  "persona_id VARCHAR NOT NULL, system_prompt TEXT NOT NULL, "
+                  "PRIMARY KEY(id))")
+        c.commit(); c.close()
+        r2 = m.wait_astrbot_ready("t1", timeout=FAST, need_db=True, need_cfg=True)
+        eq(r2, True, "★ personas 表建好后返回 True（可以安全写人格了）")
+
+        # 判据本身要能单独调用（apply_config 的报错分支也用它来决定说什么话）
+        ok(hasattr(m, "personas_table_ready"),
+           "★ personas_table_ready 是模块级函数（报错话术也要用它）")
+        eq(m.personas_table_ready("t1"), True, "表在时说就绪")
+        os.remove(dbp)
+        eq(m.personas_table_ready("t1"), False, "★ 文件不在时也说没好（不抛异常）")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_missing_config_tells_two_people_apart():
     """★ 缺 cmd_config.json 的有两种人，说的话必须相反。
 
@@ -1324,6 +1389,7 @@ def main():
         test_read_config_reports_provider_ok,
         test_app_does_not_block_save_when_not_ready,
         test_persona_written_after_ready,
+        test_ready_waits_for_personas_table,
         test_missing_config_tells_two_people_apart,
         test_no_log_wait_is_capped,
         test_apply_config_fits_app_timeout,
