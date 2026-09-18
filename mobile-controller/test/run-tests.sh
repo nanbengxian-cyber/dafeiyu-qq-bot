@@ -99,6 +99,16 @@ if ! python3 test/test-backward-compat.py; then
   exit 1
 fi
 
+# 源码树里的 Preset.java 必须是空模板。
+# 这条是纯粹的**安全**检查：真实凭据泄漏不会让 App 出任何问题
+# （内置版反而更「能用」），所以功能测试全是绿的，只有专门盯它才发现得了。
+# 2026-09-18 我自己踩过：脚本里多写了一个 EXIT trap 覆盖掉还原逻辑，
+# 服务器地址、SSH 私钥、管理口令全留在了这个被 git 跟踪的文件里。
+if ! python3 test/check-preset-clean.py; then
+  echo "Preset.java 里有真实凭据残留，**不要 commit**。" >&2
+  exit 1
+fi
+
 # 接口地址的规范化：用户填的各种形状都必须拼出**能用的** URL。
 # 用户是从别家配置复制地址过来的，`/v1` 常常留着；
 # 而各家适配器对 api_base 的处理不同，多一个 /v1 就会拼出 /v1/v1/... 的 404，

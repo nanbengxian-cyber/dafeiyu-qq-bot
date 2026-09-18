@@ -178,7 +178,31 @@ restore() {
   rm -f "$BACKUP"
   echo "已还原 $PRESET（公开仓库保持零真实信息）"
 }
-trap restore EXIT
+# ★ 这里**故意不写** `trap restore EXIT`：
+#   全文只能有**一个** EXIT trap（下面那个 cleanup_all），因为 bash 里
+#   后写的会覆盖先写的。写两个 = 还原静默失效，理由见下。
+
+# ★ 踩过的坑（2026-09-18，测试当场抓到 11 项失败）：
+#   脚本后半段为了让构建日志可读，又写了一个 `trap 'rm -f $LOG' EXIT`，
+#   它**覆盖**了上面的 restore —— 于是服务器地址、SSH 私钥、管理口令
+#   全部留在 app/src/.../Preset.java 里，下一次 commit 就会推到公开仓库。
+#   当时是测试先炸出来的，不是人看出来的。
+#
+#   教训：EXIT trap 只能有一个，谁在后面写谁赢。
+#   所以这里**不再**加第二个 EXIT trap，改成一个统一的清理钩子：
+#   后面所有需要在退出时清理的东西都登记到 EXTRA_CLEAN 里，
+#   由唯一的 restore 顺带处理。这样新增清理逻辑不会再破坏还原。
+EXTRA_CLEAN=""
+cleanup_all() {
+  restore
+  # 逐个删登记过的临时文件（路径可能含空格，用 while read 而不是 for）
+  if [ -n "$EXTRA_CLEAN" ]; then
+    printf '%s\n' "$EXTRA_CLEAN" | while IFS= read -r f; do
+      [ -n "$f" ] && rm -f "$f" 2>/dev/null
+    done
+  fi
+}
+trap cleanup_all EXIT
 
 # 私钥内容要嵌进 Java 字符串字面量：转义反斜杠和引号。
 # PEM 里一般只有 base64 和换行，但转义一下更稳妥。
@@ -249,9 +273,23 @@ echo "→ 构建内部版 APK…"
 #   OUT_APK           —— 产物写到独立文件名，**绝不覆盖**公开版产物
 #                        （否则定制包会躺在公开版的路径上，极易误发）。
 mkdir -p "$(dirname "$OUT")"
-KS_PASS="${KS_PASS:-dafeiyu2026}" DSH_PRESET_BUILD=1 OUT_APK="$OUT" \
-  bash build.sh >/tmp/preset-build.log 2>&1 \
-  || { echo "构建失败，日志尾部：" >&2; tail -20 /tmp/preset-build.log >&2; exit 1; }
+# ★ 日志必须用 mktemp，不能用固定的 /tmp/preset-build.log。
+#   踩过：固定路径下如果已存在一个**别人拥有**的同名文件，
+#   重定向会在 build.sh 启动**之前**就失败（Permission denied），
+#   而 `||` 分支会 tail 那个**上一次的旧日志** ——
+#   于是屏幕上打的是「构建失败」+ 一份看起来成功的旧日志。
+#   这比不报错更糟：既没构建，又给了你一个假的好消息。
+BUILD_LOG="$(mktemp -t preset-build.XXXXXX.log)" || {
+  echo "建不了临时日志文件，中止。" >&2; exit 1; }
+# 登记到统一的清理钩子里（**不要**在这里写 trap ... EXIT，理由见上面 restore 附近）。
+EXTRA_CLEAN="$EXTRA_CLEAN
+$BUILD_LOG"
+if ! KS_PASS="${KS_PASS:-dafeiyu2026}" DSH_PRESET_BUILD=1 OUT_APK="$OUT" \
+     bash build.sh >"$BUILD_LOG" 2>&1; then
+  echo "构建失败，日志尾部：" >&2
+  tail -20 "$BUILD_LOG" >&2
+  exit 1
+fi
 
 echo "→ 内部版产物：$OUT"
 ls -la "$OUT"
@@ -388,3 +426,27 @@ echo "✓ 自检：口令、指纹都在产物里"
 echo "✓ 自检：服务器已内置（$HOST）"
 echo
 echo "提醒：这个 APK 能管理服务器上的机器人实例，只发给信得过的人。"
+
+# ★★★ 最后一道防线：**立刻**在这里还原，而不是只等 EXIT trap。★★★
+#
+# 为什么不能只靠 trap：
+#   bash 的 EXIT trap 只有**一个**，谁最后写谁赢。脚本前面注册了
+#   cleanup_all（里面会调 restore），但只要有人在它**之后**又写一个
+#   `trap ... EXIT`，还原就再也不会发生 —— 而屏幕上一切正常。
+#
+#   我本人就是这样把服务器地址、SSH 私钥、管理口令留在了
+#   app/src/.../Preset.java 里（2026-09-18，测试报出 11 项失败才发现）。
+#   变异测试确认：只加「统一的清理钩子」挡不住后面新加的 trap。
+#
+# 所以这里做**显式还原**：不依赖任何 trap 语义，执行到这就一定还原。
+# 顺带把 EXIT trap 清掉，避免退出时再跑一次（跑两次无害，但没必要）。
+restore
+trap - EXIT
+# 再核一次：源码树里绝不允许残留真实凭据。
+# 只还原不核对是不够的 —— 万一路径变了、备份坏了，还原会「成功」
+# 但内容还是脏的，而你不会知道。
+if grep -qE 'BEGIN RSA PRIVATE KEY|HOST *= *"[0-9]|MANAGER_TOKEN *= *"[A-Za-z0-9_-]{20,}' "$PRESET" 2>/dev/null; then
+  echo "❌ 严重：$PRESET 里仍残留真实凭据，还原失败！" >&2
+  echo "   千万不要 commit，先手工把它清空。" >&2
+  exit 4
+fi
