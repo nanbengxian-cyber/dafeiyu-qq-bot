@@ -56,6 +56,14 @@ INSTANCES_DIR = os.path.join(ROOT, "instances")
 MANAGER_DIR = os.path.join(ROOT, "manager")
 TOKEN_FILE = os.path.join(MANAGER_DIR, "manager.token")
 COMPOSE_TEMPLATE = os.path.join(MANAGER_DIR, "compose.template.yml")
+# App 公告 + 版本检查：数据文件（可改，改完不用重启）+ APK 存放目录。
+# app-update.json 的字段：
+#   latest_code   App 的 versionCode（App 拿它和本地 versionCode 比大小）
+#   latest_name   显示名，如 "1.2.0"
+#   announcement  公告正文（多行文本，App 弹窗显示）
+#   sha256        APK 的 SHA256（App 下载完核对，防传/防换）
+APP_UPDATE_FILE = os.path.join(MANAGER_DIR, "app-update.json")
+APK_DIR = os.path.join(MANAGER_DIR, "apk")
 
 NAPCAT_IMAGE = os.environ.get("DAFEIYU_NAPCAT_IMAGE", "mlikiowa/napcat-docker:latest")
 ASTRBOT_IMAGE = os.environ.get("DAFEIYU_ASTRBOT_IMAGE", "soulter/astrbot:latest")
@@ -990,11 +998,20 @@ def normalize_ids(raw, label):
 
 
 def astrbot_started_marker(name):
-    """看这个实例的 AstrBot 日志里有没有「启动完成」的标记。
+    """看这个实例的 AstrBot 是不是真的启动完成了。
 
     返回 True / False；**拿不到日志时返回 None**（不代表没启动）。
-    区分 None 很重要：测试环境和容器名不同时 docker logs 必然失败，
+    区分 None 很重要：测试环境和容器名不同时 docker 命令必然失败，
     那时不能当成「没启动」去反复等 —— 会把测试拖死。
+
+    ★ 2026-09-19 修复（「怎么都保存不了配置」的根因）：
+       原来只查 `docker logs --tail 80` 里有没有 "AstrBot started"。
+       对**长期运行**的容器，这个标记早就被后续日志挤出最近 80 行了
+       （线上 dfy 实例运行 24h、日志 10555 行，标记在第 509 行），
+       于是一律被判成「没启动完」，apply_config 每次写入都 400 拒绝
+       —— 用户表现就是：怎么写配置都失败，重启服务也没用。
+       所以补第二判据：容器**正在运行且已持续运行够久**，那它必然
+       早就启动完成了（启动失败的话容器会退出），标记只是被挤出而已。
     """
     try:
         out = subprocess.run(
@@ -1006,7 +1023,52 @@ def astrbot_started_marker(name):
         return None          # 超时等其它异常
     if out.returncode != 0:
         return None          # 容器不存在
-    return "AstrBot started" in out.stdout.decode("utf-8", "replace")
+    if "AstrBot started" in out.stdout.decode("utf-8", "replace"):
+        return True
+    # 标记不在最近 80 行：要么还没启动完，要么跑太久被挤出。
+    # 用「运行时长」区分这两者（docker inspect 拿启动时刻）。
+    info = _astrbot_life(name)
+    if info is None:
+        return False         # 拿不到运行信息，按「没启动」处理（保守）
+    running, started_epoch = info
+    if not running:
+        return False         # 容器没在跑 = 确实没启动 / 已退出
+    return (time.time() - started_epoch) > ASTRBOT_RUN_OK_SECONDS
+
+
+def _astrbot_life(name):
+    """docker inspect：这个实例的 AstrBot（running, 启动时刻 epoch）。
+
+    拿不到时返回 None（docker 不可用 / 容器不在 / 解析失败）。
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "--format",
+             "{{.State.Running}}|{{.State.StartedAt}}",
+             "dafeiyu-%s-astrbot" % name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    txt = out.stdout.decode("utf-8", "replace").strip()
+    try:
+        running_s, started_s = txt.split("|", 1)
+        st = started_s.strip()
+        if st.endswith("Z"):
+            st = st[:-1]
+        st = st.split(".")[0]        # 去掉纳秒小数
+        t = time.strptime(st, "%Y-%m-%dT%H:%M:%S")
+        return running_s.strip() == "true", calendar.timegm(t)
+    except Exception:
+        return None
+
+
+# 容器「运行多久就算已启动完成」（兜底判据）。
+# 必须明显大于 READY_TIMEOUT（40s）：它只在「日志标记被挤出」时才
+# 被用到，正常短时启动会更快被日志标记判据放行，这个阈值只兜长期
+# 运行实例 —— 那种实例一定早就完成启动了。
+ASTRBOT_RUN_OK_SECONDS = 90
 
 
 def astrbot_container_exists(name):
@@ -3320,6 +3382,57 @@ def json_response(handler, code, obj):
     handler.wfile.write(body)
 
 
+def app_update_info():
+    """App 的「公告 + 版本」信息（GET /app/update）。
+
+    数据源是 app-update.json（MANAGER_DIR 下，可随时改、改完即生效）。
+    文件不存在 = 还没发过版/还没写公告：返回空壳，App 据此判断「无更新」，
+    绝不能让 App 因为没有 JSON 而报错。
+    """
+    empty = {"latest_code": 0, "latest_name": "", "announcement": "",
+             "sha256": "", "apk_size": 0}
+    try:
+        with open(APP_UPDATE_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (IOError, ValueError):
+        return empty
+    out = {
+        "latest_code": int(d.get("latest_code") or 0),
+        "latest_name": str(d.get("latest_name") or ""),
+        "announcement": str(d.get("announcement") or ""),
+        "sha256": str(d.get("sha256") or "").strip().lower(),
+        "apk_size": 0,
+    }
+    # APK 实际存在才填大小 —— 版本号写了但包还没放上去时，
+    # App 不该看到一个「能更新但永远下不动」的状态。
+    apk = os.path.join(APK_DIR, "dafeiyu-controller-mine.apk")
+    if os.path.exists(apk):
+        out["apk_size"] = os.path.getsize(apk)
+    return out
+
+
+def app_apk(handler):
+    """把内置版 APK 原样吐给 App（GET /app/apk）。
+
+    ★ 为什么由管理服务来发，而不是私有仓库：
+       App 本来就经过 SSH 隧道连到本服务（127.0.0.1:6199），
+       从私有仓库下载要内置 GitHub token（泄露 == 能进私有仓库），
+       而走隧道 0 额外凭据、原样复用双认证。文件就是部署时放进去的那份。
+    """
+    apk = os.path.join(APK_DIR, "dafeiyu-controller-mine.apk")
+    if not os.path.exists(apk):
+        json_response(handler, 404, {"error": "还没有可下载的安装包。"})
+        return
+    size = os.path.getsize(apk)
+    handler.send_response(200)
+    handler.send_header("Content-Type",
+                        "application/vnd.android.package-archive")
+    handler.send_header("Content-Length", str(size))
+    handler.end_headers()
+    with open(apk, "rb") as fh:
+        shutil.copyfileobj(fh, handler.wfile, 65536)
+
+
 def make_server(port, token):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -3452,6 +3565,11 @@ def make_server(port, token):
             path = self.path.split("?")[0]
             if path == "/health":
                 self._handle(lambda: {"ok": True, "version": 1})
+            elif path == "/app/update":
+                self._handle(app_update_info)
+            elif path == "/app/apk":
+                # 二进制下载，不走 _handle（那是 JSON 专用）。
+                app_apk(self)
             elif path == "/instances":
                 self._handle(lambda: {"instances": [
                     dict(m, containers=container_state(m["name"]),
