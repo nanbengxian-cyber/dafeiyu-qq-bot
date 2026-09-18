@@ -26,11 +26,19 @@ public final class MainActivity extends Activity {
     private ServerView serverView;
     private Button[] tabs;
     private View[] pages;
+    private ScreenHost screenHost;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         store = new Store(this);
+        screenHost = new ScreenHost(this);
+        screenHost.setOnCloseListener(new Runnable() {
+            public void run() {
+                // 任意虚拟屏关闭后，恢复登录中枢的轻量状态轮询
+                loginView.onShow();
+            }
+        });
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -84,6 +92,14 @@ public final class MainActivity extends Activity {
                         android.widget.Toast.LENGTH_SHORT).show();
             }
 
+            public void openScreen(VirtualScreen screen) {
+                screenHost.open(screen);
+            }
+
+            public void closeScreen() {
+                screenHost.close();
+            }
+
             public void openWebLogin(String base, int tunnelPort, String instance,
                                      String managerToken, String webuiToken) {
                 Intent it = new Intent(MainActivity.this, WebLoginActivity.class);
@@ -133,8 +149,23 @@ public final class MainActivity extends Activity {
             root.addView(p, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         }
-        setContentView(root);
+        // 外层套一个 FrameLayout：主界面在底，虚拟屏覆盖层在顶
+        android.widget.FrameLayout outer = new android.widget.FrameLayout(this);
+        outer.addView(root, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        outer.addView(screenHost.view(), new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(outer);
         selectTab(Math.max(0, Math.min(3, store.tab())));
+    }
+
+    @Override
+    public void onBackPressed() {
+        // 有虚拟屏开着，返回键先交给它（WebView 可能要 goBack，否则关屏）
+        if (screenHost != null && screenHost.onBack()) {
+            return;
+        }
+        super.onBackPressed();
     }
 
     private android.graphics.drawable.GradientDrawable tabStyle(boolean active) {

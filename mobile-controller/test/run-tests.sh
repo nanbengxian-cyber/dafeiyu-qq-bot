@@ -162,6 +162,15 @@ if ! python3 test/check-vision-wiring.py; then
   exit 1
 fi
 
+# 虚拟屏（验证码/二维码/密码）的接线。View/Activity 不进单测面，
+# 「逻辑对了但没接上」只能静态扫 —— 验证码屏这类用后即弃的界面
+# 接错了的症状跟没做一样（还是得去主界面翻验证码，还可能泄露密码框）。
+# 已修复的误报：外层 FrameLayout 允许 `android.widget.FrameLayout` 全限定写法。
+if ! python3 test/check-virtual-screen-wiring.py; then
+  echo "虚拟屏接线检查未通过：验证码/密码悬浮屏没接上，或退出时没清理干净。" >&2
+  exit 1
+fi
+
 # 「Key 留空=不改」是否真的成立。
 # App 的 Key 框一直这么写（因为 Key 不回显），但服务器原来要求三样填全，
 # 于是用户**只改人格或只改模型名都做不到**，必须回官网重新复制 Key。

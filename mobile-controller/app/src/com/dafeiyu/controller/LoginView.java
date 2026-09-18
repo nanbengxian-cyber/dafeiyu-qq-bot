@@ -2,14 +2,11 @@ package com.dafeiyu.controller;
 
 import android.app.Activity;
 import android.content.Context;
-import android.graphics.Bitmap;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
-import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -19,46 +16,51 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * 「登录 QQ」页 —— 开放式登录的主体。
+ * 「登录 QQ」页 —— 轻量登录中枢。
  *
- * 一页四块：
- *   1. 连接：WebUI 地址 + Token（+ 可选动态码）→ 换凭据，之后请求全自动带；
- *   2. 状态：在线/掉线/出码中…，每 2.5 秒轮询一次 CheckLoginStatus；
- *   3. 扫码登录：把 CheckLoginStatus 给的 qrcodeurl **本地**画成二维码，
- *      手机 QQ 扫它即可（和官方网页同一个内容源）；
- *   4. 密码登录：QQ 号 + 密码（MD5 后发 PasswordLogin）；要安全验证时
- *      提示切到内置网页登录页（那里是官方验证流程，能跑腾讯的验证码组件）。
- *   另有快速登录（历史账号一键登录）与「打开网页登录页」。
+ * 本页常驻内存（是四个页签之一），所以做得很轻：只有连接卡、一行文本状态、
+ * 三个验证入口按钮和快速登录/重启。**不再常驻**任何二维码位图、密码输入框
+ * 或 WebView —— 那些重资源都搬进了「虚拟屏」：
+ *
+ *   ① 二维码登录 → QrScreen（覆盖层虚拟屏，打开才画码、关掉即 recycle）
+ *   ② 密码登录   → PwScreen（覆盖层虚拟屏，关掉即清空密码明文）
+ *   ③ 短信/网页验证 → WebLoginActivity（独立 Activity，finish 即 destroy WebView）
+ *
+ * 三块都是「用完即删、需要再建」：点开才构建、关闭立即释放，平时零占用。
+ *
+ * 状态轮询只在本页前台且没有虚拟屏打开时跑，且只更新一行文字（无位图），
+ * 开虚拟屏前会先停掉，避免和屏内轮询并发打同一个连接。
  *
  * 安全：Token/密码/动态码只进内存，绝不进 Store。
  */
 public final class LoginView {
 
+    private static final long POLL_MS = 3000L;
+
     public interface Host {
         void toast(String msg);
 
+        /** 打开一块覆盖层虚拟屏（二维码 / 密码）。 */
+        void openScreen(VirtualScreen screen);
+
+        /** 关闭当前覆盖层虚拟屏。 */
+        void closeScreen();
+
         /**
-         * 打开内置网页登录页。
-         *
-         * tunnelPort/instance/managerToken 三者都有值时，网页会经管理服务代理
-         * 访问实例的 WebUI（手机连不到服务器本机的实例端口）；否则直连 base。
-         *
-         * webuiToken 是实例的 WebUI 访问口令，会拼成 `?token=` 让网页自动登录。
-         * 不传的话用户会撞上 NapCat 自己的登录页（一个写着「请输入token」的输入框），
-         * 而那个口令他既不知道也没处找。
+         * 打开内置网页登录页（短信 / 验证码 / 两步验证兜底）。
+         * tunnelPort/instance/managerToken 都有值时经管理服务代理访问实例 WebUI；
+         * 否则直连 base。webuiToken 拼成 ?token= 让网页自动登录。
          */
         void openWebLogin(String base, int tunnelPort, String instance, String managerToken,
                           String webuiToken);
     }
-
-    private static final long POLL_MS = 2500L;
 
     private final Context ctx;
     private final Host host;
     private final Store store;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final ExecutorService pool = Executors.newSingleThreadExecutor();
-    // 走 RoutingTransport：连了服务器就经隧道，没连就直连。
+    // 共享的、已连接的 NapCat 客户端 —— 连接一次，各虚拟屏复用。
     private final NapCatClient client = new NapCatClient(new RoutingTransport());
 
     private View root;
@@ -71,20 +73,13 @@ public final class LoginView {
     private TextView manualNote;
     private TextView statusLine;
     private TextView detailLine;
-    private ImageView qrImage;
-    private TextView qrNote;
-    private Button refreshQrBtn;
-    private EditText uin;
-    private TextView uinNote;
-    private EditText qqPassword;
-    private TextView pwResult;
+    private Button qrEntry;
+    private Button pwEntry;
+    private Button smsEntry;
     private LinearLayout quickBox;
-    private LinearLayout cards;
 
     private boolean polling;
     private int pollErrors;
-    private String lastQrUrl = "";
-    private boolean lastOnline;
     private boolean busy;
 
     public LoginView(Context ctx, Host host, Store store) {
@@ -102,7 +97,6 @@ public final class LoginView {
         ScrollView scroll = UiKit.scroll(ctx);
         LinearLayout page = UiKit.pageColumn(ctx);
         scroll.addView(page);
-        cards = page;
 
         // ① 连接
         LinearLayout connCard = UiKit.card(ctx, "① 连接机器人的 NapCat 网页");
@@ -123,9 +117,9 @@ public final class LoginView {
         c1.addView(connectBtn);
         connState = UiKit.text(ctx, "未连接。", 12, Theme.DIM);
         c1.addView(connState);
-        cards.addView(connCard);
+        page.addView(connCard);
 
-        // ② 状态
+        // ② 状态（纯文本，无二维码位图）
         LinearLayout statusCard = UiKit.card(ctx, "② 机器人状态");
         LinearLayout c2 = UiKit.inner(statusCard);
         statusLine = UiKit.text(ctx, "还没连接。", 17, Theme.TEXT);
@@ -133,164 +127,178 @@ public final class LoginView {
         c2.addView(statusLine);
         detailLine = UiKit.text(ctx, "", 12, Theme.DIM);
         c2.addView(detailLine);
-        refreshQrBtn = UiKit.button(ctx, "刷新二维码", false);
-        c2.addView(refreshQrBtn);
-        qrImage = new ImageView(ctx);
-        qrImage.setAdjustViewBounds(true);
-        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        qlp.topMargin = Theme.dp(ctx, 10);
-        qrImage.setLayoutParams(qlp);
-        c2.addView(qrImage);
-        qrNote = UiKit.text(ctx, "连接后这里会显示登录二维码；用手机 QQ 扫它。", 12, Theme.DIM);
-        c2.addView(qrNote);
-        cards.addView(statusCard);
+        page.addView(statusCard);
 
-        // ③ 密码登录
-        LinearLayout pwCard = UiKit.card(ctx, "③ 密码登录（QQ 号 + QQ 密码）");
-        LinearLayout c3 = UiKit.inner(pwCard);
-        c3.addView(UiKit.text(ctx, "密码只用来在服务器上登录这个 QQ 号，App 不保存它。"
-                + "触发安全验证时按提示切到网页完成。", 12, Theme.DIM));
-        uin = UiKit.input(ctx, "QQ 号（同时用来核对登录的是不是这个号）", false);
-        uin.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
-        c3.addView(uin);
-        uinNote = UiKit.text(ctx, "登录成功后会在这里告诉你服务器上真正登录的是哪个号。",
-                12, Theme.DIM);
-        c3.addView(uinNote);
-        qqPassword = UiKit.input(ctx, "QQ 密码（不会保存）", true);
-        c3.addView(qqPassword);
-        Button pwBtn = UiKit.button(ctx, "密码登录", true);
-        c3.addView(pwBtn);
-        pwResult = UiKit.text(ctx, "", 13, Theme.WARN);
-        c3.addView(pwResult);
-        cards.addView(pwCard);
+        // ③ 验证入口（点开才构建对应虚拟屏）
+        LinearLayout loginCard = UiKit.card(ctx, "③ 登录方式（点开才构建，用完即释放）");
+        LinearLayout c3 = UiKit.inner(loginCard);
+        c3.addView(UiKit.text(ctx, "下面三种验证各是一块独立「虚拟屏」：点开才占内存，"
+                + "关掉立刻释放，平时零占用。", 12, Theme.DIM));
+        qrEntry = UiKit.button(ctx, "二维码登录", true);
+        qrEntry.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                openQr();
+            }
+        });
+        c3.addView(qrEntry);
+        pwEntry = UiKit.button(ctx, "密码登录", false);
+        pwEntry.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                openPw();
+            }
+        });
+        c3.addView(pwEntry);
+        smsEntry = UiKit.button(ctx, "短信 / 网页验证（验证码 · 两步验证）", false);
+        smsEntry.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                openWebVerify();
+            }
+        });
+        c3.addView(smsEntry);
+        page.addView(loginCard);
 
-        // ④ 快速登录 + 网页
-        LinearLayout quickCard = UiKit.card(ctx, "④ 快速登录 / 网页登录");
+        // ④ 快速登录 + 重启（轻量控件，留在中枢）
+        LinearLayout quickCard = UiKit.card(ctx, "④ 快速登录 / 重启");
         LinearLayout c4 = UiKit.inner(quickCard);
         quickBox = UiKit.column(ctx);
         c4.addView(quickBox);
-        quickBox.addView(UiKit.text(ctx, "服务器上登录过的 QQ 会列在这里，点一下直接登录"
-                + "（相当于勾了 ACCOUNT 的快速登录）。“获取列表”在连接后可用。",
-                12, Theme.DIM));
+        quickBox.addView(UiKit.text(ctx, "服务器上登录过的 QQ 会列在这里，点一下直接登录。"
+                + "「获取列表」在连接后可用。", 12, Theme.DIM));
         Button reloadQuick = UiKit.button(ctx, "获取快速登录列表", false);
-        c4.addView(reloadQuick);
-        Button webBtn = UiKit.button(ctx, "打开内置网页登录页（验证码 / 两步验证兜底）", false);
-        c4.addView(webBtn);
-        Button restartBtn = UiKit.button(ctx, "重启 NapCat（卡死时用，会出新的二维码）", false);
-        c4.addView(restartBtn);
-        cards.addView(quickCard);
-
-        // 事件
-        connectBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                connect();
-            }
-        });
-        refreshQrBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                bg(new Runnable() {
-                    public void run() {
-                        try {
-                            client.refreshQrcode();
-                            tickNow();
-                        } catch (NapCatClient.ApiError e) {
-                            fail("刷新二维码失败：" + e.getMessage());
-                        }
-                    }
-                });
-            }
-        });
-        pwBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                passwordLogin();
-            }
-        });
         reloadQuick.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 loadQuickList();
             }
         });
-        webBtn.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                if (RoutingTransport.viaServer()) {
-                    // 经服务器模式：把隧道端口 + 实例名 + 管理口令交给网页，
-                    // 让它把每个子请求都代理过去。
-                    //
-                    // 这里不能直接把地址给 WebView：实例的 WebUI 只监听服务器的
-                    // 127.0.0.1，手机连不上；而且 NapCat 网页用绝对路径引资源，
-                    // 少了代理前缀就全是 404（症状是「网页老是连不上」）。
-                    //
-                    // ★ 还要把实例的 WebUI 口令一并带过去。
-                    // 不带的话网页会弹「请输入token」—— 那是 NapCat WebUI 自己的
-                    // 访问口令，用户既不知道也没处找（报过这个）。
-                    // 取口令要走网络，所以放到后台线程，别卡住界面。
-                    final String inst = RoutingTransport.activeInstance();
-                    final String pw = RoutingTransport.activeUnlockPassword();
-                    final String mt = Session.client().token();
-                    final int port = Session.tunnel().port();
-                    webBtn.setEnabled(false);
-                    pool.execute(new Runnable() {
-                        public void run() {
-                            String tok = "";
-                            try {
-                                tok = Session.client().webuiToken(inst, pw);
-                            } catch (Exception e) {
-                                // 拿不到就当没解锁：网页会显示登录页，
-                                // 上面的提示已经告诉用户该怎么办，不至于卡死。
-                                tok = "";
-                            }
-                            final String useTok = tok == null ? "" : tok;
-                            onUi(new Runnable() {
-                                public void run() {
-                                    webBtn.setEnabled(true);
-                                    host.openWebLogin("http://127.0.0.1", port, inst, mt, useTok);
-                                }
-                            });
-                        }
-                    });
-                    return;
-                }
-                String base = client.base().isEmpty() ? store.webuiBase() : client.base();
-                if (base.isEmpty()) {
-                    host.toast("先填上面的 WebUI 地址");
-                    return;
-                }
-                // 直连模式：用户自己填了 Token，原样带进网页帮他自动登录。
-                host.openWebLogin(base, 0, "", "", token.getText().toString().trim());
-            }
-        });
+        c4.addView(reloadQuick);
+        Button restartBtn = UiKit.button(ctx, "重启 NapCat（卡死时用，会出新的二维码）", false);
         restartBtn.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
-                if (!(ctx instanceof Activity)) {
-                    return;
-                }
-                new android.app.AlertDialog.Builder(ctx)
-                        .setTitle("重启 NapCat？")
-                        .setMessage("QQ 会掉线并生成新的登录二维码，大概率要重新扫码或快速登录。")
-                        .setPositiveButton("重启", new android.content.DialogInterface.OnClickListener() {
-                            public void onClick(android.content.DialogInterface d, int w) {
-                                bg(new Runnable() {
-                                    public void run() {
-                                        try {
-                                            client.restartNapCat();
-                                            say("已发送重启指令，等它起来后重新连接。");
-                                        } catch (NapCatClient.ApiError e) {
-                                            fail("重启失败：" + e.getMessage());
-                                        }
-                                    }
-                                });
-                            }
-                        })
-                        .setNegativeButton("取消", null)
-                        .show();
+                confirmRestart();
+            }
+        });
+        c4.addView(restartBtn);
+        page.addView(quickCard);
+
+        connectBtn.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                connect();
             }
         });
 
         address.setText(store.webuiBase());
-        uin.setText(store.lastUin());
+        setEntriesEnabled(false);
         root = scroll;
         return root;
+    }
+
+    private void setEntriesEnabled(boolean on) {
+        if (qrEntry != null) {
+            qrEntry.setEnabled(on);
+            pwEntry.setEnabled(on);
+            smsEntry.setEnabled(on);
+        }
+    }
+
+    // ------------------------------------------------------------ 虚拟屏入口
+
+    private void openQr() {
+        if (!client.connected()) {
+            host.toast("先连接");
+            return;
+        }
+        stopPolling();   // 让二维码屏独占轮询，避免并发打同一连接
+        host.openScreen(new QrScreen(client, new Runnable() {
+            public void run() {
+                // 登录成功：关屏 + 刷新中枢状态/账号/快速登录列表
+                host.closeScreen();
+                loadAccount();
+                loadQuickList();
+            }
+        }));
+    }
+
+    private void openPw() {
+        if (!client.connected()) {
+            host.toast("先连接");
+            return;
+        }
+        stopPolling();
+        host.openScreen(new PwScreen(client, store, new PwScreen.OnNeedWebVerify() {
+            public void run(boolean needCaptcha, boolean needNewDevice) {
+                // 需要安全验证：关掉密码屏，转到网页验证屏
+                host.closeScreen();
+                openWebVerify();
+            }
+        }));
+    }
+
+    /** 短信 / 验证码 / 两步验证 → 内置网页登录页（独立 Activity，用完即删）。 */
+    private void openWebVerify() {
+        if (RoutingTransport.viaServer()) {
+            final String inst = RoutingTransport.activeInstance();
+            final String pw = RoutingTransport.activeUnlockPassword();
+            final String mt = Session.client() != null ? Session.client().token() : "";
+            final int port = Session.tunnel() != null ? Session.tunnel().port() : 0;
+            smsEntry.setEnabled(false);
+            pool.execute(new Runnable() {
+                public void run() {
+                    String tok = "";
+                    try {
+                        if (Session.client() != null) {
+                            tok = Session.client().webuiToken(inst, pw);
+                        }
+                    } catch (Exception e) {
+                        tok = "";
+                    }
+                    final String useTok = tok == null ? "" : tok;
+                    onUi(new Runnable() {
+                        public void run() {
+                            if (smsEntry != null) {
+                                smsEntry.setEnabled(true);
+                            }
+                            host.openWebLogin("http://127.0.0.1", port, inst, mt, useTok);
+                        }
+                    });
+                }
+            });
+            return;
+        }
+        String base = client.base().isEmpty() ? store.webuiBase() : client.base();
+        if (base.isEmpty()) {
+            host.toast("先填上面的 WebUI 地址");
+            return;
+        }
+        host.openWebLogin(base, 0, "", "", token.getText().toString().trim());
+    }
+
+    private void confirmRestart() {
+        if (!(ctx instanceof Activity)) {
+            return;
+        }
+        if (!client.connected()) {
+            host.toast("先连接");
+            return;
+        }
+        new android.app.AlertDialog.Builder(ctx)
+                .setTitle("重启 NapCat？")
+                .setMessage("QQ 会掉线并生成新的登录二维码，大概率要重新扫码或快速登录。")
+                .setPositiveButton("重启", new android.content.DialogInterface.OnClickListener() {
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        bg(new Runnable() {
+                            public void run() {
+                                try {
+                                    client.restartNapCat();
+                                    setStatus("已发送重启指令，等它起来后重新连接。", Theme.WARN);
+                                } catch (NapCatClient.ApiError e) {
+                                    setStatus("重启失败：" + e.getMessage(), Theme.BAD);
+                                }
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     // ------------------------------------------------------------ 连接与轮询
@@ -324,11 +332,7 @@ public final class LoginView {
             public void run() {
                 String useTok = tok;
                 if (via) {
-                    // NapCat 的 WebUI Token 由服务器生成，用户看不到也不需要知道 ——
-                    // 直接向管理服务要，经隧道用。
                     try {
-                        // 私密机器人要带上解锁口令，否则服务器不回 webui_token，
-                        // 下面会把「锁着」误报成「还没跑起来」。
                         useTok = Session.client().webuiToken(
                                 RoutingTransport.activeInstance(),
                                 RoutingTransport.activeUnlockPassword());
@@ -361,7 +365,8 @@ public final class LoginView {
                         connState.setTextColor(Theme.GOOD);
                         token.setText("");
                         totp.setText("");
-                        host.toast("已连接，开始轮询登录状态");
+                        setEntriesEnabled(true);
+                        host.toast("已连接。选一种登录方式打开虚拟屏。");
                     }
                 });
                 startPolling();
@@ -370,10 +375,7 @@ public final class LoginView {
         });
     }
 
-    /**
-     * 页面显示时调用。连了服务器的话，用户什么都不用填 ——
-     * 地址、Token 都从管理服务取，请求经隧道代理到选中的那个实例。
-     */
+    /** 页面显示时调用（也用作虚拟屏关闭后的恢复入口）。 */
     public void onShow() {
         boolean via = RoutingTransport.viaServer();
         serverNote.setVisibility(via ? View.VISIBLE : View.GONE);
@@ -392,6 +394,7 @@ public final class LoginView {
             serverNote.setText("已连服务器，但还没选机器人。"
                     + "回「机器人」页点「登录这个 QQ」。");
         }
+        setEntriesEnabled(client.connected());
         if (client.connected()) {
             startPolling();
         }
@@ -443,7 +446,6 @@ public final class LoginView {
                 } catch (NapCatClient.ApiError e) {
                     pollErrors++;
                     if (pollErrors >= 4) {
-                        // 连续四次失败才判定连接断了；偶发超时/抖动不值得打断轮询
                         polling = false;
                         onUi(new Runnable() {
                             public void run() {
@@ -452,6 +454,7 @@ public final class LoginView {
                                 connState.setTextColor(Theme.BAD);
                                 statusLine.setText("状态不明");
                                 statusLine.setTextColor(Theme.WARN);
+                                setEntriesEnabled(false);
                             }
                         });
                     }
@@ -463,64 +466,40 @@ public final class LoginView {
         });
     }
 
-    /** 把 CheckLoginStatus 的结果铺到界面上（在后台线程算好，回 UI 线程改控件）。 */
+    /** 只更新一行文本状态，不画二维码（二维码归 QrScreen）。 */
     private void renderStatus(final Map<String, Object> st) {
         final boolean isLogin = Json.bool(st, "isLogin", false);
         final boolean isOffline = Json.bool(st, "isOffline", false);
         final String phase = Json.str(st, "loginPhase", isLogin ? "ready" : "waiting_qrcode");
-        final String qrUrl = Json.str(st, "qrcodeurl", "");
-        final String loginError = Json.str(st, "loginError", "");
-        final boolean qrChanged = !qrUrl.isEmpty() && !qrUrl.equals(lastQrUrl);
-        if (qrChanged) {
-            lastQrUrl = qrUrl;
-        }
-        Bitmap bmp = null;
-        if (qrChanged && !isLogin) {
-            bmp = QrPainter.paint(qrUrl, Theme.dp(ctx, 280));
-        }
-        final Bitmap qr = bmp;
+        final boolean wasLogin = this.lastOnline;
+        this.lastOnline = isLogin;
         onUi(new Runnable() {
             public void run() {
+                if (statusLine == null) {
+                    return;
+                }
                 if (isLogin) {
                     statusLine.setText("在线");
                     statusLine.setTextColor(Theme.GOOD);
-                    qrImage.setImageBitmap(null);
-                    qrNote.setText("已登录。掉线时这里会重新出码。");
-                    if (!lastOnline) {
+                    if (!wasLogin) {
                         loadAccount();
-                        loadQuickList();
                     }
-                    lastOnline = true;
                     return;
                 }
-                lastOnline = false;
                 if (isOffline) {
                     statusLine.setText("已掉线");
                     statusLine.setTextColor(Theme.BAD);
+                    detailLine.setText("点「二维码登录」重新扫码，或用「快速登录」。");
                 } else {
                     statusLine.setText(phaseText(phase));
                     statusLine.setTextColor(Theme.WARN);
-                }
-                // loginError 是 NapCat 的「上一次错误」，不会随新码自动清掉。
-                // 二维码每 30 秒自己换一张，换完之后 loginError 往往还停在
-                // 「二维码已过期，请刷新」—— 于是界面上同时出现一张**能扫的新码**
-                // 和一行红字说码过期了。用户看到红字就不敢扫 / 以为坏了。
-                // 手上已经拿到刚画好的新码时，这条过期提示就是过时的，不显示。
-                if (!loginError.isEmpty() && qr == null) {
-                    detailLine.setText("最近错误：" + loginError);
-                    detailLine.setTextColor(Theme.BAD);
-                } else {
                     detailLine.setText("");
-                }
-                if (qr != null) {
-                    qrImage.setImageBitmap(qr);
-                    qrNote.setText("用手机 QQ 扫上面的二维码（QQ → 右上角 + → 扫一扫）。");
-                } else if (isOffline && qrUrl.isEmpty()) {
-                    qrNote.setText("掉线后还没出新码，点「刷新二维码」试一次。");
                 }
             }
         });
     }
+
+    private boolean lastOnline;
 
     private static String phaseText(String phase) {
         if ("qrcode_scanned".equals(phase)) {
@@ -541,7 +520,7 @@ public final class LoginView {
         if ("ready".equals(phase)) {
             return "在线";
         }
-        return "等待扫码";
+        return "等待登录";
     }
 
     private void loadAccount() {
@@ -551,85 +530,19 @@ public final class LoginView {
                     final Map<String, Object> info = client.loginInfo();
                     onUi(new Runnable() {
                         public void run() {
+                            if (detailLine == null) {
+                                return;
+                            }
                             String u = Json.str(info, "uin", Json.str(info, "uid", ""));
                             String nick = Json.str(info, "nick", Json.str(info, "nickname", ""));
                             if (!u.isEmpty() || !nick.isEmpty()) {
                                 detailLine.setText("账号：" + nick + "（" + u + "）");
                                 detailLine.setTextColor(Theme.GOOD);
                             }
-                            checkExpectedUin(u);
                         }
                     });
                 } catch (NapCatClient.ApiError ignored) {
                 }
-            }
-        });
-    }
-
-    /**
-     * QQ 号防呆：填了「期望的 QQ 号」就核对服务器上真正登录的是不是它。
-     * 登录错号（比如填错、或服务器上早就登着别的号）是这套流程最容易犯的错，
-     * 而且从二维码上看不出来 —— 所以对不上时用醒目的颜色明说。
-     */
-    private void checkExpectedUin(String actualUin) {
-        String want = uin.getText().toString().trim();
-        if (want.isEmpty() || actualUin == null || actualUin.isEmpty()) {
-            return;
-        }
-        if (want.equals(actualUin.trim())) {
-            uinNote.setTextColor(Theme.GOOD);
-            uinNote.setText("✓ 已核对：服务器上登录的正是这个 QQ 号（" + want + "）。");
-            return;
-        }
-        uinNote.setTextColor(Theme.BAD);
-        uinNote.setText("⚠ 对不上：服务器上登录的是 " + actualUin.trim()
-                + "，你填的是 " + want + "。如果要的是另一个号，先「重启 NapCat」再用那个号登录。");
-    }
-
-    // ------------------------------------------------------------ 密码登录
-
-    private void passwordLogin() {
-        final String account = uin.getText().toString().trim();
-        final String password = qqPassword.getText().toString();
-        if (account.isEmpty()) {
-            host.toast("请填 QQ 号");
-            return;
-        }
-        if (password.isEmpty()) {
-            host.toast("请填密码");
-            return;
-        }
-        store.setLastUin(account);
-        pwResult.setText("正在提交…");
-        pwResult.setTextColor(Theme.DIM);
-        bg(new Runnable() {
-            public void run() {
-                Map<String, Object> data;
-                try {
-                    data = client.passwordLogin(account, password);
-                } catch (NapCatClient.ApiError e) {
-                    pwFail("密码登录失败：" + e.getMessage());
-                    return;
-                }
-                final boolean needCaptcha = Json.bool(data, "needCaptcha", false);
-                final boolean needNewDevice = Json.bool(data, "needNewDevice", false);
-                onUi(new Runnable() {
-                    public void run() {
-                        if (needCaptcha || needNewDevice) {
-                            pwResult.setTextColor(Theme.WARN);
-                            pwResult.setText(needCaptcha
-                                    ? "QQ 要求安全验证（验证码）。App 里做不了腾讯的验证组件，"
-                                    + "请点「打开内置网页登录页」，用密码登录走完那一步。"
-                                    : "QQ 要求新设备验证（扫码确认）。请点「打开内置网页登录页」"
-                                    + "按提示扫码验证。");
-                        } else {
-                            pwResult.setTextColor(Theme.GOOD);
-                            pwResult.setText("登录请求已发送，等几秒看上面的状态。"
-                                    + "如果它要求安全验证，会在这里提示。");
-                            qqPassword.setText("");
-                        }
-                    }
-                });
             }
         });
     }
@@ -652,6 +565,9 @@ public final class LoginView {
                 final java.util.List<Object> found = items;
                 onUi(new Runnable() {
                     public void run() {
+                        if (quickBox == null) {
+                            return;
+                        }
                         quickBox.removeViews(1, quickBox.getChildCount() - 1);
                         if (found.isEmpty()) {
                             quickBox.addView(UiKit.text(ctx, "（服务器上还没有历史登录记录）",
@@ -695,9 +611,9 @@ public final class LoginView {
             public void run() {
                 try {
                     client.setQuickLogin(account);
-                    say("已发起快速登录 " + account + "，等几秒看状态。");
+                    setStatus("已发起快速登录 " + account + "，等几秒看状态。", Theme.GOOD);
                 } catch (NapCatClient.ApiError e) {
-                    fail("快速登录失败：" + e.getMessage());
+                    setStatus("快速登录失败：" + e.getMessage(), Theme.BAD);
                 }
             }
         });
@@ -713,11 +629,13 @@ public final class LoginView {
         ui.post(task);
     }
 
-    private void say(final String msg) {
+    private void setStatus(final String msg, final int color) {
         onUi(new Runnable() {
             public void run() {
-                pwResult.setTextColor(Theme.GOOD);
-                pwResult.setText(msg);
+                if (statusLine != null) {
+                    statusLine.setText(msg);
+                    statusLine.setTextColor(color);
+                }
                 host.toast(msg);
             }
         });
@@ -730,15 +648,6 @@ public final class LoginView {
                 connectBtn.setEnabled(true);
                 connState.setText(msg);
                 connState.setTextColor(Theme.BAD);
-            }
-        });
-    }
-
-    private void pwFail(final String msg) {
-        onUi(new Runnable() {
-            public void run() {
-                pwResult.setTextColor(Theme.BAD);
-                pwResult.setText(msg);
             }
         });
     }
