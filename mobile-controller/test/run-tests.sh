@@ -179,6 +179,15 @@ if ! python3 test/test-blank-key.py; then
   exit 1
 fi
 
+# 换 Key 后重启把配置覆盖回旧值（AstrBot 启动时用内存配置重写 cmd_config.json）。
+# provider 条目会被保住、但 Key/地址/模型名可能被旧内存值盖回去 ——
+# 表现正是「换了新 Key 却怎么都改不动」：保存提示成功，机器人还用旧 Key。
+# 这条证明 apply_config 能自愈，救不回时必须明确报错、绝不静默成功。
+if ! python3 test/test-key-restart-drift.py; then
+  echo "换 Key 重启覆盖竞态检查未通过：用户会「怎么都改不动 Key」。" >&2
+  exit 1
+fi
+
 # 识图 API 的**能力**探测。「能连上」不等于「能看图」——
 # 很多网关会接受带图片的请求然后完全忽略图片、瞎猜一个答案。
 # 这组测试用假服务器模拟「假装能看」的模型，证明探测不会被骗过去。

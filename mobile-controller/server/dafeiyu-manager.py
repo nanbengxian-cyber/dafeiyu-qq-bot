@@ -1667,6 +1667,49 @@ def apply_config(name, groups, friends, api_base, api_key, api_model, persona,
         if not provs2 or provs2[0].get("id") != "dafeiyu-main":
             raise ManagerError("配置没保住：重启后主聊天 API 丢了。"
                                "请等实例完全起来再改。")
+        # ★ 只验「provider 还在」是不够的：重启时 AstrBot 用内存配置
+        #   重写 cmd_config.json，provider **条目**会被保住，但里面的
+        #   **Key / 地址 / 模型名**可能被旧内存值覆盖回去 —— 表现正是
+        #   「换了新 Key 却怎么都改不动」：保存提示成功，机器人还用旧 Key。
+        #   provider id 判据完全看不出这种「壳还在、值回退」的失败。
+        #   所以这里必须逐字段核对；发现被覆盖就**再写一次**（此时
+        #   AstrBot 已完全起来，不会再有第二次重写把它盖掉），然后复验。
+        def _main_src_of(c):
+            for s in (c.get("provider_sources") or []):
+                if s.get("id") == "dafeiyu-main_source":
+                    return s
+            return {}
+        def _main_prov_of(c):
+            for p in (c.get("provider") or []):
+                if p.get("id") == "dafeiyu-main":
+                    return p
+            return {}
+        want_base = normalize_api_base(api_base, use_proto)
+        s2 = _main_src_of(back2)
+        p2 = _main_prov_of(back2)
+        got_key = (s2.get("key") or [""])[0] if s2.get("key") else ""
+        drifted = (got_key != api_key
+                   or (s2.get("api_base") or "") != want_base
+                   or (p2.get("model") or "") != api_model)
+        if drifted:
+            # 重写一次并重启后复验（就绪后重写，重启只是让它读进内存生效）。
+            write_json_bom(path, cfg)
+            compose(name, "restart", "astrbot", check=False)
+            wait_astrbot_ready(name, need_db=has_persona)
+            back3 = read_json_maybe_bom(path)
+            s3 = _main_src_of(back3)
+            p3 = _main_prov_of(back3)
+            got_key3 = (s3.get("key") or [""])[0] if s3.get("key") else ""
+            if (got_key3 != api_key
+                    or (s3.get("api_base") or "") != want_base
+                    or (p3.get("model") or "") != api_model):
+                raise ManagerError(
+                    "主聊天 API 没保住：重启后又被覆盖回旧配置了"
+                    "（换新 Key/地址/模型名不生效）。"
+                    "请等这个机器人状态显示「运行中」约半分钟后再保存一次。")
+            # 又重启了一次 —— 后面的识图/人格/通道校验必须看**最新**的文件，
+            # 否则会拿被覆盖前的旧快照 back2 误判。
+            back2 = back3
     if vision_any:
         # 识图 provider 要确认三件事，少一件机器人就还是「看不见图」：
         #   ① provider 还在；
